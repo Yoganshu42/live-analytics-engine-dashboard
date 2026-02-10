@@ -1,87 +1,15 @@
-# Live Dashboard
-
-A modern analytics dashboard with a FastAPI backend, a Next.js frontend, CSV/XLSX ingest, and a branded landing experience.
-
-**Stack**
-- `FastAPI` + `SQLAlchemy` + `PostgreSQL`
-- `Next.js` + `Tailwind`
-- CSV/XLSX ingest via Swagger
-
-**Monorepo Layout**
-- `backend/` — API service
-- `frontend/my-app/` — Web app
-
----
-
-**Quick Start**
-
-Backend:
-```powershell
-cd backend
+📊 Live Dashboard: Business Control Centre<p align="center"><img src="https://img.shields.io/badge/Next.js-000000?style=for-the-badge&logo=nextdotjs&logoColor=white" /><img src="https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi&logoColor=white" /><img src="https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white" /><img src="https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=for-the-badge&logo=tailwind-css&logoColor=white" /></p>A high-performance, real-time analytics ecosystem featuring a FastAPI robust backend and a Next.js glassmorphic frontend. Designed for seamless CSV/XLSX ingestion and enterprise-grade branded data visualization.🚀 Core FeaturesIntelligent Ingestion: Direct CSV/XLSX processing via optimized Swagger endpoints.Branded Experience: Tailored landing pages and dashboards for Samsung, Godrej, and Reliance.Real-time Synchronization: Built-in Server-Sent Events (SSE) for live data updates.Secure Auth: JWT-based Role-Based Access Control (RBAC) for Admins and Employees.📂 Project StructurePlaintext📦 Live Dashboard
+ ┣ 📂 backend            # FastAPI + SQLAlchemy + PostgreSQL
+ ┃ ┣ 📜 main.py          # API Entrypoint
+ ┃ ┗ 📜 .env             # Environment Secrets
+ ┗ 📂 frontend/my-app    # Next.js + Tailwind + Framer Motion
+   ┣ 📂 public           # Assets & Branded Media
+   ┗ 📂 src              # React Components & Hooks
+🛠️ Quick Start1. Backend SetupPowerShellcd backend
+# Install dependencies (recommended: pip install -r requirements.txt)
 uvicorn main:app --reload
-```
-
-Frontend:
-```powershell
-cd frontend/my-app
+2. Frontend SetupPowerShellcd frontend/my-app
 npm install
 npm run dev
-```
-
----
-
-**Configuration**
-
-Create `backend/.env` and set:
-- `DATABASE_URL`
-- `JWT_SECRET`
-- `BOOTSTRAP_TOKEN`
-- `ADMIN_USERNAME`
-- `ADMIN_PASSWORD`
-- `EMPLOYEE_USERNAME`
-- `EMPLOYEE_PASSWORD`
-
-The backend loads `.env` automatically and creates required tables (`users`, `data_rows`) on startup.
-
----
-
-**Upload Data (Swagger)**
-
-1. Open: `http://127.0.0.1:8000/docs`
-2. Login: `POST /auth/login`
-3. Authorize: `Bearer <access_token>`
-4. Upload: `POST /upload`
-
-Required fields for upload:
-- `file` (CSV/XLSX)
-- `source` (e.g., `samsung`, `godrej`, `reliance`)
-- `dataset_type` (`sales` or `claims`)
-- `job_id` (optional)
-
----
-
-**Deploy**
-
-Frontend (Vercel):
-```powershell
-cd frontend/my-app
-vercel --prod --yes
-```
-
-Backend (Vercel, testing only):
-```powershell
-cd backend
-vercel --prod --yes
-```
-
-Note: Vercel backend requires a publicly reachable database. Private VPC RDS will fail.
-
-Backend (AWS ECS/Fargate, production):
-- Recommended for private VPC RDS
-
----
-
-**Notes**
-
-- Landing video: `frontend/my-app/public/Business_Analytics_Video_Generation_Prompt.mp4`
-- `/events` provides SSE (no WebSockets on Vercel)
+⚙️ ConfigurationCreate a .env file in the backend/ directory with the following variables:VariableDescriptionDATABASE_URLPostgreSQL connection stringJWT_SECRETSecret key for token encryptionBOOTSTRAP_TOKENInitial token for system setupADMIN_CREDENTIALSDefault login for high-level access📈 Data Ingestion WorkflowNavigate to http://127.0.0.1:8000/docsAuthenticate via POST /auth/login to receive your JWT.Authorize by clicking the "Authorize" button and entering your token.Upload your data using POST /upload.Note: Supported dataset_type values are limited to sales or claims.🚢 Deployment StrategiesFrontendRecommended: VercelPowerShellvercel --prod --yes
+BackendEnvironmentPlatformNoteDevelopmentVercelEasy testing; requires public DB access.ProductionAWS ECS / FargateRecommended for private VPC and RDS security.💡 Technical NotesReal-time: Utilizing /events (SSE) to ensure compatibility with serverless environments like Vercel where WebSockets may be restricted.Visuals: The dashboard features a high-fidelity neural network background video found in public/Business_Analytics_Video_Generation_Prompt.mp4.<p align="center">Built with ❤️ by the Zopper's Data Science Team</p>
