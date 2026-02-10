@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+pandas
+numpy
+python-multipart
+python-dotenv
+openpyxl
+python-jose[cryptography]
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+email-validator

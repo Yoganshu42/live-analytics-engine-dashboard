@@ -1,0 +1,44 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: analytics_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: tech@1234
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql://postgres:tech%401234@db:5432/analytics_db
+      JWT_SECRET: change-me
+      ACCESS_TOKEN_EXPIRE_MINUTES: "720"
+      BOOTSTRAP_TOKEN: change-me
+      ADMIN_USERNAME: admin.user@zopper.com
+      ADMIN_PASSWORD: admin123
+      EMPLOYEE_USERNAME: employee.user@zopper.com
+      EMPLOYEE_PASSWORD: employee123
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: ./frontend/my-app
+      args:
+        NEXT_PUBLIC_API_BASE: http://localhost:8000
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pg_data:
