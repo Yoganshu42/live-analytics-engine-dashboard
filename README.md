@@ -7,6 +7,12 @@
   <img src="https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=for-the-badge&logo=tailwind-css&logoColor=white" alt="Tailwind CSS" />
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Brand%20Colors-1BA9C5-F47A1F-2F7AE5?style=for-the-badge" alt="Brand Colors" />
+  <img src="https://img.shields.io/badge/Framer%20Motion-000000?style=for-the-badge&logo=framer&logoColor=white" alt="Framer Motion" />
+  <img src="https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white" alt="Vercel" />
+</p>
+
 A FastAPI + Next.js analytics dashboard with CSV/XLSX ingestion and branded data visualization.
 
 ---
@@ -20,6 +26,31 @@ A FastAPI + Next.js analytics dashboard with CSV/XLSX ingestion and branded data
 **Repository**
 - `backend/` — API service
 - `frontend/my-app/` — Web app
+
+---
+
+## Directory Structure
+
+```text
+Live Dashboard
+├─ backend
+│  ├─ authentication
+│  ├─ core
+│  ├─ db
+│  ├─ models
+│  ├─ routers
+│  ├─ services
+│  ├─ main.py
+│  └─ requirements.txt
+├─ frontend
+│  └─ my-app
+│     ├─ app
+│     ├─ components
+│     ├─ public
+│     └─ package.json
+├─ docker-compose.yml
+└─ README.md
+```
 
 ---
 
