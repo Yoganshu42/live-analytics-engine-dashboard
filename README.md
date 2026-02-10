@@ -8,9 +8,6 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Brand%20Colors-1BA9C5?style=for-the-badge" alt="Brand Colors" />
-  <img src="https://img.shields.io/badge/Brand%20Accent-F47A1F?style=for-the-badge" alt="Brand Accent" />
-  <img src="https://img.shields.io/badge/Brand%20Deep-2F7AE5?style=for-the-badge" alt="Brand Deep" />
   <img src="https://img.shields.io/badge/Framer%20Motion-000000?style=for-the-badge&logo=framer&logoColor=white" alt="Framer Motion" />
   <img src="https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white" alt="Vercel" />
 </p>
