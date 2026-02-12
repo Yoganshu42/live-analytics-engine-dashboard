@@ -1,6 +1,30 @@
+import json
+
 import pandas as pd
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
+
+def invalidate_dataframe_cache(
+    source: str | None = None,
+    dataset_type: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    # Cache removed intentionally; kept for compatibility with callers.
+    return None
+
+
+def _extract_data_payload(row) -> dict | None:
+    data = getattr(row, "data", None)
+    if data is None and isinstance(row, (tuple, list)) and row:
+        data = row[0]
+
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+    return data if isinstance(data, dict) else None
 
 
 def get_data_rows(
@@ -10,7 +34,7 @@ def get_data_rows(
     dataset_type: str,
 ) -> list[dict]:
     """
-    Fetch raw rows from data_rows table and return JSON payloads
+    Fetch raw rows from data_rows table and return JSON payloads.
     """
     rows = (
         db.query(DataRow.data)
@@ -22,8 +46,13 @@ def get_data_rows(
         .all()
     )
 
-    # rows = [(data,), (data,), ...] → unwrap
-    return [r[0] for r in rows]
+    out = []
+    for row in rows:
+        payload = _extract_data_payload(row)
+        if payload is not None:
+            out.append(payload)
+    return out
+
 
 def get_dataframe(
     db,
@@ -52,9 +81,13 @@ def get_dataframe(
     if not rows:
         return pd.DataFrame()
 
-    # 🔑 CRITICAL: flatten JSONB correctly
-    df = pd.DataFrame([r.data for r in rows])
-    print(df.columns.tolist())
-    return df
-# rows = get_data_rows(db, job_id, "samsung", "sales")
-# print(len(rows), rows[0].keys())
+    payloads = []
+    for row in rows:
+        payload = _extract_data_payload(row)
+        if payload is not None:
+            payloads.append(payload)
+
+    if not payloads:
+        return pd.DataFrame()
+
+    return pd.DataFrame(payloads)

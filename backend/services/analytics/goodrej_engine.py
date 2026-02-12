@@ -35,13 +35,13 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     # LOAD DATA
     # --------------------------------------------------
 
-    def load_data(self) -> dict[str, pd.DataFrame]:
-        sales = self._load_rows("sales")
-        claims = self._load_rows("claims")
+    def load_data(self, include_sales: bool = True, include_claims: bool = True) -> dict[str, pd.DataFrame]:
+        sales = self._load_rows("sales") if include_sales else pd.DataFrame()
+        claims = self._load_rows("claims") if include_claims else pd.DataFrame()
         return {"sales": sales, "claims": claims}
 
     def _load_rows(self, dataset_type):
-        q = self.db.query(DataRow).filter(DataRow.dataset_type == dataset_type)
+        q = self.db.query(DataRow.data).filter(DataRow.dataset_type == dataset_type)
         if self.source:
             q = q.filter(
                 (DataRow.source.ilike("godrej%")) |
@@ -51,8 +51,8 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         # Goodrej dashboards should aggregate across all uploads, even when a job_id
         # is passed from the UI. This ensures totals reflect the full database.
         rows = q.all()
-
-        df = pd.DataFrame([r.data for r in rows])
+        payloads = [r[0] if isinstance(r, tuple) else r.data for r in rows]
+        df = pd.DataFrame(payloads)
         if df.empty:
             return df
 
@@ -72,6 +72,22 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                     col_map[col] = "Warranty End Date"
                 elif key in {"channel", "channel name", "channel_name"}:
                     col_map[col] = "Channel"
+            if col_map:
+                df = df.rename(columns=col_map)
+        if dataset_type == "claims" and not df.empty:
+            col_map = {}
+            for col in df.columns:
+                key = str(col).strip().lower()
+                if key in {"claim amount", "claim_amount", "net claim amount", "net_claim_amount"}:
+                    col_map[col] = "Claim_Amount"
+                elif key in {"customer premium", "customer_premium", "premium"}:
+                    col_map[col] = "Customer Premium"
+                elif key in {"prodcut category", "product category", "product_category", "category"}:
+                    col_map[col] = "Product_Category"
+                elif key in {"channel", "channel name", "channel_name"}:
+                    col_map[col] = "Channel"
+                elif key in {"month", "month name", "month_name"}:
+                    col_map[col] = "Month"
             if col_map:
                 df = df.rename(columns=col_map)
         if dataset_type == "sales":
@@ -97,9 +113,15 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
 
         df = df.copy()
 
-        df["Warranty Start Date"] = pd.to_datetime(df["Warranty Start Date"], errors="coerce")
+        try:
+            df["Warranty Start Date"] = pd.to_datetime(df["Warranty Start Date"], format="mixed", errors="coerce")
+        except TypeError:
+            df["Warranty Start Date"] = pd.to_datetime(df["Warranty Start Date"], errors="coerce")
         if "Warranty End Date" in df.columns:
-            df["Warranty End Date"] = pd.to_datetime(df.get("Warranty End Date"), errors="coerce")
+            try:
+                df["Warranty End Date"] = pd.to_datetime(df.get("Warranty End Date"), format="mixed", errors="coerce")
+            except TypeError:
+                df["Warranty End Date"] = pd.to_datetime(df.get("Warranty End Date"), errors="coerce")
         else:
             df["Warranty End Date"] = pd.NaT
         df["Customer Premium"]    = pd.to_numeric(df["Customer Premium"], errors="coerce").fillna(0)
@@ -131,28 +153,15 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             df.loc[missing_start, "Earned_Premium"] = 0
             df.loc[missing_start, "Unearned_Premium"] = df.loc[missing_start, "Customer Premium"]
 
-        # Revenue Split
-        def split(row):
-            split = REVENUE_SPLIT.get(row["Channel"])
-            if not split:
-                return 0,0,0,0
+        split_df = pd.DataFrame(df["Channel"].map(REVENUE_SPLIT).tolist(), index=df.index).fillna(0)
+        zopper_share = split_df.get("zopper", 0)
+        godrej_share = split_df.get("godrej", 0)
+        channel_share = split_df.get("channel", 0)
 
-            ep = row["Earned_Premium"]
-            up = row["Unearned_Premium"]
-
-            return (
-                ep * split["zopper"],
-                up * split["zopper"],
-                ep * split["godrej"],
-                ep * split["channel"]
-            )
-
-        df[[ 
-            "Zopper_Share_EP",
-            "Zopper_Unearned",
-            "Godrej_Share_EP",
-            "Channel_Share_EP"
-        ]] = df.apply(split, axis=1, result_type="expand")
+        df["Zopper_Share_EP"] = df["Earned_Premium"] * zopper_share
+        df["Zopper_Unearned"] = df["Unearned_Premium"] * zopper_share
+        df["Godrej_Share_EP"] = df["Earned_Premium"] * godrej_share
+        df["Channel_Share_EP"] = df["Earned_Premium"] * channel_share
 
         return df
 
@@ -162,9 +171,27 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
 
     def _normalize_claims(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
+        def _as_series(value):
+            if isinstance(value, pd.DataFrame):
+                if value.shape[1] == 0:
+                    return pd.Series(dtype=float, index=df.index)
+                return value.iloc[:, 0]
+            if isinstance(value, pd.Series):
+                return value
+            return pd.Series(value, index=df.index)
+
+        if "Claim_Amount" not in df.columns:
+            for alt in ["Claim Amount", "Net Claim Amount", "Net_Claim_Amount"]:
+                if alt in df.columns:
+                    df["Claim_Amount"] = df[alt]
+                    break
+        if "Claim_Amount" not in df.columns and "Customer Premium" in df.columns:
+            # Some Goodrej claim uploads carry premium fields instead of claim amount.
+            df["Claim_Amount"] = df["Customer Premium"]
         if "Claim_Amount" in df.columns:
+            claim_amount = _as_series(df["Claim_Amount"])
             df["Claim_Amount"] = pd.to_numeric(
-                df["Claim_Amount"], errors="coerce"
+                claim_amount, errors="coerce"
             ).fillna(0)
         return df
 
@@ -173,13 +200,19 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         cleaned = raw.str.replace(r"\.0$", "", regex=True)
 
         yyyymm_mask = cleaned.str.fullmatch(r"\d{6}")
-        parsed = pd.to_datetime(
-            cleaned.where(~yyyymm_mask, cleaned.str.slice(0, 4) + "-" + cleaned.str.slice(4, 6) + "-01"),
-            errors="coerce",
+        yyyymm_normalized = cleaned.where(
+            ~yyyymm_mask, cleaned.str.slice(0, 4) + "-" + cleaned.str.slice(4, 6) + "-01"
         )
+        try:
+            parsed = pd.to_datetime(yyyymm_normalized, format="mixed", errors="coerce")
+        except TypeError:
+            parsed = pd.to_datetime(yyyymm_normalized, errors="coerce")
 
         if parsed.isna().any():
-            parsed_try = pd.to_datetime(cleaned, errors="coerce")
+            try:
+                parsed_try = pd.to_datetime(cleaned, format="mixed", errors="coerce")
+            except TypeError:
+                parsed_try = pd.to_datetime(cleaned, errors="coerce")
             parsed = parsed.fillna(parsed_try)
 
         if parsed.isna().all():
@@ -429,7 +462,10 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     # --------------------------------------------------
 
     def compute_by_dimension(self, dimension: str, metric: str) -> list[dict]:
-        data = self.load_data()
+        data = self.load_data(
+            include_sales=(self.dataset_type != "claims") or metric == "loss_ratio",
+            include_claims=(self.dataset_type == "claims") or metric == "loss_ratio",
+        )
         df = data["claims"] if self.dataset_type == "claims" else data["sales"]
 
         if df.empty:
@@ -491,7 +527,10 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     # --------------------------------------------------
 
     def compute_summary(self) -> dict:
-        data = self.load_data()
+        data = self.load_data(
+            include_sales=self.dataset_type != "claims",
+            include_claims=self.dataset_type == "claims",
+        )
 
         if self.dataset_type == "claims":
             df = data["claims"]

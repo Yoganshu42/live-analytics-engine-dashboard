@@ -1,7 +1,9 @@
 import os
 from datetime import datetime, timedelta
-from passlib.context import CryptContext
+
 from jose import jwt
+from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 
 PWD_CONTEXT = CryptContext(schemes=["bcrypt"], deprecated="auto")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
@@ -14,7 +16,10 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return PWD_CONTEXT.verify(password, password_hash)
+    try:
+        return PWD_CONTEXT.verify(password, password_hash)
+    except (ValueError, UnknownHashError):
+        return False
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:

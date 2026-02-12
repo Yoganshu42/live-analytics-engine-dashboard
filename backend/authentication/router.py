@@ -1,9 +1,9 @@
 import os
+from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
 
 from db.deps import get_db
-from authentication.models import User
 from authentication.schemas import (
     LoginRequest,
     LoginResponse,
@@ -13,6 +13,7 @@ from authentication.schemas import (
 from authentication.security import verify_password, create_access_token, hash_password
 from authentication.local_users import use_local_auth, verify_local_user
 from authentication.deps import get_current_user, require_admin
+from authentication.repository import get_user_by_identifier, create_user as create_user_record
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -24,7 +25,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     else:
-        user = db.query(User).filter(User.username == payload.email).first()
+        user = get_user_by_identifier(db, payload.email)
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
@@ -44,7 +45,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/me", response_model=UserResponse)
-def me(current_user: User = Depends(get_current_user)):
+def me(current_user: Any = Depends(get_current_user)):
     return {
         "email": current_user.username,
         "role": current_user.role,
@@ -56,26 +57,28 @@ def me(current_user: User = Depends(get_current_user)):
 def create_user(
     payload: CreateUserRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: Any = Depends(require_admin),
 ):
     if use_local_auth():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Local auth enabled. Edit backend/authentication/local_users.py to add users.",
         )
-    existing = db.query(User).filter(User.username == payload.email).first()
+
+    existing = get_user_by_identifier(db, payload.email)
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
-    user = User(
-        username=payload.email,
+    user = create_user_record(
+        db,
+        identifier=payload.email,
         password_hash=hash_password(payload.password),
         role=payload.role,
-        is_active=True,
     )
-    db.add(user)
     db.commit()
-    db.refresh(user)
+
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create user")
 
     return {
         "email": user.username,
@@ -104,20 +107,19 @@ def bootstrap_users(
     created = []
 
     def ensure_user(username: str, password: str, role: str):
-        user = db.query(User).filter(User.username == username).first()
+        user = get_user_by_identifier(db, username)
         if user is None:
-            user = User(
-                username=username,
+            user = create_user_record(
+                db,
+                identifier=username,
                 password_hash=hash_password(password),
                 role=role,
-                is_active=True,
             )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-            created.append(username)
+            if user is not None:
+                created.append(username)
 
     ensure_user(admin_username, admin_password, "admin")
     ensure_user(employee_username, employee_password, "employee")
+    db.commit()
 
     return {"created": created, "admin": admin_username, "employee": employee_username}

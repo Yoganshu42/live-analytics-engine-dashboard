@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
+from services.analytics_repository import get_dataframe
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +86,21 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
 
         # yyyymm
         yyyymm_mask = cleaned.str.fullmatch(r"\d{6}")
-        parsed = pd.to_datetime(
-            cleaned.where(~yyyymm_mask, cleaned.str.slice(0, 4) + "-" + cleaned.str.slice(4, 6) + "-01"),
-            errors="coerce",
+        yyyymm_normalized = cleaned.where(
+            ~yyyymm_mask,
+            cleaned.str.slice(0, 4) + "-" + cleaned.str.slice(4, 6) + "-01",
         )
+        try:
+            parsed = pd.to_datetime(yyyymm_normalized, format="mixed", errors="coerce")
+        except TypeError:
+            parsed = pd.to_datetime(yyyymm_normalized, errors="coerce")
 
         # try full datetime / date formats
         if parsed.isna().any():
-            parsed_try = pd.to_datetime(cleaned, errors="coerce")
+            try:
+                parsed_try = pd.to_datetime(cleaned, format="mixed", errors="coerce")
+            except TypeError:
+                parsed_try = pd.to_datetime(cleaned, errors="coerce")
             parsed = parsed.fillna(parsed_try)
 
         if parsed.isna().all():
@@ -101,8 +109,6 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 if parsed_try.notna().any():
                     parsed = parsed_try
                     break
-
-        # month name only (e.g., "Jul", "Jan (till 10)")
         if parsed.isna().any():
             tokens = (
                 cleaned.str.lower()
@@ -159,19 +165,23 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
     # --------------------------------------------------
 
     def load_data(self) -> dict[str, pd.DataFrame]:
-        sales_q = self.db.query(DataRow).filter(DataRow.dataset_type == "sales")
-        claims_q = self.db.query(DataRow).filter(DataRow.dataset_type == "claims")
+        sales_df = get_dataframe(
+            db=self.db,
+            job_id=self.job_id,
+            source="reliance",
+            dataset_type="sales",
+        )
+        claims_df = get_dataframe(
+            db=self.db,
+            job_id=self.job_id,
+            source="reliance",
+            dataset_type="claims",
+        )
 
-        if self.source:
-            sales_q = sales_q.filter(DataRow.source.ilike("reliance%"))
-            claims_q = claims_q.filter(DataRow.source.ilike("reliance%"))
-
-        if self.job_id:
-            sales_q = sales_q.filter(DataRow.job_id == self.job_id)
-            claims_q = claims_q.filter(DataRow.job_id == self.job_id)
-
-        sales_df = pd.DataFrame([r.data for r in sales_q.all()])
-        claims_df = pd.DataFrame([r.data for r in claims_q.all()])
+        if sales_df is None:
+            sales_df = pd.DataFrame()
+        if claims_df is None:
+            claims_df = pd.DataFrame()
 
         if not sales_df.empty:
             sales_df.columns = [str(c).strip() for c in sales_df.columns]
@@ -231,9 +241,40 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         # CLAIMS CLEANING (NOTEBOOK)
         # -----------------------------
         if not claims_df.empty:
-            claims_df["Day of Call_Date"] = pd.to_datetime(
-                claims_df["Day of Call_Date"], errors="coerce"
+            def _normalize_key(value: str) -> str:
+                return (
+                    value.lower()
+                    .replace("_", "")
+                    .replace(" ", "")
+                    .replace("/", "")
+                    .replace("-", "")
+                    .replace("(", "")
+                    .replace(")", "")
+                    .strip()
+                )
+
+            def _pick_column(frame: pd.DataFrame, candidates: list[str]) -> str | None:
+                normalized = {_normalize_key(c): c for c in frame.columns}
+                for candidate in candidates:
+                    key = _normalize_key(candidate)
+                    if key in normalized:
+                        return normalized[key]
+                return None
+
+            call_date_col = _pick_column(
+                claims_df,
+                [
+                    "Day of Call_Date",
+                    "Day of Call Date",
+                    "Call_Date",
+                    "Call Date",
+                    "Date",
+                ],
             )
+            if call_date_col is not None:
+                claims_df["Day of Call_Date"] = pd.to_datetime(
+                    claims_df[call_date_col], errors="coerce"
+                )
 
             if "Month" in claims_df.columns:
                 claims_df["Month"] = self._parse_month_series(claims_df["Month"])
@@ -242,7 +283,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     (claims_df["Month"] >= self.report_start)
                     & (claims_df["Month"] <= self.report_end)
                 ]
-            else:
+            elif "Day of Call_Date" in claims_df.columns:
                 claims_df = claims_df[
                     claims_df["Day of Call_Date"].dt.year == 2025
                 ]
@@ -250,14 +291,31 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     (claims_df["Day of Call_Date"] >= self.report_start)
                     & (claims_df["Day of Call_Date"] <= self.report_end)
                 ]
+            else:
+                # No recognizable claims date column; keep rows rather than fail hard.
+                claims_df = claims_df.copy()
 
-            claims_df["Warranty Type"] = claims_df["Warranty Type"].replace(
-                {"Screen Protection": "Cracked Screen"}
+            warranty_col = _pick_column(claims_df, ["Warranty Type"])
+            if warranty_col is not None:
+                claims_df[warranty_col] = claims_df[warranty_col].replace(
+                    {"Screen Protection": "Cracked Screen"}
+                )
+                if warranty_col != "Warranty Type":
+                    claims_df["Warranty Type"] = claims_df[warranty_col]
+
+            brand_col = _pick_column(
+                claims_df,
+                [
+                    "Product Brand(Group)",
+                    "Product Brand (Group)",
+                    "Product Brand",
+                    "Brand",
+                ],
             )
-
-            claims_df["Product Brand(Group)"] = claims_df[
-                "Product Brand(Group)"
-            ].replace({"OPPO": "Oppo"})
+            if brand_col is not None:
+                claims_df[brand_col] = claims_df[brand_col].replace({"OPPO": "Oppo"})
+                if brand_col != "Product Brand(Group)":
+                    claims_df["Product Brand(Group)"] = claims_df[brand_col]
 
             claims_df["One time deductible"] = (
                 self._clean_number(claims_df.get("One time deductible"))
@@ -414,6 +472,15 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                         "Zone",
                         "Zone Name",
                         "Location",
+                    ])
+                elif dimension == "plan_category":
+                    dim_col = _pick_column([
+                        "Plan Type",
+                        "Plan Category",
+                        "Plan_Category",
+                        "Warranty Type",
+                        "Product Category",
+                        "Product_Category",
                     ])
                 elif dimension == "device_plan_category":
                     dim_col = _pick_column([
@@ -596,6 +663,53 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             dim_sales = _pick_dim(sales, sales_candidates)
             dim_claims = _pick_dim(claims, claims_candidates)
 
+            if dim_sales is None or dim_claims is None:
+                return []
+
+            sales = sales.copy()
+            claims = claims.copy()
+            sales[dim_sales] = sales[dim_sales].astype(str).str.strip()
+            claims[dim_claims] = claims[dim_claims].astype(str).str.strip()
+        elif dimension == "plan_category":
+            def _normalize_key(value: str) -> str:
+                return (
+                    value.lower()
+                    .replace("_", "")
+                    .replace(" ", "")
+                    .replace("/", "")
+                    .replace("-", "")
+                    .replace("(", "")
+                    .replace(")", "")
+                    .strip()
+                )
+
+            def _pick_dim(df: pd.DataFrame, candidates: list[str]) -> str | None:
+                normalized = {_normalize_key(c): c for c in df.columns}
+                for candidate in candidates:
+                    key = _normalize_key(candidate)
+                    if key in normalized:
+                        return normalized[key]
+                return None
+
+            sales_candidates = [
+                "Plan Type",
+                "Plan Category",
+                "Plan_Category",
+                "Product Category",
+                "Product_Category",
+                "Brand",
+            ]
+            claims_candidates = [
+                "Warranty Type",
+                "Plan Type",
+                "Plan Category",
+                "Plan_Category",
+                "Product Category",
+                "Product_Category",
+            ]
+
+            dim_sales = _pick_dim(sales, sales_candidates)
+            dim_claims = _pick_dim(claims, claims_candidates)
             if dim_sales is None or dim_claims is None:
                 return []
 

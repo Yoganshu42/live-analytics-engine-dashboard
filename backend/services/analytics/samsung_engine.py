@@ -6,8 +6,8 @@ from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
 
-REPORT_START = pd.Timestamp("2025-01-01")
-REPORT_END = pd.Timestamp("2025-12-31")
+REPORT_START = pd.Timestamp("2000-01-01")
+REPORT_END = pd.Timestamp("2100-12-31")
 ZOPPER_GST_MULTIPLIER = 1.18
 
 
@@ -341,13 +341,27 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         df: pd.DataFrame,
         use_adjusted: bool,
     ) -> pd.Series | None:
-        if use_adjusted and "_adj_start_date" in df.columns:
-            series = pd.to_datetime(df["_adj_start_date"], errors="coerce")
+        def _parse(series: pd.Series) -> pd.Series:
+            try:
+                return pd.to_datetime(series, format="mixed", errors="coerce")
+            except TypeError:
+                return pd.to_datetime(series, errors="coerce")
+
+        if "Month" in df.columns:
+            series = _parse(df["Month"])
             if not series.isna().all():
                 return series
-        for col in ["Start_Date", "Month", "End_Date"]:
+        if "Date" in df.columns:
+            series = _parse(df["Date"])
+            if not series.isna().all():
+                return series
+        if use_adjusted and "_adj_start_date" in df.columns:
+            series = _parse(df["_adj_start_date"])
+            if not series.isna().all():
+                return series
+        for col in ["Start_Date", "End_Date"]:
             if col in df.columns:
-                series = pd.to_datetime(df[col], errors="coerce")
+                series = _parse(df[col])
                 if not series.isna().all():
                     return series
         return None
@@ -444,7 +458,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
         # ---------------- DIMENSION ----------------
         DIMENSION_MAP = {
-            "month": ["Month", "month", "Fiscal Month", "Day of Call_Date", "Call_Date"],
+            "month": ["Month", "Date", "month", "Fiscal Month", "Day of Call_Date", "Call_Date"],
             "state": [
                 "State",
                 "State Name",
@@ -506,8 +520,19 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 start_series = None
                 month_source = df[dim]
             else:
-                start_series = df["Start_Date"] if "Start_Date" in df.columns else None
-                if metric in {"gross_premium", "earned_premium", "zopper_earned_premium"} and "_adj_start_date" in df.columns:
+                start_series = None
+                if "Date" in df.columns:
+                    date_series = pd.to_datetime(df["Date"], errors="coerce")
+                    if not date_series.isna().all():
+                        start_series = date_series
+                if start_series is None and "Start_Date" in df.columns:
+                    start_series = df["Start_Date"]
+                if metric == "quantity" and start_series is not None and not start_series.isna().all():
+                    # Quantity should follow policy start month for consistent partner comparison.
+                    month_source = start_series
+                elif metric in {"gross_premium", "earned_premium", "zopper_earned_premium"} and start_series is not None:
+                    month_source = start_series
+                elif metric in {"gross_premium", "earned_premium", "zopper_earned_premium"} and "_adj_start_date" in df.columns:
                     month_source = df["_adj_start_date"]
                 else:
                     month_source = df[dim]
@@ -548,8 +573,13 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             sales_df = sales_df.copy()
             sales_df = self._apply_sales_date_filter(sales_df, use_adjusted=True)
             if dim_key == "month":
-                start_series = sales_df["Start_Date"] if "Start_Date" in sales_df.columns else None
-                # Prefer Start_Date for month bucketing to avoid stale/invalid Month values
+                start_series = None
+                if "Date" in sales_df.columns:
+                    date_series = pd.to_datetime(sales_df["Date"], errors="coerce")
+                    if not date_series.isna().all():
+                        start_series = date_series
+                if start_series is None and "Start_Date" in sales_df.columns:
+                    start_series = sales_df["Start_Date"]
                 if start_series is not None and not start_series.isna().all():
                     month_source = start_series
                 else:

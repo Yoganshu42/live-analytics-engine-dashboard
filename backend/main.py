@@ -11,9 +11,12 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
+    Response,
 )
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
@@ -22,9 +25,11 @@ from db.base import Base
 from db.deps import get_db
 
 from models.data_rows import DataRow
+from models.manual_updates import ManualUpdateMarker
 from authentication import models as auth_models
 from authentication.deps import get_current_user
 from authentication.router import router as auth_router
+from services.manual_update_service import mark_manual_update
 
 # --------------------------------------------------
 # LOGGING
@@ -67,7 +72,29 @@ app = FastAPI(
 # --------------------------------------------------
 # DB INIT
 # --------------------------------------------------
-Base.metadata.create_all(bind=engine)
+@app.on_event("startup")
+def _init_db():
+    try:
+        Base.metadata.create_all(bind=engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_data_rows_source_dataset
+                    ON public.data_rows (source, dataset_type)
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_data_rows_source_dataset_job
+                    ON public.data_rows (source, dataset_type, job_id)
+                    """
+                )
+            )
+    except Exception:
+        logger.exception("DB init failed")
 
 # --------------------------------------------------
 # ✅ CORS — FIXED (DEV SAFE)
@@ -82,17 +109,32 @@ app.add_middleware(
 
 
 # --------------------------------------------------
+# CORS PREFLIGHT (EXPLICIT)
+# --------------------------------------------------
+@app.options("/{path:path}")
+def preflight(path: str, request: Request):
+    return Response(status_code=204)
+
+
+# --------------------------------------------------
 # ROUTERS
 # --------------------------------------------------
 from routers.analytics import router as analytics_router
+from routers.admin_files import router as admin_files_router
+from services.analytics_repository import invalidate_dataframe_cache
 app.include_router(auth_router)
 app.include_router(analytics_router, dependencies=[Depends(get_current_user)])
+app.include_router(admin_files_router)
 
 # --------------------------------------------------
 # HEALTH CHECK
 # --------------------------------------------------
 @app.get("/health")
 def health():
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
     return {"status": "ok"}
 
 # ==================================================
@@ -146,6 +188,18 @@ async def upload_file(
         ]
     )
     db.commit()
+    mark_manual_update(
+        db=db,
+        source=source.lower().strip(),
+        dataset_type=dataset_type.lower().strip(),
+        job_id=job_id,
+    )
+    db.commit()
+    invalidate_dataframe_cache(
+        source=source.lower().strip(),
+        dataset_type=dataset_type.lower().strip(),
+        job_id=job_id,
+    )
 
     logger.info(
         "UPLOAD: source=%s dataset=%s rows=%s",
@@ -183,6 +237,18 @@ def ingest_rows(
     ]
     db.add_all(rows)
     db.commit()
+    mark_manual_update(
+        db=db,
+        source=payload.source.lower().strip(),
+        dataset_type=payload.dataset_type.lower().strip(),
+        job_id=payload.job_id,
+    )
+    db.commit()
+    invalidate_dataframe_cache(
+        source=payload.source.lower().strip(),
+        dataset_type=payload.dataset_type.lower().strip(),
+        job_id=payload.job_id,
+    )
     return {"rows_inserted": len(rows)}
 
 # ==================================================
