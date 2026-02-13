@@ -3,7 +3,6 @@
 from fastapi import APIRouter, Query, Depends
 import pandas as pd
 from sqlalchemy.orm import Session
-from sqlalchemy import func
 from collections import Counter
 from datetime import datetime
 
@@ -12,13 +11,9 @@ from services.analytics import ENGINE_REGISTRY
 from services.analytics_repository import get_dataframe
 from services.analytics_engine import (
     aggregate_by_dimension,
-    get_latest_date,
     filter_by_date_range,
-    get_date_bounds,
 )
 from models.data_rows import DataRow
-from models.manual_updates import ManualUpdateMarker
-
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
@@ -39,6 +34,83 @@ def _normalize_source(source: str) -> tuple[str, str]:
     return resolved, engine_key
 
 
+def _current_month_cap() -> pd.Timestamp:
+    now = datetime.now()
+    start = pd.Timestamp(year=now.year, month=now.month, day=1)
+    return start + pd.offsets.MonthEnd(0)
+
+
+def _parse_series(series: pd.Series) -> pd.Series:
+    try:
+        return pd.to_datetime(series, format="mixed", errors="coerce")
+    except TypeError:
+        return pd.to_datetime(series, errors="coerce")
+
+
+def _clip_to_current_month(series: pd.Series) -> pd.Series:
+    cap = _current_month_cap()
+    return series.where(series <= cap, cap)
+
+
+def _sanitize_range(
+    from_date: str | None,
+    to_date: str | None,
+) -> tuple[str | None, str | None]:
+    cap = _current_month_cap()
+    from_dt = pd.to_datetime(from_date, errors="coerce") if from_date else None
+    to_dt = pd.to_datetime(to_date, errors="coerce") if to_date else None
+
+    if from_dt is not None and from_dt is not pd.NaT and from_dt > cap:
+        from_dt = cap
+    if to_dt is not None and to_dt is not pd.NaT and to_dt > cap:
+        to_dt = cap
+
+    if from_dt is not None and to_dt is not None and from_dt > to_dt:
+        from_dt, to_dt = to_dt, from_dt
+
+    safe_from = from_dt.date().isoformat() if from_dt is not None and from_dt is not pd.NaT else None
+    safe_to = to_dt.date().isoformat() if to_dt is not None and to_dt is not pd.NaT else None
+    return safe_from, safe_to
+
+
+def _latest_from_columns(df: pd.DataFrame, columns: list[str]) -> pd.Timestamp | None:
+    if df is None or df.empty:
+        return None
+    best: pd.Timestamp | None = None
+    for col in columns:
+        if col not in df.columns:
+            continue
+        series = _parse_series(df[col]).dropna()
+        if series.empty:
+            continue
+        series = _clip_to_current_month(series)
+        current = series.max()
+        if best is None or current > best:
+            best = current
+    return best
+
+
+def _bounds_from_columns(df: pd.DataFrame, columns: list[str]) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if df is None or df.empty:
+        return None, None
+    min_found: pd.Timestamp | None = None
+    max_found: pd.Timestamp | None = None
+    for col in columns:
+        if col not in df.columns:
+            continue
+        series = _parse_series(df[col]).dropna()
+        if series.empty:
+            continue
+        series = _clip_to_current_month(series)
+        local_min = series.min()
+        local_max = series.max()
+        if min_found is None or local_min < min_found:
+            min_found = local_min
+        if max_found is None or local_max > max_found:
+            max_found = local_max
+    return min_found, max_found
+
+
 @router.get("/by-dimension")
 def analytics_by_dimension(
     job_id: str | None = Query(None),
@@ -50,6 +122,7 @@ def analytics_by_dimension(
     to_date: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, engine_key = _normalize_source(source)
 
     # ==============================
@@ -116,6 +189,7 @@ def analytics_summary(
     to_date: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, engine_key = _normalize_source(source)
 
     if engine_key in ENGINE_REGISTRY and dataset_type in {"sales", "claims"}:
@@ -200,10 +274,36 @@ def analytics_summary(
             "units_sold": int(len(df)),
         }
 
+    def _sum_first_available(*names: str) -> float:
+        normalized = {str(col).strip().lower().replace(" ", "_"): col for col in df.columns}
+        for raw_name in names:
+            key = raw_name.strip().lower().replace(" ", "_")
+            actual = normalized.get(key)
+            if actual is None:
+                continue
+            return float(pd.to_numeric(df[actual], errors="coerce").fillna(0).sum())
+        return 0.0
+
     return {
-        "gross_premium": float(df.get("Amount", 0).sum()),
-        "earned_premium": float(df.get("earned_premium", 0).sum()),
-        "zopper_earned_premium": float(df.get("earned_zopper", 0).sum()),
+        "gross_premium": _sum_first_available(
+            "amount",
+            "gross_premium",
+            "gross premium",
+            "customer_premium",
+            "customer premium",
+        ),
+        "earned_premium": _sum_first_available(
+            "earned_premium",
+            "earned premium",
+            "earned_amount",
+            "earned amount",
+        ),
+        "zopper_earned_premium": _sum_first_available(
+            "earned_zopper",
+            "zopper_earned_premium",
+            "zopper earned premium",
+            "zopper_earned_amount",
+        ),
         "units_sold": int(len(df)),
     }
 
@@ -217,28 +317,42 @@ def analytics_last_updated(
     to_date: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
-    job_key = (job_id or "").strip()
 
-    source_candidates = [resolved_source]
+    sales_start_columns = [
+        "Start_Date",
+        "Start Date",
+        "Plan Start Date",
+        "Warranty Start Date",
+        "Date",
+    ]
+    claims_date_columns = [
+        "Day of Call_Date",
+        "Call_Date",
+        "Call Date",
+        "Date",
+    ]
+
+    def _latest_for_source(src: str) -> pd.Timestamp | None:
+        df = get_dataframe(
+            db=db,
+            job_id=job_id,
+            source=src,
+            dataset_type=dataset_type,
+        )
+        if dataset_type == "sales":
+            return _latest_from_columns(df, sales_start_columns)
+        return _latest_from_columns(df, claims_date_columns)
+
     if resolved_source == "samsung":
-        source_candidates = ["samsung", "samsung_vs", "samsung_croma"]
+        latest_values = [_latest_for_source("samsung_vs"), _latest_for_source("samsung_croma")]
+        latest_values = [v for v in latest_values if v is not None]
+        latest = max(latest_values) if latest_values else None
+    else:
+        latest = _latest_for_source(resolved_source)
 
-    latest = (
-        db.query(func.max(ManualUpdateMarker.updated_at))
-        .filter(ManualUpdateMarker.dataset_type == dataset_type.lower().strip())
-        .filter(ManualUpdateMarker.job_key == job_key)
-        .filter(ManualUpdateMarker.source.in_(source_candidates))
-        .scalar()
-    )
-
-    if latest is None:
-        return {"data_upto": None}
-
-    date_str = latest.date().isoformat() if hasattr(latest, "date") else str(latest)
-    return {
-        "data_upto": date_str,
-    }
+    return {"data_upto": latest.date().isoformat() if latest is not None else None}
 
 
 @router.get("/date-bounds")
@@ -250,65 +364,28 @@ def analytics_date_bounds(
 ):
     resolved_source, _ = _normalize_source(source)
 
-    def _parse_series(series: pd.Series):
-        try:
-            return pd.to_datetime(series, format="mixed", errors="coerce")
-        except TypeError:
-            return pd.to_datetime(series, errors="coerce")
-
     def _bounds_for_source(src: str):
-        if src.startswith("samsung") and dataset_type == "sales":
-            df = get_dataframe(
-                db=db,
-                job_id=job_id,
-                source=src,
-                dataset_type=dataset_type,
-            )
-            if df is None or df.empty:
-                return None, None
-
-            # Prefer actual sales record dates for Samsung bounds.
-            min_found = None
-            max_found = None
-            for col in ["Month", "Month Name", "Month_Name", "Date", "Start_Date", "Start Date", "Plan Start Date"]:
-                if col not in df.columns:
-                    continue
-                series = _parse_series(df[col])
-                if series.notna().any():
-                    s_min = series.min()
-                    s_max = series.max()
-                    if min_found is None or s_min < min_found:
-                        min_found = s_min
-                    if max_found is None or s_max > max_found:
-                        max_found = s_max
-            return min_found, max_found
-
-        if src.startswith("reliance") and dataset_type == "sales":
-            engine_cls = ENGINE_REGISTRY.get("reliance")
-            if engine_cls is not None:
-                engine = engine_cls(
-                    db=db,
-                    job_id=job_id,
-                    source=src,
-                    dataset_type=dataset_type,
-                    from_date=None,
-                    to_date=None,
-                )
-                data = engine.load_data()
-                df = data.get("sales")
-                if df is None or df.empty:
-                    return None, None
-                if "_ew" in df.columns:
-                    df = df[df["_ew"] != True]
-                return get_date_bounds(df, dataset_type)
-
         df = get_dataframe(
             db=db,
             job_id=job_id,
             source=src,
             dataset_type=dataset_type,
         )
-        return get_date_bounds(df, dataset_type)
+        if dataset_type == "sales":
+            return _bounds_from_columns(
+                df,
+                [
+                    "Start_Date",
+                    "Start Date",
+                    "Plan Start Date",
+                    "Warranty Start Date",
+                    "Date",
+                ],
+            )
+        return _bounds_from_columns(
+            df,
+            ["Day of Call_Date", "Call_Date", "Call Date", "Date"],
+        )
 
     if resolved_source == "samsung":
         vs_min, vs_max = _bounds_for_source("samsung_vs")
@@ -318,13 +395,13 @@ def analytics_date_bounds(
     else:
         min_date, max_date = _bounds_for_source(resolved_source)
 
-    if resolved_source.startswith("reliance") and dataset_type == "sales":
-        clamp_min = pd.Timestamp("2025-07-01")
-        if min_date is None or min_date < clamp_min:
-            min_date = clamp_min
-        clamp_max = pd.Timestamp("2025-12-31")
-        if max_date is None or max_date > clamp_max:
-            max_date = clamp_max
+    cap = _current_month_cap()
+    if max_date is not None and max_date > cap:
+        max_date = cap
+    if min_date is not None and min_date > cap:
+        min_date = cap
+    if min_date is not None and max_date is not None and min_date > max_date:
+        min_date = max_date
 
     return {
         "min_date": min_date.date().isoformat() if min_date is not None else None,
