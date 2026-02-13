@@ -86,6 +86,54 @@ def _init_db():
     try:
         Base.metadata.create_all(bind=engine)
         with engine.begin() as conn:
+            # Some DB restores (like analytics.sql) only include `data_rows` + `users`.
+            # Create the manual update marker table explicitly so admin "Replace Tag"
+            # and upload flows don't fail in production.
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.manual_update_markers (
+                        id SERIAL PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        dataset_type TEXT NOT NULL,
+                        job_key TEXT NOT NULL DEFAULT '',
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_update_marker_tag
+                    ON public.manual_update_markers (source, dataset_type, job_key);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_manual_update_markers_source
+                    ON public.manual_update_markers (source);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_manual_update_markers_dataset
+                    ON public.manual_update_markers (dataset_type);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_manual_update_markers_job
+                    ON public.manual_update_markers (job_key);
+                    """
+                )
+            )
             conn.execute(
                 text(
                     """
