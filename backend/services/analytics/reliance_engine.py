@@ -538,8 +538,6 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     .reset_index()
                     .rename(columns={ew_dim_col: dimension, "_value": "ew_count"})
                 )
-                if dimension == "month" and "month" in ew_out.columns:
-                    ew_out["month"] = pd.to_datetime(ew_out["month"], errors="coerce").dt.strftime("%b-%y")
                 out = out.merge(ew_out, on=dimension, how="outer").fillna(0)
 
         if dimension == "month" and "month" in out.columns:
