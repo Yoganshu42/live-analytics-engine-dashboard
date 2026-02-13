@@ -104,6 +104,19 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
         return month_dt
 
+    def _coalesce_columns(
+        self,
+        df: pd.DataFrame,
+        target: str,
+        candidates: list[str],
+    ) -> pd.DataFrame:
+        available = [c for c in candidates if c in df.columns]
+        if not available:
+            return df
+        combined = df[available].bfill(axis=1).iloc[:, 0]
+        df[target] = combined
+        return df
+
     # --------------------------------------------------
     # LOAD DATA
     # --------------------------------------------------
@@ -153,31 +166,27 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         if not sales_df.empty:
             sales_df.columns = [str(c).strip() for c in sales_df.columns]
 
-        # normalize common date column variants
-        col_renames = {}
-        for src, dest in [
-            ("Start Date", "Start_Date"),
-            ("Start_Date", "Start_Date"),
-            ("Plan Start Date", "Start_Date"),
-            ("End Date", "End_Date"),
-            ("End_Date", "End_Date"),
-            ("Plan End Date", "End_Date"),
-            ("Month", "Month"),
-            ("Month ", "Month"),
-            ("Month Name", "Month"),
-            ("Month_Name", "Month"),
-            ("Fiscal Month", "Fiscal Month"),
-            ("State / City", "State"),
-            ("State/City", "State"),
-        ]:
-            if src in sales_df.columns and dest not in sales_df.columns:
-                col_renames[src] = dest
-        if col_renames:
-            sales_df = sales_df.rename(columns=col_renames)
+        # Coalesce common variants into canonical columns (works even when both variants exist).
+        if not sales_df.empty:
+            sales_df = self._coalesce_columns(sales_df, "Start_Date", ["Start_Date", "Start Date", "Plan Start Date"])
+            sales_df = self._coalesce_columns(sales_df, "End_Date", ["End_Date", "End Date", "Plan End Date"])
+            sales_df = self._coalesce_columns(sales_df, "Month", ["Month", "Month ", "Month Name", "Month_Name"])
+            sales_df = self._coalesce_columns(sales_df, "State", ["State", "State / City", "State/City"])
 
         if not sales_df.empty:
-            sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], errors="coerce")
-            sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], errors="coerce")
+            try:
+                sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], format="mixed", errors="coerce")
+            except TypeError:
+                sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], errors="coerce")
+            try:
+                sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], format="mixed", errors="coerce")
+            except TypeError:
+                sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], errors="coerce")
+            if "Date" in sales_df.columns:
+                try:
+                    sales_df["Date"] = pd.to_datetime(sales_df["Date"], format="mixed", errors="coerce")
+                except TypeError:
+                    sales_df["Date"] = pd.to_datetime(sales_df["Date"], errors="coerce")
             # Keep raw Month values; parsing is handled centrally in _parse_month_series
 
 
@@ -342,24 +351,45 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         use_adjusted: bool,
     ) -> pd.Series | None:
         def _parse(series: pd.Series) -> pd.Series:
+            raw = series.astype(str).str.strip()
             try:
-                return pd.to_datetime(series, format="mixed", errors="coerce")
+                parsed = pd.to_datetime(raw, format="mixed", errors="coerce")
             except TypeError:
-                return pd.to_datetime(series, errors="coerce")
+                parsed = pd.to_datetime(raw, errors="coerce")
 
-        if "Month" in df.columns:
-            series = _parse(df["Month"])
-            if not series.isna().all():
-                return series
+            # pandas can parse values like "Jan-26" as year 0001; fix those explicitly.
+            bad_year = parsed.dt.year < 2000
+            if bad_year.any():
+                mon_yy = pd.to_datetime(raw, format="%b-%y", errors="coerce")
+                if mon_yy.notna().any():
+                    parsed = parsed.where(~bad_year, mon_yy)
+                    bad_year = parsed.dt.year < 2000
+                if bad_year.any():
+                    day_mon = pd.to_datetime(raw, format="%d-%b", errors="coerce")
+                    if day_mon.notna().any():
+                        inferred_year = self.report_end.year if self.report_end is not None else pd.Timestamp.now().year
+                        day_mon = day_mon.map(lambda dt: dt.replace(year=inferred_year) if not pd.isna(dt) else dt)
+                        parsed = parsed.where(~bad_year, day_mon)
+
+            return parsed
+
         if "Date" in df.columns:
             series = _parse(df["Date"])
+            if not series.isna().all():
+                return series
+        if "Start_Date" in df.columns:
+            series = _parse(df["Start_Date"])
+            if not series.isna().all():
+                return series
+        if "Month" in df.columns:
+            series = _parse(df["Month"])
             if not series.isna().all():
                 return series
         if use_adjusted and "_adj_start_date" in df.columns:
             series = _parse(df["_adj_start_date"])
             if not series.isna().all():
                 return series
-        for col in ["Start_Date", "End_Date"]:
+        for col in ["End_Date"]:
             if col in df.columns:
                 series = _parse(df[col])
                 if not series.isna().all():
@@ -761,29 +791,103 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         df_qty = df
         df_prem = self._apply_sales_date_filter(df, use_adjusted=True)
 
+        def _norm_key(name: str) -> str:
+            return (
+                str(name)
+                .strip()
+                .lower()
+                .replace("_", "")
+                .replace(" ", "")
+                .replace("(", "")
+                .replace(")", "")
+                .replace("-", "")
+            )
+
+        def _pick_col(frame: pd.DataFrame, *candidates: str) -> str | None:
+            normalized = {_norm_key(c): c for c in frame.columns}
+            for candidate in candidates:
+                key = _norm_key(candidate)
+                if key in normalized:
+                    return normalized[key]
+            return None
+
+        def _sum_col(frame: pd.DataFrame, *candidates: str) -> float:
+            col = _pick_col(frame, *candidates)
+            if col is None:
+                return 0.0
+            series = frame[col]
+            if series is None:
+                return 0.0
+            cleaned = (
+                series.astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("INR", "", regex=False)
+                .str.replace("Rs.", "", regex=False)
+                .str.replace("Rs", "", regex=False)
+                .str.strip()
+            )
+            return float(pd.to_numeric(cleaned, errors="coerce").fillna(0).sum())
+
+        gross = _sum_col(
+            df_prem,
+            "Amount",
+            "Gross Premium",
+            "gross_premium",
+            "Plan Selling Price",
+            "Plan Selling Price ",
+            "Customer Premium",
+        )
+
+        amount_col = _pick_col(df_prem, "Amount", "Gross Premium", "Plan Selling Price", "Customer Premium")
+        earned_col = _pick_col(df_prem, "Earned Premium", "earned_premium")
+        zopper_earned_col = _pick_col(df_prem, "Zopper Earned Premium", "zopper_earned_premium", "earned_zopper")
+        zopper_share_col = _pick_col(df_prem, "Zopper Share", "Zopper Shared ( Transfer Price )", "transfer_price")
+
+        if earned_col is not None:
+            earned = _sum_col(df_prem, earned_col)
+        elif amount_col is not None and ("Start_Date" in df_prem.columns or "_adj_start_date" in df_prem.columns):
+            start_col = "_adj_start_date" if "_adj_start_date" in df_prem.columns else "Start_Date"
+            end_col = "_adj_end_date" if "_adj_end_date" in df_prem.columns else "End_Date"
+            if end_col in df_prem.columns:
+                earned = float(
+                    self._earned_with_dates(
+                        df_prem,
+                        amount_col,
+                        pd.to_datetime(df_prem[start_col], errors="coerce"),
+                        pd.to_datetime(df_prem[end_col], errors="coerce"),
+                    ).sum()
+                )
+            else:
+                earned = _sum_col(df_prem, amount_col)
+        else:
+            earned = 0.0
+
+        if zopper_earned_col is not None:
+            zopper_earned = _sum_col(df_prem, zopper_earned_col)
+        elif zopper_share_col is not None and ("Start_Date" in df_prem.columns or "_adj_start_date" in df_prem.columns):
+            start_col = "_adj_start_date" if "_adj_start_date" in df_prem.columns else "Start_Date"
+            end_col = "_adj_end_date" if "_adj_end_date" in df_prem.columns else "End_Date"
+            if end_col in df_prem.columns:
+                zopper_earned = float(
+                    (
+                        self._earned_with_dates(
+                            df_prem,
+                            zopper_share_col,
+                            pd.to_datetime(df_prem[start_col], errors="coerce"),
+                            pd.to_datetime(df_prem[end_col], errors="coerce"),
+                        )
+                        * ZOPPER_GST_MULTIPLIER
+                    ).sum()
+                )
+            else:
+                zopper_earned = _sum_col(df_prem, zopper_share_col) * ZOPPER_GST_MULTIPLIER
+        else:
+            zopper_earned = 0.0
+
         return {
-            "gross_premium": float(df_prem["Amount"].sum()),
-            "earned_premium": float(
-                (
-                    self._earned_with_dates(
-                        df_prem,
-                        "Amount",
-                        df_prem["_adj_start_date"] if "_adj_start_date" in df_prem.columns else df_prem["Start_Date"],
-                        df_prem["_adj_end_date"] if "_adj_end_date" in df_prem.columns else df_prem["End_Date"],
-                    )
-                ).sum()
-            ),
-            "zopper_earned_premium": float(
-                (
-                    self._earned_with_dates(
-                        df_prem,
-                        "Zopper Share",
-                        df_prem["_adj_start_date"] if "_adj_start_date" in df_prem.columns else df_prem["Start_Date"],
-                        df_prem["_adj_end_date"] if "_adj_end_date" in df_prem.columns else df_prem["End_Date"],
-                    )
-                    * ZOPPER_GST_MULTIPLIER
-                ).sum()
-            ),
+            "gross_premium": float(gross),
+            "earned_premium": float(earned),
+            "zopper_earned_premium": float(zopper_earned),
             "units_sold": int(len(df_qty)),
         }
 

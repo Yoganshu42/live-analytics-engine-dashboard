@@ -1,15 +1,51 @@
 import json
+import threading
+import time
 
 import pandas as pd
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
+
+_CACHE_TTL_SECONDS = 300
+_df_cache_lock = threading.Lock()
+_df_cache: dict[tuple[str, str, str], tuple[float, pd.DataFrame]] = {}
+
+
+def _cache_key(source: str, dataset_type: str, job_id: str | None) -> tuple[str, str, str]:
+    return (
+        (source or "").strip().lower(),
+        (dataset_type or "").strip().lower(),
+        (job_id or "").strip(),
+    )
+
 
 def invalidate_dataframe_cache(
     source: str | None = None,
     dataset_type: str | None = None,
     job_id: str | None = None,
 ) -> None:
-    # Cache removed intentionally; kept for compatibility with callers.
+    with _df_cache_lock:
+        if source is None and dataset_type is None and job_id is None:
+            _df_cache.clear()
+            return None
+
+        src = (source or "").strip().lower() if source is not None else None
+        ds = (dataset_type or "").strip().lower() if dataset_type is not None else None
+        jb = (job_id or "").strip() if job_id is not None else None
+
+        keys_to_delete = []
+        for key in _df_cache.keys():
+            key_source, key_dataset, key_job = key
+            if src is not None and key_source != src:
+                continue
+            if ds is not None and key_dataset != ds:
+                continue
+            if jb is not None and key_job != jb:
+                continue
+            keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            _df_cache.pop(key, None)
     return None
 
 
@@ -64,6 +100,15 @@ def get_dataframe(
     Fetch rows from data_rows and flatten JSONB `data` into a DataFrame.
     job_id is kept for compatibility but not required for analytics.
     """
+    key = _cache_key(source, dataset_type, job_id)
+    now = time.time()
+    with _df_cache_lock:
+        cached = _df_cache.get(key)
+        if cached is not None:
+            expires_at, cached_df = cached
+            if expires_at >= now:
+                return cached_df.copy(deep=False)
+            _df_cache.pop(key, None)
 
     base_query = (
         db.query(DataRow.data)
@@ -79,7 +124,10 @@ def get_dataframe(
         rows = base_query.all()
 
     if not rows:
-        return pd.DataFrame()
+        df = pd.DataFrame()
+        with _df_cache_lock:
+            _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
+        return df
 
     payloads = []
     for row in rows:
@@ -88,6 +136,12 @@ def get_dataframe(
             payloads.append(payload)
 
     if not payloads:
-        return pd.DataFrame()
+        df = pd.DataFrame()
+        with _df_cache_lock:
+            _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
+        return df
 
-    return pd.DataFrame(payloads)
+    df = pd.DataFrame(payloads)
+    with _df_cache_lock:
+        _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
+    return df.copy(deep=False)

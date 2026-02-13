@@ -30,16 +30,24 @@ engine_kwargs = {
 }
 
 if DATABASE_URL.startswith("postgresql"):
+    connect_args = {}
     engine_kwargs.update(
         {
-            "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "1800")),
-            "pool_size": int(os.getenv("DB_POOL_SIZE", "5")),
-            "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+            "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "900")),
+            "pool_size": int(os.getenv("DB_POOL_SIZE", "3")),
+            "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "2")),
+            "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "30")),
+            "pool_use_lifo": os.getenv("DB_POOL_USE_LIFO", "1") == "1",
         }
     )
 
     if _needs_ssl(DATABASE_URL) and "sslmode=" not in DATABASE_URL:
-        engine_kwargs["connect_args"] = {"sslmode": "require"}
+        connect_args["sslmode"] = "require"
+
+    connect_args["application_name"] = os.getenv("DB_APP_NAME", "live-dashboard-api")
+
+    if connect_args:
+        engine_kwargs["connect_args"] = connect_args
 
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
