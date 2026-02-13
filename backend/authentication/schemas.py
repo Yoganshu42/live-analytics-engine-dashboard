@@ -28,3 +28,7 @@ class CreateUserRequest(BaseModel):
     email: ZOPPER_EMAIL
     password: str
     role: str = Field(..., pattern="^(admin|employee)$")
+
+
+class UpdatePasswordRequest(BaseModel):
+    password: str = Field(..., min_length=6)

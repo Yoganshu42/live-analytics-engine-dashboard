@@ -9,11 +9,18 @@ from authentication.schemas import (
     LoginResponse,
     UserResponse,
     CreateUserRequest,
+    UpdatePasswordRequest,
 )
 from authentication.security import verify_password, create_access_token, hash_password
 from authentication.local_users import use_local_auth, verify_local_user
 from authentication.deps import get_current_user, require_admin
-from authentication.repository import get_user_by_identifier, create_user as create_user_record
+from authentication.repository import (
+    get_user_by_identifier,
+    create_user as create_user_record,
+    list_users as list_user_records,
+    delete_user as delete_user_record,
+    update_user_password as update_user_password_record,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -85,6 +92,81 @@ def create_user(
         "role": user.role,
         "is_active": user.is_active,
     }
+
+
+@router.get("/users", response_model=list[UserResponse])
+def list_users(
+    search: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: Any = Depends(require_admin),
+):
+    if use_local_auth():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local auth enabled. User management API is unavailable.",
+        )
+
+    users = list_user_records(db, search=search, limit=limit)
+    return [
+        {
+            "email": user.username,
+            "role": user.role,
+            "is_active": user.is_active,
+        }
+        for user in users
+    ]
+
+
+@router.delete("/users/{email}")
+def delete_user(
+    email: str,
+    db: Session = Depends(get_db),
+    _: Any = Depends(require_admin),
+):
+    if use_local_auth():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local auth enabled. User management API is unavailable.",
+        )
+
+    current = get_user_by_identifier(db, email)
+    if current is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    deleted = delete_user_record(db, email)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete user")
+    db.commit()
+    return {"deleted": True, "email": email}
+
+
+@router.patch("/users/{email}/password")
+def update_user_password(
+    email: str,
+    payload: UpdatePasswordRequest,
+    db: Session = Depends(get_db),
+    _: Any = Depends(require_admin),
+):
+    if use_local_auth():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local auth enabled. User management API is unavailable.",
+        )
+
+    current = get_user_by_identifier(db, email)
+    if current is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    updated = update_user_password_record(
+        db,
+        identifier=email,
+        password_hash=hash_password(payload.password),
+    )
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update password")
+    db.commit()
+    return {"updated": True, "email": email}
 
 
 @router.post("/bootstrap")

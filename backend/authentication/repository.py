@@ -127,3 +127,79 @@ def create_user(db: Session, identifier: str, password_hash: str, role: str):
         return None
 
     return SimpleNamespace(**created)
+
+
+def list_users(db: Session, search: str | None = None, limit: int = 100):
+    cols = _users_columns(db)
+    identifier_col = _identifier_column(cols)
+    password_col = _password_column(cols)
+    if not identifier_col or not password_col:
+        return []
+
+    projection = _user_projection(cols, identifier_col, password_col)
+    where_clause = ""
+    params: dict[str, object] = {"limit": max(1, min(limit, 500))}
+
+    if search:
+        where_clause = f'WHERE "{identifier_col}" ILIKE :search'
+        params["search"] = f"%{search.strip()}%"
+
+    rows = (
+        db.execute(
+            text(
+                f"""
+                SELECT {projection}
+                FROM users
+                {where_clause}
+                ORDER BY "{identifier_col}" ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return [SimpleNamespace(**row) for row in rows]
+
+
+def delete_user(db: Session, identifier: str) -> bool:
+    cols = _users_columns(db)
+    identifier_col = _identifier_column(cols)
+    if not identifier_col:
+        return False
+
+    deleted = db.execute(
+        text(
+            f"""
+            DELETE FROM users
+            WHERE "{identifier_col}" = :identifier
+            """
+        ),
+        {"identifier": identifier},
+    )
+    return bool((deleted.rowcount or 0) > 0)
+
+
+def update_user_password(db: Session, identifier: str, password_hash: str) -> bool:
+    cols = _users_columns(db)
+    identifier_col = _identifier_column(cols)
+    password_col = _password_column(cols)
+    if not identifier_col or not password_col:
+        return False
+
+    set_parts = [f'"{password_col}" = :password_hash']
+    if "updated_at" in cols:
+        set_parts.append('"updated_at" = NOW()')
+
+    updated = db.execute(
+        text(
+            f"""
+            UPDATE users
+            SET {", ".join(set_parts)}
+            WHERE "{identifier_col}" = :identifier
+            """
+        ),
+        {"identifier": identifier, "password_hash": password_hash},
+    )
+    return bool((updated.rowcount or 0) > 0)
