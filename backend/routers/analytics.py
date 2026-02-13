@@ -325,12 +325,19 @@ def analytics_last_updated(
         "Start Date",
         "Plan Start Date",
         "Warranty Start Date",
+        "Warranty Purchase Date",
+        "Product Purchased Date",
         "Date",
     ]
     claims_date_columns = [
         "Day of Call_Date",
         "Call_Date",
         "Call Date",
+        "Payment_date",
+        "Payment Date",
+        "Warranty Purchase Date",
+        "Warranty Start Date",
+        "Product Purchased Date",
         "Date",
     ]
 

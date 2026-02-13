@@ -14,9 +14,8 @@ const normalizedInsightsFlag = (
   process.env.NEXT_PUBLIC_ENABLE_GRAPH_INSIGHTS || ""
 ).trim().toLowerCase()
 
-const INSIGHTS_ENABLED =
-  normalizedInsightsFlag === "true" ||
-  (process.env.NODE_ENV !== "production" && normalizedInsightsFlag !== "false")
+// Enable insights by default; allow explicit opt-out via env.
+const INSIGHTS_ENABLED = !["0", "false", "no", "off"].includes(normalizedInsightsFlag)
 
 type Props = {
   source: string
@@ -288,7 +287,6 @@ export default function MultiGraphView({
     })
 
     if (lastInsightsKeyRef.current === insightsRequestKey) return
-    lastInsightsKeyRef.current = insightsRequestKey
 
     let active = true
     const timer = setTimeout(() => {
@@ -310,6 +308,9 @@ export default function MultiGraphView({
       })
         .then((res) => {
           if (!active) return
+          // Only lock the request key after a response so temporary failures
+          // (e.g., backend toggles, network) can be retried.
+          lastInsightsKeyRef.current = insightsRequestKey
           setInsights(Array.isArray(res.insights) ? res.insights : [])
           setInsightsModel(res.model || "")
           if (!res.insights?.length) {
@@ -318,6 +319,7 @@ export default function MultiGraphView({
         })
         .catch((err) => {
           if (!active) return
+          lastInsightsKeyRef.current = ""
           const rawMessage = err instanceof Error ? err.message : "Failed to generate insights."
           const safeMessage = /invalid token|jwt|unauthorized|forbidden|not authenticated|authentication required/i.test(rawMessage)
             ? "Insights are unavailable for this session right now."

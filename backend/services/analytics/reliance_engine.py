@@ -32,17 +32,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
     ):
         super().__init__(db=db, job_id=job_id, source=source)
         self.dataset_type = dataset_type or "sales"
-        self.report_start = pd.to_datetime(from_date, errors="coerce") if from_date else RELIANCE_START
-        self.report_end = pd.to_datetime(to_date, errors="coerce") if to_date else RELIANCE_END
-        if pd.isna(self.report_start):
-            self.report_start = RELIANCE_START
-        if pd.isna(self.report_end):
-            self.report_end = RELIANCE_END
-        if self.report_start < RELIANCE_START:
-            self.report_start = RELIANCE_START
-        if self.report_end > RELIANCE_END:
-            self.report_end = RELIANCE_END
-        if self.report_end < self.report_start:
+        # The original notebook logic hard-coded a Jul-Dec 2025 window.
+        # For the dashboard deployment we must respect the user-provided range,
+        # and otherwise default to "no extra filtering" (let the API date-bounds drive it).
+        self.report_start = pd.to_datetime(from_date, errors="coerce") if from_date else None
+        self.report_end = pd.to_datetime(to_date, errors="coerce") if to_date else None
+        if self.report_start is not None and pd.isna(self.report_start):
+            self.report_start = None
+        if self.report_end is not None and pd.isna(self.report_end):
+            self.report_end = None
+        if self.report_start is not None and self.report_end is not None and self.report_end < self.report_start:
             self.report_end = self.report_start
 
     # --------------------------------------------------
@@ -131,7 +130,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 "dec": 12,
             }
             month_num = first.map(month_map)
-            year = self.report_start.year
+            year = (self.report_start.year if self.report_start is not None else pd.Timestamp.today().year)
             parsed_month = pd.to_datetime(
                 {"year": year, "month": month_num, "day": 1},
                 errors="coerce",
@@ -217,20 +216,18 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 sales_df["Plan End Date"], errors="coerce"
             )
 
-            # NOTEBOOK: only year 2025 + July-Dec window
-            if "Month" in sales_df.columns:
+            # Normalize Month for dashboard charts.
+            # The dump contains free-form month labels like "Jan (till 10)" which are not safe to parse.
+            # Prefer Plan Start Date when available.
+            if "Plan Start Date" in sales_df.columns:
+                sales_df["Month"] = self._month_key(sales_df["Plan Start Date"])
+            elif "Month" in sales_df.columns:
                 sales_df["Month"] = self._parse_month_series(sales_df["Month"])
-                sales_df = sales_df[sales_df["Month"].dt.year == 2025]
-                sales_df = sales_df[
-                    (sales_df["Month"] >= self.report_start)
-                    & (sales_df["Month"] <= self.report_end)
-                ]
-            else:
-                sales_df = sales_df[sales_df["Plan Start Date"].dt.year == 2025]
-                sales_df = sales_df[
-                    (sales_df["Plan Start Date"] >= self.report_start)
-                    & (sales_df["Plan Start Date"] <= self.report_end)
-                ]
+
+            if self.report_start is not None and "Month" in sales_df.columns:
+                sales_df = sales_df[sales_df["Month"] >= self.report_start]
+            if self.report_end is not None and "Month" in sales_df.columns:
+                sales_df = sales_df[sales_df["Month"] <= self.report_end]
 
             # Exclude EW entirely (as requested)
             sales_df["_ew"] = self._is_ew_plan(sales_df)
