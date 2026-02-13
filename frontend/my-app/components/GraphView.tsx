@@ -114,10 +114,9 @@ const normalizeDimValue = (value: unknown, dimKey: string) => {
   return raw
 }
 
-const normalizeDimKey = (value: unknown, dimKey: string) => {
-  const label = normalizeDimValue(value, dimKey)
-  if (dimKey.includes("month") || dimKey.includes("date")) return label
-  return label.toLowerCase()
+const asNumber = (value: unknown) => {
+  const n = Number(value ?? 0)
+  return Number.isFinite(n) ? n : 0
 }
 
 const toTimeValue = (value: unknown) => {
@@ -562,8 +561,8 @@ export default function GraphView({
 
           let merged: Row[] = (combined.data || []).map(row => ({
             ...row,
-            samsung_vs: (row as any).samsung_vs ?? 0,
-            samsung_croma: (row as any).samsung_croma ?? 0,
+            samsung_vs: asNumber(row["samsung_vs"]),
+            samsung_croma: asNumber(row["samsung_croma"]),
           }))
 
           merged = filterByRange(merged, dimKey, fromDate, toDate, source)

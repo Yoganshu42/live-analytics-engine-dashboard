@@ -125,10 +125,15 @@ export default function DashboardPage() {
         ? rawJobId
         : null
 
+    const normalizedBrand = storedBrand ? normalizeBrand(storedBrand) : "samsung"
+    let normalizedMode: "sales" | "claims" = storedMode === "claims" ? "claims" : "sales"
+    // Samsung currently has sales data only in the deployed dataset.
+    if (normalizedBrand.startsWith("samsung")) normalizedMode = "sales"
+
     return {
       view: storedView === "dashboard" ? "dashboard" : "home",
-      brand: storedBrand ? normalizeBrand(storedBrand) : "samsung",
-      mode: storedMode === "claims" ? "claims" : "sales",
+      brand: normalizedBrand,
+      mode: normalizedMode,
       jobId,
       from: storedFrom,
       to: storedTo,
@@ -178,6 +183,7 @@ export default function DashboardPage() {
   const applyBrandChange = (nextBrandRaw: string) => {
     const nextBrand = normalizeBrand(nextBrandRaw)
     setBrand(nextBrand)
+    if (nextBrand.startsWith("samsung")) setMode("sales")
     setIsFullscreen(false)
     setDefaultKey("")
     setFromDate("")
@@ -288,6 +294,11 @@ export default function DashboardPage() {
 
   const handleModeChange = (nextMode: "sales" | "claims") => {
     setIsFullscreen(false)
+    // Samsung currently has sales data only in the deployed dataset.
+    if (brand.startsWith("samsung") && nextMode === "claims") {
+      setMode("sales")
+      return
+    }
     setMode(nextMode)
   }
 
@@ -646,7 +657,7 @@ export default function DashboardPage() {
                         {brand === "samsung_croma" && <Image src="/croma_logo.jpg" width={96} height={32} className="h-8 w-auto" alt="Croma" />}
                       </motion.div>
                     )}
-                    <Tabs value={mode} onChange={handleModeChange} />
+                    <Tabs value={mode} onChange={handleModeChange} disableClaims={brand.startsWith("samsung")} />
                   </div>
                 </motion.div>
 
