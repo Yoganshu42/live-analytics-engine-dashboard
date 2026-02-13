@@ -11,4 +11,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use multiple workers to handle the dashboard's parallel graph requests.
+# Tunable via UVICORN_WORKERS; default keeps memory reasonable on small instances.
+CMD ["sh", "-lc", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}"]

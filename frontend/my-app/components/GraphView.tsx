@@ -548,48 +548,22 @@ export default function GraphView({
 
         if (source === "samsung") {
           setCompareMode(true)
-          const [vs, croma] = await Promise.all([
-            fetchRowsWithRangeFallback({
-              source: "samsung_vs",
-              dimension,
-              metric,
-              datasetType,
-              bucket,
-              jobId,
-              from_date: fromDate,
-              to_date: toDate,
-            }),
-            fetchRowsWithRangeFallback({
-              source: "samsung_croma",
-              dimension,
-              metric,
-              datasetType,
-              bucket,
-              jobId,
-              from_date: fromDate,
-              to_date: toDate,
-            }),
-          ])
+          // Backend returns both partners in one response to avoid 2 requests per graph.
+          const combined = await fetchRowsWithRangeFallback({
+            source: "samsung",
+            dimension,
+            metric,
+            datasetType,
+            bucket,
+            jobId,
+            from_date: fromDate,
+            to_date: toDate,
+          })
 
-          const map = new Map<string, Row>()
-
-          const merge = (rows: Row[], key: string) => {
-            rows.forEach(row => {
-              const label = normalizeDimValue(row[dimKey], dimKey)
-              const mapKey = normalizeDimKey(row[dimKey], dimKey)
-              if (!map.has(mapKey)) map.set(mapKey, { [dimKey]: label })
-              const entry = map.get(mapKey)!
-              entry[key] = row[metricKey] ?? 0
-            })
-          }
-
-          merge(vs.data, "samsung_vs")
-          merge(croma.data, "samsung_croma")
-
-          let merged: Row[] = Array.from(map.values()).map(row => ({
+          let merged: Row[] = (combined.data || []).map(row => ({
             ...row,
-            samsung_vs: row.samsung_vs ?? 0,
-            samsung_croma: row.samsung_croma ?? 0,
+            samsung_vs: (row as any).samsung_vs ?? 0,
+            samsung_croma: (row as any).samsung_croma ?? 0,
           }))
 
           merged = filterByRange(merged, dimKey, fromDate, toDate, source)

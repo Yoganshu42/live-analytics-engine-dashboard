@@ -130,6 +130,50 @@ def analytics_by_dimension(
     # ==============================
     if engine_key in ENGINE_REGISTRY and dataset_type in {"sales", "claims"}:
         engine_cls = ENGINE_REGISTRY[engine_key]
+
+        # Samsung "overview" should return both partners in one response so the frontend
+        # doesn't need to fire 2 requests per graph (vs + croma).
+        if resolved_source == "samsung" and engine_key == "samsung":
+            dim_key = (dimension or "").strip().lower()
+            metric_key = (metric or "").strip().lower()
+            merged: dict[str, dict[str, Any]] = {}
+
+            def _merge(rows: list[dict[str, Any]], out_key: str):
+                for row in rows or []:
+                    if not isinstance(row, dict):
+                        continue
+                    dim_val = row.get(dim_key, row.get(dimension))
+                    if dim_val is None:
+                        continue
+                    key = str(dim_val)
+                    if key not in merged:
+                        merged[key] = {dim_key: dim_val}
+                    value = row.get(metric_key, row.get(metric, 0))
+                    try:
+                        merged[key][out_key] = float(value or 0)
+                    except Exception:
+                        merged[key][out_key] = 0.0
+
+            for src, out_key in [("samsung_vs", "samsung_vs"), ("samsung_croma", "samsung_croma")]:
+                engine = engine_cls(
+                    db=db,
+                    job_id=job_id,
+                    source=src,
+                    dataset_type=dataset_type,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                _merge(engine.compute_by_dimension(dimension=dimension, metric=metric) or [], out_key)
+
+            out_rows = list(merged.values())
+            for row in out_rows:
+                row["samsung_vs"] = row.get("samsung_vs", 0.0)
+                row["samsung_croma"] = row.get("samsung_croma", 0.0)
+
+            if dim_key in {"month", "date"}:
+                out_rows.sort(key=lambda r: str(r.get(dim_key, "")))
+            return out_rows
+
         engine = engine_cls(
             db=db,
             job_id=job_id,
