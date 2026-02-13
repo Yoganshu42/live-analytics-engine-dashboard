@@ -1,0 +1,17 @@
+# secrets
+**/.env
+**/.env.*
+
+# python
+**/__pycache__/
+**/*.pyc
+**/venv/
+
+# node
+**/node_modules/
+**/.next/
+**/.vercel/
+
+# local / large data dumps
+analytics.sql
+analytics.dump
