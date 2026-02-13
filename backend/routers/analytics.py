@@ -1,5 +1,7 @@
 # routers/analytics.py
 
+from typing import Any
+
 from fastapi import APIRouter, Query, Depends
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -90,6 +92,10 @@ def _latest_from_columns(df: pd.DataFrame, columns: list[str]) -> pd.Timestamp |
     return best
 
 
+def _to_safe_key(key: str) -> str:
+    return re.sub(r"[()%'.]", "", re.sub(r"\s+", "_", (key or "").strip().lower()))
+
+
 def _bounds_from_columns(df: pd.DataFrame, columns: list[str]) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     if df is None or df.empty:
         return None, None
@@ -134,21 +140,29 @@ def analytics_by_dimension(
         # Samsung "overview" should return both partners in one response so the frontend
         # doesn't need to fire 2 requests per graph (vs + croma).
         if resolved_source == "samsung" and engine_key == "samsung":
-            dim_key = (dimension or "").strip().lower()
-            metric_key = (metric or "").strip().lower()
+            dim_key = _to_safe_key(dimension or "")
+            metric_key = _to_safe_key(metric or "")
             merged: dict[str, dict[str, Any]] = {}
 
             def _merge(rows: list[dict[str, Any]], out_key: str):
                 for row in rows or []:
                     if not isinstance(row, dict):
                         continue
-                    dim_val = row.get(dim_key, row.get(dimension))
+
+                    # Engine outputs often use title-cased keys ("Month") while the API
+                    # dimension param is lower ("month"). Match by safe-key.
+                    safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                    dim_col = safe_map.get(dim_key) or safe_map.get(_to_safe_key(dimension or ""))
+                    metric_col = safe_map.get(metric_key) or safe_map.get(_to_safe_key(metric or ""))
+
+                    dim_val = row.get(dim_col) if dim_col is not None else None
                     if dim_val is None:
                         continue
                     key = str(dim_val)
                     if key not in merged:
                         merged[key] = {dim_key: dim_val}
-                    value = row.get(metric_key, row.get(metric, 0))
+
+                    value = row.get(metric_col) if metric_col is not None else row.get(metric, 0)
                     try:
                         merged[key][out_key] = float(value or 0)
                     except Exception:
