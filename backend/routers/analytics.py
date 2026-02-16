@@ -2,6 +2,8 @@
 
 from typing import Any
 import re
+import time
+import logging
 
 from fastapi import APIRouter, Query, Depends
 import pandas as pd
@@ -18,6 +20,7 @@ from services.analytics_engine import (
 )
 from models.data_rows import DataRow
 router = APIRouter(prefix="/analytics", tags=["analytics"])
+logger = logging.getLogger(__name__)
 
 
 def _normalize_source(source: str) -> tuple[str, str]:
@@ -129,6 +132,7 @@ def analytics_by_dimension(
     to_date: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    started = time.perf_counter()
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, engine_key = _normalize_source(source)
 
@@ -138,12 +142,14 @@ def analytics_by_dimension(
     if engine_key in ENGINE_REGISTRY and dataset_type in {"sales", "claims"}:
         engine_cls = ENGINE_REGISTRY[engine_key]
 
+
         # Samsung "overview" should return both partners in one response so the frontend
         # doesn't need to fire 2 requests per graph (vs + croma).
         if resolved_source == "samsung" and engine_key == "samsung":
             dim_key = _to_safe_key(dimension or "")
             metric_key = _to_safe_key(metric or "")
             merged: dict[str, dict[str, Any]] = {}
+            lock = threading.Lock()
 
             def _merge(rows: list[dict[str, Any]], out_key: str):
                 for row in rows or []:
@@ -160,25 +166,42 @@ def analytics_by_dimension(
                     if dim_val is None:
                         continue
                     key = str(dim_val)
-                    if key not in merged:
-                        merged[key] = {dim_key: dim_val}
+                    
+                    with lock:
+                        if key not in merged:
+                            merged[key] = {dim_key: dim_val}
 
-                    value = row.get(metric_col) if metric_col is not None else row.get(metric, 0)
-                    try:
-                        merged[key][out_key] = float(value or 0)
-                    except Exception:
-                        merged[key][out_key] = 0.0
+                        value = row.get(metric_col) if metric_col is not None else row.get(metric, 0)
+                        try:
+                            merged[key][out_key] = float(value or 0)
+                        except Exception:
+                            merged[key][out_key] = 0.0
 
-            for src, out_key in [("samsung_vs", "samsung_vs"), ("samsung_croma", "samsung_croma")]:
-                engine = engine_cls(
-                    db=db,
-                    job_id=job_id,
-                    source=src,
-                    dataset_type=dataset_type,
-                    from_date=from_date,
-                    to_date=to_date,
-                )
-                _merge(engine.compute_by_dimension(dimension=dimension, metric=metric) or [], out_key)
+            def _fetch_and_merge(src: str, out_key: str):
+                try:
+                    engine = engine_cls(
+                        db=db,
+                        job_id=job_id,
+                        source=src,
+                        dataset_type=dataset_type,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
+                    rows = engine.compute_by_dimension(dimension=dimension, metric=metric)
+                    _merge(rows or [], out_key)
+                except Exception as exc:
+                    logger.error("Failed to fetch %s: %s", src, exc)
+
+            import threading
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(_fetch_and_merge, "samsung_vs", "samsung_vs"),
+                    executor.submit(_fetch_and_merge, "samsung_croma", "samsung_croma"),
+                ]
+                for f in futures:
+                    f.result()
 
             out_rows = list(merged.values())
             for row in out_rows:
@@ -187,6 +210,15 @@ def analytics_by_dimension(
 
             if dim_key in {"month", "date"}:
                 out_rows.sort(key=lambda r: str(r.get(dim_key, "")))
+            logger.info(
+                "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=samsung_overview rows=%s duration_ms=%.2f",
+                source,
+                dataset_type,
+                dimension,
+                metric,
+                len(out_rows),
+                (time.perf_counter() - started) * 1000,
+            )
             return out_rows
 
         engine = engine_cls(
@@ -197,10 +229,20 @@ def analytics_by_dimension(
             from_date=from_date,
             to_date=to_date,
         )
-        return engine.compute_by_dimension(
+        out = engine.compute_by_dimension(
             dimension=dimension,
             metric=metric,
         )
+        logger.info(
+            "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=engine rows=%s duration_ms=%.2f",
+            source,
+            dataset_type,
+            dimension,
+            metric,
+            len(out),
+            (time.perf_counter() - started) * 1000,
+        )
+        return out
 
     df = get_dataframe(
         db=db,
@@ -234,9 +276,27 @@ def analytics_by_dimension(
     )
 
     if out_df is None or out_df.empty:
+        logger.info(
+            "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=fallback rows=0 duration_ms=%.2f",
+            source,
+            dataset_type,
+            dimension,
+            metric,
+            (time.perf_counter() - started) * 1000,
+        )
         return []
 
-    return out_df.to_dict(orient="records")
+    out = out_df.to_dict(orient="records")
+    logger.info(
+        "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=fallback rows=%s duration_ms=%.2f",
+        source,
+        dataset_type,
+        dimension,
+        metric,
+        len(out),
+        (time.perf_counter() - started) * 1000,
+    )
+    return out
 
 
 @router.get("/summary")
@@ -248,6 +308,7 @@ def analytics_summary(
     to_date: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    started = time.perf_counter()
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, engine_key = _normalize_source(source)
 
@@ -274,6 +335,12 @@ def analytics_summary(
                 total["earned_premium"] += float(summary.get("earned_premium", 0) or 0)
                 total["zopper_earned_premium"] += float(summary.get("zopper_earned_premium", 0) or 0)
                 total["units_sold"] += int(summary.get("units_sold", 0) or 0)
+            logger.info(
+                "TIMING analytics.summary source=%s dataset=%s mode=samsung_overview duration_ms=%.2f",
+                source,
+                dataset_type,
+                (time.perf_counter() - started) * 1000,
+            )
             return total
 
         engine = engine_cls(
@@ -284,7 +351,14 @@ def analytics_summary(
             from_date=from_date,
             to_date=to_date,
         )
-        return engine.compute_summary()
+        out = engine.compute_summary()
+        logger.info(
+            "TIMING analytics.summary source=%s dataset=%s mode=engine duration_ms=%.2f",
+            source,
+            dataset_type,
+            (time.perf_counter() - started) * 1000,
+        )
+        return out
 
     df = get_dataframe(
         db=db,

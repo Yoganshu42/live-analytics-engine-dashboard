@@ -1,8 +1,10 @@
+
 import json
 import threading
 import time
 
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 
@@ -50,10 +52,11 @@ def invalidate_dataframe_cache(
 
 
 def _extract_data_payload(row) -> dict | None:
-    data = getattr(row, "data", None)
-    if data is None and isinstance(row, (tuple, list)) and row:
-        data = row[0]
-
+    # Row is a tuple from raw SQL: (data, )
+    if not row:
+        return None
+    
+    data = row[0]
     if isinstance(data, str):
         try:
             data = json.loads(data)
@@ -72,6 +75,7 @@ def get_data_rows(
     """
     Fetch raw rows from data_rows table and return JSON payloads.
     """
+    # Use raw SQL for speed here too if needed, but this is less critical than get_dataframe
     rows = (
         db.query(DataRow.data)
         .filter(
@@ -91,14 +95,13 @@ def get_data_rows(
 
 
 def get_dataframe(
-    db,
+    db: Session,
     job_id: str | None,
     source: str,
     dataset_type: str,
 ):
     """
-    Fetch rows from data_rows and flatten JSONB `data` into a DataFrame.
-    job_id is kept for compatibility but not required for analytics.
+    Fetch rows from data_rows using RAW SQL and flatten JSONB `data` into a DataFrame.
     """
     key = _cache_key(source, dataset_type, job_id)
     now = time.time()
@@ -110,18 +113,31 @@ def get_dataframe(
                 return cached_df.copy(deep=False)
             _df_cache.pop(key, None)
 
-    base_query = (
-        db.query(DataRow.data)
-        .filter(DataRow.source == source)
-        .filter(DataRow.dataset_type == dataset_type)
-    )
-    query = base_query
+    # RAW SQL QUERY for performance (bypasses ORM overhead)
+    # We select only the 'data' column.
+    stmt = "SELECT data FROM data_rows WHERE source = :source AND dataset_type = :dataset_type"
+    params = {"source": source, "dataset_type": dataset_type}
+    
     if job_id:
-        query = query.filter(DataRow.job_id == job_id)
-
-    rows = query.all()
-    if job_id and not rows:
-        rows = base_query.all()
+        stmt += " AND job_id = :job_id"
+        params["job_id"] = job_id
+        
+    try:
+        # Execute raw SQL
+        result = db.execute(text(stmt), params)
+        rows = result.fetchall()
+        
+        # If job_id was requested but returned nothing, try fallback to all rows (matching logic in original code)
+        if job_id and not rows:
+            stmt = "SELECT data FROM data_rows WHERE source = :source AND dataset_type = :dataset_type"
+            params = {"source": source, "dataset_type": dataset_type}
+            result = db.execute(text(stmt), params)
+            rows = result.fetchall()
+            
+    except Exception as e:
+        # Fallback or error handling
+        print(f"DB Error in get_dataframe: {e}")
+        rows = []
 
     if not rows:
         df = pd.DataFrame()
@@ -129,11 +145,20 @@ def get_dataframe(
             _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
         return df
 
-    payloads = []
-    for row in rows:
-        payload = _extract_data_payload(row)
-        if payload is not None:
-            payloads.append(payload)
+    # Optimize payload extraction
+    # rows is list of tuples: [({'col': val},), ({'col': val},), ...]
+    # We need list of dicts:  [{'col': val}, {'col': val}, ...]
+    
+    # Fast path: assuming data is already dict (SQLAlchemy + psycopg2 usually adapts JSONB to dict automatically)
+    try:
+        payloads = [r[0] for r in rows if r[0] is not None]
+    except Exception:
+        # Fallback slow path if data needs parsing
+        payloads = []
+        for row in rows:
+            p = _extract_data_payload(row)
+            if p:
+                payloads.append(p)
 
     if not payloads:
         df = pd.DataFrame()
@@ -141,7 +166,9 @@ def get_dataframe(
             _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
         return df
 
-    df = pd.DataFrame(payloads)
+    # Create DataFrame directly from list of dicts
+    df = pd.DataFrame.from_records(payloads)
+    
     with _df_cache_lock:
         _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
     return df.copy(deep=False)

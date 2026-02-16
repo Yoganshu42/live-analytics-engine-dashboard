@@ -633,7 +633,9 @@ export default function GraphView({
         })
       } catch (e: unknown) {
         if (requestId !== requestIdRef.current) return
-        setError(e instanceof Error ? e.message : "Failed")
+        const msg = e instanceof Error ? e.message : "Failed"
+        console.error("GraphView fetch error:", msg, { source, dimension, metric })
+        setError(msg)
         setData([])
         onDataReady?.({
           rows: [],
