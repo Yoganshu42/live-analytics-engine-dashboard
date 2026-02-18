@@ -1,0 +1,33 @@
+﻿version: "3.9"
+services:
+  backend:
+    build:
+      context: ./backend
+    image: live-dashboard-backend:latest
+    environment:
+      DATABASE_URL: postgresql://postgres:DBaaKhprViUUu2F@database-1.cr4kiosyiszs.ap-south-1.rds.amazonaws.com:5432/analytics_db
+      JWT_SECRET: change-me
+      ACCESS_TOKEN_EXPIRE_MINUTES: "720"
+      BOOTSTRAP_TOKEN: change-me
+      ADMIN_USERNAME: admin.user@zopper.com
+      ADMIN_PASSWORD: admin123
+      EMPLOYEE_USERNAME: employee.user@zopper.com
+      EMPLOYEE_PASSWORD: employee123
+      UVICORN_WORKERS: "2"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend/my-app
+      args:
+        NEXT_PUBLIC_API_BASE: http://43.205.134.36:8000
+    image: live-dashboard-frontend:latest
+    environment:
+      NEXT_PUBLIC_API_BASE: http://43.205.134.36:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
