@@ -79,7 +79,7 @@ type GraphInsightsResponse = {
 
 const DEFAULT_API_BASE =
   typeof window !== "undefined"
-    ? `http://${window.location.hostname || "127.0.0.1"}:8000`
+    ? (window.location.origin || "")
     : "http://127.0.0.1:8000"
 
 const normalizeApiBase = (value: string) => {
@@ -88,22 +88,41 @@ const normalizeApiBase = (value: string) => {
   const match = withoutMarker.match(/https?:\/\/.*/)
   return match ? match[0] : withoutMarker
 }
-const API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE || DEFAULT_API_BASE)
+const ENV_API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE || "")
+const API_BASE = ENV_API_BASE || DEFAULT_API_BASE
 
 const runtimeOverride =
   typeof window !== "undefined"
     ? normalizeApiBase(new URLSearchParams(window.location.search).get("api") || "")
     : ""
 
+const browserHostApiBases =
+  typeof window !== "undefined"
+    ? [
+        `${window.location.protocol}//${window.location.hostname}:8000`,
+        `http://${window.location.hostname}:8000`,
+      ]
+    : []
+
 const API_FALLBACKS = Array.from(
   new Set([
     runtimeOverride,
+    ENV_API_BASE,
+    ...browserHostApiBases,
     API_BASE,
     "http://127.0.0.1:8000",
     "http://localhost:8000",
     "http://0.0.0.0:8000",
   ].map(v => normalizeApiBase(v)).filter(Boolean))
 )
+const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
+const ADMIN_UPLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_ADMIN_UPLOAD_TIMEOUT_MS || 180000)
+let preferredApiBase = API_FALLBACKS[0] || ""
+
+const orderedApiBases = () => {
+  const ordered = [preferredApiBase, ...API_FALLBACKS].filter(Boolean)
+  return Array.from(new Set(ordered))
+}
 
 const normalizeToken = (value: string | null) => {
   if (!value) return null
@@ -131,25 +150,44 @@ class NoFallbackError extends Error {
   noFallback = true
 }
 
-async function fetchJsonWithFallback(path: string, query: string, init: RequestInit = {}) {
+type ApiRequestInit = RequestInit & {
+  timeoutMs?: number
+}
+
+const fetchWithTimeout = async (
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = API_REQUEST_TIMEOUT_MS
+) => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function fetchJsonWithFallback(path: string, query: string, init: ApiRequestInit = {}) {
   const response = await fetchResponseWithFallback(path, query, init)
   return response.json()
 }
 
-async function fetchResponseWithFallback(path: string, query: string, init: RequestInit = {}) {
+async function fetchResponseWithFallback(path: string, query: string, init: ApiRequestInit = {}) {
   const errors: string[] = []
   let sawUnauthorized = false
+  const { timeoutMs, ...requestInit } = init
 
-  for (const base of API_FALLBACKS) {
+  for (const base of orderedApiBases()) {
     const url = query ? `${base}${path}?${query}` : `${base}${path}`
     try {
-      const headers = new Headers(init.headers || {})
+      const headers = new Headers(requestInit.headers || {})
       headers.set("Accept", "application/json")
 
       const isFormDataBody =
-        typeof FormData !== "undefined" && init.body instanceof FormData
+        typeof FormData !== "undefined" && requestInit.body instanceof FormData
 
-      if (init.body && !isFormDataBody && !headers.has("Content-Type")) {
+      if (requestInit.body && !isFormDataBody && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json")
       }
 
@@ -158,11 +196,11 @@ async function fetchResponseWithFallback(path: string, query: string, init: Requ
         headers.set("Authorization", `Bearer ${token}`)
       }
 
-      const res = await fetch(url, {
-        ...init,
+      const res = await fetchWithTimeout(url, {
+        ...requestInit,
         mode: "cors",
         headers,
-      })
+      }, timeoutMs)
 
       if (!res.ok) {
         let detail = ""
@@ -188,12 +226,18 @@ async function fetchResponseWithFallback(path: string, query: string, init: Requ
         throw new Error(message)
       }
 
+      preferredApiBase = base
       return res
     } catch (err) {
       if (err instanceof NoFallbackError) {
         throw err
       }
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg =
+        err instanceof Error && err.name === "AbortError"
+          ? `Request timed out after ${timeoutMs ?? API_REQUEST_TIMEOUT_MS}ms`
+          : err instanceof Error
+            ? err.message
+            : String(err)
       errors.push(`${url} -> ${msg}`)
       continue
     }
@@ -350,6 +394,28 @@ export async function replaceAdminFile(payload: {
   return fetchJsonWithFallback("/admin/files/replace", "", {
     method: "POST",
     body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
+}
+
+export async function updateAdminFile(payload: {
+  file: File
+  source: string
+  dataset_type: string
+  job_id?: string
+}) {
+  const form = new FormData()
+  form.append("file", payload.file)
+  form.append("source", payload.source)
+  form.append("dataset_type", payload.dataset_type)
+  if (payload.job_id !== undefined) {
+    form.append("job_id", payload.job_id)
+  }
+
+  return fetchJsonWithFallback("/admin/files/update", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
   })
 }
 

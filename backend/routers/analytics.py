@@ -7,6 +7,7 @@ import logging
 
 from fastapi import APIRouter, Query, Depends
 import pandas as pd
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from collections import Counter
 from datetime import datetime
@@ -19,6 +20,14 @@ from services.analytics_engine import (
     filter_by_date_range,
 )
 from models.data_rows import DataRow
+from models.manual_updates import ManualUpdateMarker
+from services.precomputed_repository import (
+    get_precomputed_graph,
+    get_precomputed_summary,
+    upsert_precomputed_graph,
+    upsert_precomputed_summary,
+)
+from services.manual_update_service import mark_manual_update
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 logger = logging.getLogger(__name__)
 
@@ -48,28 +57,24 @@ def _current_month_cap() -> pd.Timestamp:
 
 def _parse_series(series: pd.Series) -> pd.Series:
     try:
-        return pd.to_datetime(series, format="mixed", errors="coerce")
+        parsed = pd.to_datetime(series, format="mixed", errors="coerce")
     except TypeError:
-        return pd.to_datetime(series, errors="coerce")
+        parsed = pd.to_datetime(series, errors="coerce")
+    # Ignore implausible/legacy parsed dates that distort bounds (e.g. 1970 from malformed month codes).
+    return parsed.where(parsed.dt.year >= 2000)
 
 
 def _clip_to_current_month(series: pd.Series) -> pd.Series:
-    cap = _current_month_cap()
-    return series.where(series <= cap, cap)
+    # Do not cap to the current month; uploaded data can legitimately include future periods.
+    return series
 
 
 def _sanitize_range(
     from_date: str | None,
     to_date: str | None,
 ) -> tuple[str | None, str | None]:
-    cap = _current_month_cap()
     from_dt = pd.to_datetime(from_date, errors="coerce") if from_date else None
     to_dt = pd.to_datetime(to_date, errors="coerce") if to_date else None
-
-    if from_dt is not None and from_dt is not pd.NaT and from_dt > cap:
-        from_dt = cap
-    if to_dt is not None and to_dt is not pd.NaT and to_dt > cap:
-        to_dt = cap
 
     if from_dt is not None and to_dt is not None and from_dt > to_dt:
         from_dt, to_dt = to_dt, from_dt
@@ -121,19 +126,17 @@ def _bounds_from_columns(df: pd.DataFrame, columns: list[str]) -> tuple[pd.Times
     return min_found, max_found
 
 
-@router.get("/by-dimension")
-def analytics_by_dimension(
-    job_id: str | None = Query(None),
-    dimension: str = Query(...),
-    metric: str = Query(...),
-    source: str = Query(...),
-    dataset_type: str = Query(...),
-    from_date: str | None = Query(None),
-    to_date: str | None = Query(None),
-    db: Session = Depends(get_db),
-):
-    started = time.perf_counter()
-    from_date, to_date = _sanitize_range(from_date, to_date)
+def compute_by_dimension_rows(
+    *,
+    db: Session,
+    job_id: str | None,
+    dimension: str,
+    metric: str,
+    source: str,
+    dataset_type: str,
+    from_date: str | None,
+    to_date: str | None,
+) -> list[dict[str, Any]]:
     resolved_source, engine_key = _normalize_source(source)
 
     # ==============================
@@ -142,14 +145,12 @@ def analytics_by_dimension(
     if engine_key in ENGINE_REGISTRY and dataset_type in {"sales", "claims"}:
         engine_cls = ENGINE_REGISTRY[engine_key]
 
-
         # Samsung "overview" should return both partners in one response so the frontend
         # doesn't need to fire 2 requests per graph (vs + croma).
         if resolved_source == "samsung" and engine_key == "samsung":
             dim_key = _to_safe_key(dimension or "")
             metric_key = _to_safe_key(metric or "")
             merged: dict[str, dict[str, Any]] = {}
-            lock = threading.Lock()
 
             def _merge(rows: list[dict[str, Any]], out_key: str):
                 for row in rows or []:
@@ -160,22 +161,28 @@ def analytics_by_dimension(
                     # dimension param is lower ("month"). Match by safe-key.
                     safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
                     dim_col = safe_map.get(dim_key) or safe_map.get(_to_safe_key(dimension or ""))
+                    if dim_col is None:
+                        # Samsung partner engines may fall back between plan/device category
+                        # based on available columns. Treat them as aliases while merging.
+                        if dim_key == "plan_category":
+                            dim_col = safe_map.get("device_plan_category")
+                        elif dim_key == "device_plan_category":
+                            dim_col = safe_map.get("plan_category")
                     metric_col = safe_map.get(metric_key) or safe_map.get(_to_safe_key(metric or ""))
 
                     dim_val = row.get(dim_col) if dim_col is not None else None
                     if dim_val is None:
                         continue
                     key = str(dim_val)
-                    
-                    with lock:
-                        if key not in merged:
-                            merged[key] = {dim_key: dim_val}
 
-                        value = row.get(metric_col) if metric_col is not None else row.get(metric, 0)
-                        try:
-                            merged[key][out_key] = float(value or 0)
-                        except Exception:
-                            merged[key][out_key] = 0.0
+                    if key not in merged:
+                        merged[key] = {dim_key: dim_val}
+
+                    value = row.get(metric_col) if metric_col is not None else row.get(metric, 0)
+                    try:
+                        merged[key][out_key] = float(value or 0)
+                    except Exception:
+                        merged[key][out_key] = 0.0
 
             def _fetch_and_merge(src: str, out_key: str):
                 try:
@@ -192,16 +199,10 @@ def analytics_by_dimension(
                 except Exception as exc:
                     logger.error("Failed to fetch %s: %s", src, exc)
 
-            import threading
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [
-                    executor.submit(_fetch_and_merge, "samsung_vs", "samsung_vs"),
-                    executor.submit(_fetch_and_merge, "samsung_croma", "samsung_croma"),
-                ]
-                for f in futures:
-                    f.result()
+            # Run sequentially in-request: avoids thread-unsafe Session sharing and
+            # prevents intermittent DB SSL/connection failures under load.
+            _fetch_and_merge("samsung_vs", "samsung_vs")
+            _fetch_and_merge("samsung_croma", "samsung_croma")
 
             out_rows = list(merged.values())
             for row in out_rows:
@@ -210,15 +211,6 @@ def analytics_by_dimension(
 
             if dim_key in {"month", "date"}:
                 out_rows.sort(key=lambda r: str(r.get(dim_key, "")))
-            logger.info(
-                "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=samsung_overview rows=%s duration_ms=%.2f",
-                source,
-                dataset_type,
-                dimension,
-                metric,
-                len(out_rows),
-                (time.perf_counter() - started) * 1000,
-            )
             return out_rows
 
         engine = engine_cls(
@@ -232,15 +224,6 @@ def analytics_by_dimension(
         out = engine.compute_by_dimension(
             dimension=dimension,
             metric=metric,
-        )
-        logger.info(
-            "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=engine rows=%s duration_ms=%.2f",
-            source,
-            dataset_type,
-            dimension,
-            metric,
-            len(out),
-            (time.perf_counter() - started) * 1000,
         )
         return out
 
@@ -276,32 +259,16 @@ def analytics_by_dimension(
     )
 
     if out_df is None or out_df.empty:
-        logger.info(
-            "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=fallback rows=0 duration_ms=%.2f",
-            source,
-            dataset_type,
-            dimension,
-            metric,
-            (time.perf_counter() - started) * 1000,
-        )
         return []
 
-    out = out_df.to_dict(orient="records")
-    logger.info(
-        "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=fallback rows=%s duration_ms=%.2f",
-        source,
-        dataset_type,
-        dimension,
-        metric,
-        len(out),
-        (time.perf_counter() - started) * 1000,
-    )
-    return out
+    return out_df.to_dict(orient="records")
 
 
-@router.get("/summary")
-def analytics_summary(
+@router.get("/by-dimension")
+def analytics_by_dimension(
     job_id: str | None = Query(None),
+    dimension: str = Query(...),
+    metric: str = Query(...),
     source: str = Query(...),
     dataset_type: str = Query(...),
     from_date: str | None = Query(None),
@@ -310,6 +277,176 @@ def analytics_summary(
 ):
     started = time.perf_counter()
     from_date, to_date = _sanitize_range(from_date, to_date)
+    resolved_source, _ = _normalize_source(source)
+    normalized_dataset = (dataset_type or "").strip().lower()
+
+    cached = get_precomputed_graph(
+        db=db,
+        source=resolved_source,
+        dataset_type=normalized_dataset,
+        job_id=job_id,
+        dimension=dimension,
+        metric=metric,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if cached is not None and len(cached) > 0:
+        is_stale_cached_shape = False
+        is_stale_zero_metric = False
+        metric_key = _to_safe_key(metric or "")
+        dimension_key = _to_safe_key(dimension or "")
+        if isinstance(cached[0], dict):
+            row_keys = {_to_safe_key(str(k)) for k in cached[0].keys()}
+            has_compare_keys = "samsung_vs" in row_keys or "samsung_croma" in row_keys
+            is_samsung_overview_shape = (
+                resolved_source == "samsung"
+                and "samsung_vs" in row_keys
+                and "samsung_croma" in row_keys
+            )
+            if resolved_source in {"samsung_vs", "samsung_croma"} and has_compare_keys and metric_key not in row_keys:
+                is_stale_cached_shape = True
+            if metric_key and metric_key not in row_keys and not is_samsung_overview_shape:
+                is_stale_cached_shape = True
+
+        if (
+            resolved_source == "godrej"
+            and normalized_dataset == "claims"
+            and dimension_key in {"channel", "product_category"}
+            and metric_key in {"claims", "net_claims", "loss_ratio"}
+        ):
+            metric_values: list[float] = []
+            for row in cached:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get(metric_key, row.get(metric))
+                try:
+                    value = float(raw)
+                except Exception:
+                    continue
+                if pd.notna(value):
+                    metric_values.append(value)
+
+            has_only_zeros = bool(metric_values) and all(abs(v) < 1e-12 for v in metric_values)
+            if has_only_zeros:
+                quantity_cached = get_precomputed_graph(
+                    db=db,
+                    source=resolved_source,
+                    dataset_type=normalized_dataset,
+                    job_id=job_id,
+                    dimension=dimension,
+                    metric="quantity",
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                quantity_values: list[float] = []
+                for row in quantity_cached or []:
+                    if not isinstance(row, dict):
+                        continue
+                    raw = row.get("quantity")
+                    try:
+                        value = float(raw)
+                    except Exception:
+                        continue
+                    if pd.notna(value):
+                        quantity_values.append(value)
+                if any(v > 0 for v in quantity_values):
+                    is_stale_zero_metric = True
+
+        if is_stale_cached_shape or is_stale_zero_metric:
+            reason = "shape" if is_stale_cached_shape else "all_zero_metric"
+            logger.warning(
+                "Stale precomputed graph detected (%s); recomputing live source=%s dataset=%s dimension=%s metric=%s",
+                reason,
+                resolved_source,
+                normalized_dataset,
+                dimension,
+                metric,
+            )
+        else:
+            logger.info(
+                "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=precomputed rows=%s duration_ms=%.2f",
+                source,
+                dataset_type,
+                dimension,
+                metric,
+                len(cached),
+                (time.perf_counter() - started) * 1000,
+            )
+            return cached
+    if cached == [] and resolved_source.startswith("samsung"):
+        logger.warning(
+            "Empty precomputed samsung graph detected; recomputing live source=%s dataset=%s dimension=%s metric=%s from=%s to=%s",
+            resolved_source,
+            normalized_dataset,
+            dimension,
+            metric,
+            from_date,
+            to_date,
+        )
+    try:
+        out = compute_by_dimension_rows(
+            db=db,
+            job_id=job_id,
+            dimension=dimension,
+            metric=metric,
+            source=source,
+            dataset_type=normalized_dataset,
+            from_date=from_date,
+            to_date=to_date,
+        )
+    except Exception:
+        logger.exception(
+            "Live compute failed for analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s",
+            source,
+            dataset_type,
+            dimension,
+            metric,
+        )
+        out = []
+
+    logger.info(
+        "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=live rows=%s duration_ms=%.2f",
+        source,
+        dataset_type,
+        dimension,
+        metric,
+        len(out),
+        (time.perf_counter() - started) * 1000,
+    )
+    try:
+        upsert_precomputed_graph(
+            db=db,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            job_id=job_id,
+            dimension=dimension,
+            metric=metric,
+            from_date=from_date,
+            to_date=to_date,
+            rows=out,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to upsert precomputed graph source=%s dataset=%s dimension=%s metric=%s",
+            resolved_source,
+            normalized_dataset,
+            dimension,
+            metric,
+        )
+    return out
+
+
+def compute_summary_values(
+    *,
+    db: Session,
+    job_id: str | None,
+    source: str,
+    dataset_type: str,
+    from_date: str | None,
+    to_date: str | None,
+) -> dict[str, Any]:
     resolved_source, engine_key = _normalize_source(source)
 
     if engine_key in ENGINE_REGISTRY and dataset_type in {"sales", "claims"}:
@@ -335,12 +472,6 @@ def analytics_summary(
                 total["earned_premium"] += float(summary.get("earned_premium", 0) or 0)
                 total["zopper_earned_premium"] += float(summary.get("zopper_earned_premium", 0) or 0)
                 total["units_sold"] += int(summary.get("units_sold", 0) or 0)
-            logger.info(
-                "TIMING analytics.summary source=%s dataset=%s mode=samsung_overview duration_ms=%.2f",
-                source,
-                dataset_type,
-                (time.perf_counter() - started) * 1000,
-            )
             return total
 
         engine = engine_cls(
@@ -351,14 +482,7 @@ def analytics_summary(
             from_date=from_date,
             to_date=to_date,
         )
-        out = engine.compute_summary()
-        logger.info(
-            "TIMING analytics.summary source=%s dataset=%s mode=engine duration_ms=%.2f",
-            source,
-            dataset_type,
-            (time.perf_counter() - started) * 1000,
-        )
-        return out
+        return engine.compute_summary()
 
     df = get_dataframe(
         db=db,
@@ -441,6 +565,130 @@ def analytics_summary(
     }
 
 
+@router.get("/summary")
+def analytics_summary(
+    job_id: str | None = Query(None),
+    source: str = Query(...),
+    dataset_type: str = Query(...),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    from_date, to_date = _sanitize_range(from_date, to_date)
+    resolved_source, _ = _normalize_source(source)
+    normalized_dataset = (dataset_type or "").strip().lower()
+
+    cached = get_precomputed_summary(
+        db=db,
+        source=resolved_source,
+        dataset_type=normalized_dataset,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if cached is not None:
+        gross_cached = float(cached.get("gross_premium", 0) or 0)
+        earned_cached = float(cached.get("earned_premium", 0) or 0)
+        zopper_cached = float(cached.get("zopper_earned_premium", 0) or 0)
+        units_cached = int(cached.get("units_sold", 0) or 0)
+        all_financial_zero = (
+            gross_cached == 0
+            and earned_cached == 0
+            and zopper_cached == 0
+        )
+
+        source_variants = (
+            ["samsung_vs", "samsung_croma", "samsung_vijay_sales", "samsung"]
+            if resolved_source == "samsung"
+            else [resolved_source]
+        )
+
+        def _has_rows_in_scope() -> bool:
+            if from_date is None and to_date is None:
+                query = (
+                    db.query(func.count(DataRow.id))
+                    .filter(DataRow.source.in_(source_variants))
+                    .filter(DataRow.dataset_type == normalized_dataset)
+                )
+                if job_id is not None:
+                    query = query.filter(DataRow.job_id == job_id)
+                count = query.scalar()
+                return int(count or 0) > 0
+
+            for src in source_variants:
+                scoped_df = get_dataframe(
+                    db=db,
+                    job_id=job_id,
+                    source=src,
+                    dataset_type=normalized_dataset,
+                )
+                if scoped_df is None or scoped_df.empty:
+                    continue
+                scoped_df = filter_by_date_range(scoped_df, normalized_dataset, from_date, to_date)
+                if scoped_df is not None and not scoped_df.empty:
+                    return True
+            return False
+
+        has_rows_in_scope = _has_rows_in_scope() if all_financial_zero else False
+        is_stale_zero_with_units = all_financial_zero and units_cached > 0
+        is_stale_zero_empty = all_financial_zero and units_cached == 0
+        is_stale_zero_with_rows = is_stale_zero_empty and (
+            has_rows_in_scope or resolved_source.startswith("samsung")
+        )
+
+        if is_stale_zero_with_units or is_stale_zero_with_rows:
+            reason = "zero_with_units" if is_stale_zero_with_units else "zero_with_rows"
+            logger.warning(
+                "Stale precomputed summary detected (%s); recomputing live source=%s dataset=%s",
+                reason,
+                resolved_source,
+                normalized_dataset,
+            )
+        else:
+            logger.info(
+                "TIMING analytics.summary source=%s dataset=%s mode=precomputed duration_ms=%.2f",
+                source,
+                dataset_type,
+                (time.perf_counter() - started) * 1000,
+            )
+            return cached
+
+    out = compute_summary_values(
+        db=db,
+        job_id=job_id,
+        source=source,
+        dataset_type=normalized_dataset,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    logger.info(
+        "TIMING analytics.summary source=%s dataset=%s mode=live duration_ms=%.2f",
+        source,
+        dataset_type,
+        (time.perf_counter() - started) * 1000,
+    )
+    try:
+        upsert_precomputed_summary(
+            db=db,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+            summary=out if isinstance(out, dict) else {},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to upsert precomputed summary source=%s dataset=%s",
+            resolved_source,
+            normalized_dataset,
+        )
+    return out
+
+
 @router.get("/last-updated")
 def analytics_last_updated(
     job_id: str | None = Query(None),
@@ -452,45 +700,84 @@ def analytics_last_updated(
 ):
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
+    dataset_key = (dataset_type or "").strip().lower()
+    job_key = (job_id or "").strip()
 
-    sales_start_columns = [
-        "Start_Date",
-        "Start Date",
-        "Plan Start Date",
-        "Warranty Start Date",
-        "Warranty Purchase Date",
-        "Product Purchased Date",
-        "Date",
-    ]
-    claims_date_columns = [
-        "Day of Call_Date",
-        "Call_Date",
-        "Call Date",
-        "Payment_date",
-        "Payment Date",
-        "Warranty Purchase Date",
-        "Warranty Start Date",
-        "Product Purchased Date",
-        "Date",
-    ]
+    source_variants = (
+        ["samsung", "samsung_vs", "samsung_croma", "samsung_vijay_sales"]
+        if resolved_source == "samsung"
+        else [resolved_source]
+    )
 
-    def _latest_for_source(src: str) -> pd.Timestamp | None:
-        df = get_dataframe(
-            db=db,
-            job_id=job_id,
-            source=src,
-            dataset_type=dataset_type,
+    def _latest_marker_for_sources(sources: list[str], key: str | None) -> datetime | None:
+        query = (
+            db.query(func.max(ManualUpdateMarker.updated_at))
+            .filter(ManualUpdateMarker.dataset_type == dataset_key)
+            .filter(ManualUpdateMarker.source.in_(sources))
         )
-        if dataset_type == "sales":
-            return _latest_from_columns(df, sales_start_columns)
-        return _latest_from_columns(df, claims_date_columns)
+        if key is not None:
+            query = query.filter(ManualUpdateMarker.job_key == key)
+        return query.scalar()
 
-    if resolved_source == "samsung":
-        latest_values = [_latest_for_source("samsung_vs"), _latest_for_source("samsung_croma")]
-        latest_values = [v for v in latest_values if v is not None]
-        latest = max(latest_values) if latest_values else None
-    else:
-        latest = _latest_for_source(resolved_source)
+    def _source_has_rows(src: str, key: str | None) -> bool:
+        query = (
+            db.query(func.count(DataRow.id))
+            .filter(DataRow.source == src)
+            .filter(DataRow.dataset_type == dataset_key)
+        )
+        if key is not None:
+            if key == "":
+                query = query.filter(DataRow.job_id.is_(None))
+            else:
+                query = query.filter(DataRow.job_id == key)
+        count = query.scalar()
+        return int(count or 0) > 0
+
+    latest = _latest_marker_for_sources(source_variants, job_key if job_key else None)
+    if latest is None and job_key:
+        # Fallback to aggregate marker for this source/dataset.
+        latest = _latest_marker_for_sources(source_variants, "")
+    if latest is None and job_key:
+        # Final fallback: latest saved date across all tags for this source/dataset.
+        latest = _latest_marker_for_sources(source_variants, None)
+
+    # Backfill missing sales marker once for legacy tags so card does not stay "Unknown".
+    if latest is None and dataset_key == "sales":
+        key_candidates: list[str | None] = [job_key, "", None] if job_key else ["", None]
+        marker_source: str | None = None
+        marker_job: str | None = None
+        for candidate in key_candidates:
+            source_with_rows = next(
+                (src for src in source_variants if _source_has_rows(src, candidate)),
+                None,
+            )
+            if source_with_rows is not None:
+                marker_source = source_with_rows
+                marker_job = candidate if candidate not in {"", None} else None
+                break
+
+        if marker_source is not None:
+            try:
+                mark_manual_update(
+                    db=db,
+                    source=marker_source,
+                    dataset_type=dataset_key,
+                    job_id=marker_job,
+                )
+                db.commit()
+                latest = _latest_marker_for_sources(source_variants, job_key if job_key else None)
+                if latest is None and job_key:
+                    latest = _latest_marker_for_sources(source_variants, "")
+                if latest is None and job_key:
+                    latest = _latest_marker_for_sources(source_variants, None)
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Failed to initialize manual update marker source=%s dataset=%s job=%s",
+                    source,
+                    dataset_key,
+                    job_key,
+                )
 
     return {"data_upto": latest.date().isoformat() if latest is not None else None}
 
@@ -524,7 +811,30 @@ def analytics_date_bounds(
             )
         return _bounds_from_columns(
             df,
-            ["Day of Call_Date", "Call_Date", "Call Date", "Date"],
+            [
+                "Day of Call_Date",
+                "Call_Date",
+                "Call Date",
+                "Call_Registered_Date",
+                "Call Registered Date",
+                "Call_Initiated_Date",
+                "Call Initiated Date",
+                "Month-Year",
+                "Month Year",
+                "Month_Year",
+                "Month Year",
+                "Fiscal Month",
+                "Invoice_Date_",
+                "Invoice Date",
+                "Payment_date",
+                "Payment Date",
+                "Posting Date",
+                "Complete Date",
+                "Bill Created Date",
+                "Warranty_start_date_",
+                "Warranty Start Date",
+                "Date",
+            ],
         )
 
     if resolved_source == "samsung":
@@ -535,11 +845,6 @@ def analytics_date_bounds(
     else:
         min_date, max_date = _bounds_for_source(resolved_source)
 
-    cap = _current_month_cap()
-    if max_date is not None and max_date > cap:
-        max_date = cap
-    if min_date is not None and min_date > cap:
-        min_date = cap
     if min_date is not None and max_date is not None and min_date > max_date:
         min_date = max_date
 

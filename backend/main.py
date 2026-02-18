@@ -35,10 +35,16 @@ from db.deps import get_db
 
 from models.data_rows import DataRow
 from models.manual_updates import ManualUpdateMarker
+from models.precomputed_analytics import PrecomputedGraph, PrecomputedInsight, PrecomputedSummary
 from authentication import models as auth_models
 from authentication.deps import get_current_user
 from authentication.router import router as auth_router
 from services.manual_update_service import mark_manual_update
+from services.precompute_service import rebuild_precomputed_analytics
+from services.precomputed_repository import (
+    get_precomputed_insights,
+    upsert_precomputed_insights,
+)
 
 # --------------------------------------------------
 # LOGGING
@@ -64,6 +70,61 @@ def _json_safe(value: Any):
 
 def _clean_json_row(row: dict) -> dict:
     return {k: _json_safe(v) for k, v in row.items()}
+
+
+def _refresh_jobs(job_id: str | None) -> list[str | None]:
+    normalized = (job_id or "").strip() or None
+    jobs: list[str | None] = [normalized]
+    if normalized is not None:
+        jobs.append(None)
+    return jobs
+
+
+def _refresh_after_data_change(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    action: str,
+) -> None:
+    src = source.lower().strip()
+    ds = dataset_type.lower().strip()
+    refresh_jobs = _refresh_jobs(job_id)
+
+    for refresh_job in refresh_jobs:
+        mark_manual_update(
+            db=db,
+            source=src,
+            dataset_type=ds,
+            job_id=refresh_job,
+        )
+    db.commit()
+
+    for refresh_job in refresh_jobs:
+        invalidate_dataframe_cache(
+            source=src,
+            dataset_type=ds,
+            job_id=refresh_job,
+        )
+
+    for refresh_job in refresh_jobs:
+        try:
+            rebuild_precomputed_analytics(
+                db=db,
+                source=src,
+                dataset_type=ds,
+                job_id=refresh_job,
+            )
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to rebuild precomputed analytics after %s source=%s dataset=%s job_id=%s",
+                action,
+                src,
+                ds,
+                refresh_job,
+            )
 
 
 # --------------------------------------------------
@@ -245,17 +306,12 @@ async def upload_file(
         ]
     )
     db.commit()
-    mark_manual_update(
+    _refresh_after_data_change(
         db=db,
-        source=source.lower().strip(),
-        dataset_type=dataset_type.lower().strip(),
+        source=source,
+        dataset_type=dataset_type,
         job_id=job_id,
-    )
-    db.commit()
-    invalidate_dataframe_cache(
-        source=source.lower().strip(),
-        dataset_type=dataset_type.lower().strip(),
-        job_id=job_id,
+        action="upload",
     )
 
     logger.info(
@@ -294,17 +350,12 @@ def ingest_rows(
     ]
     db.add_all(rows)
     db.commit()
-    mark_manual_update(
+    _refresh_after_data_change(
         db=db,
-        source=payload.source.lower().strip(),
-        dataset_type=payload.dataset_type.lower().strip(),
+        source=payload.source,
+        dataset_type=payload.dataset_type,
         job_id=payload.job_id,
-    )
-    db.commit()
-    invalidate_dataframe_cache(
-        source=payload.source.lower().strip(),
-        dataset_type=payload.dataset_type.lower().strip(),
-        job_id=payload.job_id,
+        action="ingest",
     )
     return {"rows_inserted": len(rows)}
 
@@ -345,25 +396,37 @@ def _graph_insights_cache_key(payload: GraphInsightPayload) -> str:
 
 
 def _read_chatcards_system_prompt() -> str:
-    modelfile_path = Path(__file__).resolve().parent.parent / "chatcards" / "Modelfile"
     fallback = (
-        "You are a business insights assistant. Generate concise, factual bullet insights "
-        "from chart data. Keep output to 3-5 bullets."
+        "You are AI Sahyogi, a business analytics copilot for Zopper leadership reviews. "
+        "Generate crisp, decision-ready insights from chart data. Use precise business "
+        "language, quantify impact, and avoid filler. Return exactly 3 to 5 bullet points."
     )
-    if not modelfile_path.exists():
-        return fallback
+    env_path = os.getenv("CHATCARDS_MODELFILE_PATH", "").strip()
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+    base_dir = Path(__file__).resolve().parent
+    candidates.extend(
+        [
+            base_dir / "chatcards" / "Modelfile",            # backend-local (works in Docker image)
+            base_dir.parent / "chatcards" / "Modelfile",     # repo-root sibling (works in local dev)
+        ]
+    )
 
-    try:
-        content = modelfile_path.read_text(encoding="utf-8")
-    except Exception:
-        return fallback
-
-    match = re.search(r'SYSTEM\s+"""(.*?)"""', content, flags=re.DOTALL | re.IGNORECASE)
-    if not match:
-        return fallback
-
-    system = match.group(1).strip()
-    return system or fallback
+    for modelfile_path in candidates:
+        if not modelfile_path.exists():
+            continue
+        try:
+            content = modelfile_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        match = re.search(r'SYSTEM\s+"""(.*?)"""', content, flags=re.DOTALL | re.IGNORECASE)
+        if not match:
+            continue
+        system = match.group(1).strip()
+        if system:
+            return system
+    return fallback
 
 
 def _extract_bullets(text: str) -> list[str]:
@@ -391,6 +454,17 @@ def _extract_bullets(text: str) -> list[str]:
 
 def _to_safe_key(key: str) -> str:
     return re.sub(r"[()%'.]", "", re.sub(r"\s+", "_", key.strip().lower()))
+
+
+def _normalize_source_key(source: str) -> str:
+    source_key = (source or "").strip().lower()
+    if source_key in {"samsung_vs", "samsung_vijay_sales"}:
+        return "samsung_vs"
+    if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+        return "reliance"
+    if source_key in {"godrej", "goodrej", "goddrej"}:
+        return "godrej"
+    return source_key
 
 
 def _pretty_label(key: str) -> str:
@@ -493,17 +567,17 @@ def _derive_data_driven_insights(payload: GraphInsightPayload) -> list[str]:
         latest_label = str(latest_row.get(dimension_key, "latest period"))
         if latest_a is not None:
             insights.append(
-                f"In {latest_label}, {_pretty_label(series_a)} is {_format_metric_value(payload.metric, latest_a)}."
+                f"In {latest_label}, {_pretty_label(series_a)} stands at {_format_metric_value(payload.metric, latest_a)}."
             )
         if series_b and latest_b is not None:
             insights.append(
-                f"In {latest_label}, {_pretty_label(series_b)} is {_format_metric_value(payload.metric, latest_b)}."
+                f"In {latest_label}, {_pretty_label(series_b)} stands at {_format_metric_value(payload.metric, latest_b)}."
             )
         if latest_a is not None and latest_b is not None:
             leader = series_a if latest_a >= latest_b else series_b
             gap = abs(latest_a - latest_b)
             insights.append(
-                f"{_pretty_label(leader)} leads by {_format_metric_value(payload.metric, gap)} in the latest period."
+                f"{_pretty_label(leader)} leads by {_format_metric_value(payload.metric, gap)} in the latest period, signaling stronger momentum."
             )
         return _dedupe_insights(insights)
 
@@ -531,28 +605,37 @@ def _derive_data_driven_insights(payload: GraphInsightPayload) -> list[str]:
     low_label, low_value = min(points, key=lambda x: x[1])
     metric_name = _pretty_label(actual_metric_key)
 
-    insights.append(f"Latest {metric_name} is {_format_metric_value(actual_metric_key, last_value)} in {last_label}.")
+    insights.append(
+        f"Latest {metric_name} is {_format_metric_value(actual_metric_key, last_value)} in {last_label}."
+    )
     if len(points) > 1:
         delta = last_value - first_value
         direction = "increased" if delta >= 0 else "decreased"
+        momentum = "positive momentum" if delta >= 0 else "a contraction trend"
         pct = (abs(delta) / abs(first_value) * 100.0) if first_value else None
         if pct is None:
             insights.append(
-                f"{metric_name} {direction} by {_format_metric_value(actual_metric_key, abs(delta))} from {first_label} to {last_label}."
+                f"{metric_name} {direction} by {_format_metric_value(actual_metric_key, abs(delta))} from {first_label} to {last_label}, indicating {momentum}."
             )
         else:
             insights.append(
-                f"{metric_name} {direction} by {_format_metric_value(actual_metric_key, abs(delta))} ({pct:.1f}%) from {first_label} to {last_label}."
+                f"{metric_name} {direction} by {_format_metric_value(actual_metric_key, abs(delta))} ({pct:.1f}%) from {first_label} to {last_label}, indicating {momentum}."
             )
 
-    insights.append(f"Peak {metric_name} is {_format_metric_value(actual_metric_key, peak_value)} in {peak_label}.")
-    insights.append(f"Lowest {metric_name} is {_format_metric_value(actual_metric_key, low_value)} in {low_label}.")
+    insights.append(
+        f"Peak {metric_name} reached {_format_metric_value(actual_metric_key, peak_value)} in {peak_label}."
+    )
+    insights.append(
+        f"Lowest {metric_name} was {_format_metric_value(actual_metric_key, low_value)} in {low_label}."
+    )
 
     total = sum(v for _, v in points if v > 0)
     if total > 0:
         top3 = sorted(points, key=lambda x: x[1], reverse=True)[:3]
         share = sum(v for _, v in top3) / total * 100.0
-        insights.append(f"Top 3 categories contribute {share:.1f}% of total {metric_name}.")
+        insights.append(
+            f"Top 3 categories contribute {share:.1f}% of total {metric_name}, highlighting concentration risk."
+        )
 
     return _dedupe_insights(insights)
 
@@ -560,7 +643,7 @@ def _build_insight_prompt(payload: GraphInsightPayload) -> str:
     rows = payload.rows[:80]
     serialized_rows = json.dumps(rows, ensure_ascii=True, default=str)
     return (
-        "Generate concise business insights for the graph below.\n"
+        "Generate executive-ready insights for the graph below.\n"
         "Return only bullet points.\n"
         f"Source: {payload.source}\n"
         f"Dataset Type: {payload.dataset_type}\n"
@@ -572,10 +655,14 @@ def _build_insight_prompt(payload: GraphInsightPayload) -> str:
         f"To Date: {payload.to_date or 'n/a'}\n"
         "Data rows (JSON):\n"
         f"{serialized_rows}\n"
-        "Constraints:\n"
-        "- 3 to 5 bullets\n"
-        "- Keep each bullet short and specific\n"
-        "- Mention trend direction when possible\n"
+        "Output requirements:\n"
+        "- 3 to 5 bullets.\n"
+        "- Each bullet must include at least one concrete number from the data.\n"
+        "- Prioritize: latest status, strongest change, top/low contributor, and concentration/risk signal.\n"
+        "- Use professional business vocabulary (momentum, contribution, concentration, volatility, efficiency).\n"
+        "- Mention direction and scale (absolute and percent) when possible.\n"
+        "- Do not mention missing data, AI limitations, or generic disclaimers.\n"
+        "- Keep each bullet under 24 words.\n"
     )
 
 
@@ -613,8 +700,26 @@ def _call_ollama(system_prompt: str, prompt: str) -> tuple[str, str]:
 @app.post("/insights/graph")
 def generate_graph_insights(
     payload: GraphInsightPayload,
+    db: Session = Depends(get_db),
 ):
-    insights_enabled = os.getenv("ENABLE_GRAPH_INSIGHTS", "").strip().lower() in {"1", "true", "yes", "on"}
+    normalized_source = _normalize_source_key(payload.source)
+    normalized_dataset = (payload.dataset_type or "").strip().lower()
+    cached_db = get_precomputed_insights(
+        db=db,
+        source=normalized_source,
+        dataset_type=normalized_dataset,
+        job_id=payload.job_id,
+        dimension=payload.dimension,
+        metric=payload.metric,
+        bucket=payload.bucket,
+        compare_mode=payload.compare_mode,
+        from_date=payload.from_date,
+        to_date=payload.to_date,
+    )
+    if cached_db is not None:
+        return cached_db
+
+    insights_enabled = os.getenv("ENABLE_GRAPH_INSIGHTS", "1").strip().lower() not in {"0", "false", "no", "off"}
     if not insights_enabled:
         return {
             "insights": [],
@@ -651,6 +756,26 @@ def generate_graph_insights(
                 "message": "LLM insights unavailable; showing data-driven insights.",
             }
             _graph_insights_cache[cache_key] = (now + GRAPH_INSIGHTS_TTL_SECONDS, response_payload)
+            try:
+                upsert_precomputed_insights(
+                    db=db,
+                    source=normalized_source,
+                    dataset_type=normalized_dataset,
+                    job_id=payload.job_id,
+                    dimension=payload.dimension,
+                    metric=payload.metric,
+                    bucket=payload.bucket,
+                    compare_mode=payload.compare_mode,
+                    from_date=payload.from_date,
+                    to_date=payload.to_date,
+                    insights=response_payload["insights"],
+                    model=response_payload.get("model", "rule-based"),
+                    message=response_payload.get("message"),
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to persist precomputed graph insights")
             return response_payload
         raise HTTPException(
             status_code=503,
@@ -669,6 +794,26 @@ def generate_graph_insights(
 
     response_payload = {"insights": insights[:5], "model": model}
     _graph_insights_cache[cache_key] = (now + GRAPH_INSIGHTS_TTL_SECONDS, response_payload)
+    try:
+        upsert_precomputed_insights(
+            db=db,
+            source=normalized_source,
+            dataset_type=normalized_dataset,
+            job_id=payload.job_id,
+            dimension=payload.dimension,
+            metric=payload.metric,
+            bucket=payload.bucket,
+            compare_mode=payload.compare_mode,
+            from_date=payload.from_date,
+            to_date=payload.to_date,
+            insights=response_payload["insights"],
+            model=response_payload.get("model", "rule-based"),
+            message=response_payload.get("message"),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist precomputed graph insights")
     return response_payload
 
 # ==================================================

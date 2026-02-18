@@ -85,7 +85,7 @@ const GROUP_ORDER = ["time", "region", "category", "device_category"]
 const FAST_LOAD_COUNT = 4
 const DEFER_STEP_MS = 120
 
-const GODREJ_PRESETS: Preset[] = [
+const GODREJ_SALES_PRESETS: Preset[] = [
   {
     group: "time",
     dimension: "month",
@@ -103,9 +103,33 @@ const GODREJ_PRESETS: Preset[] = [
   },
 ]
 
+const GODREJ_CLAIMS_PRESETS: Preset[] = [
+  {
+    group: "time",
+    dimension: "month",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "state",
+    dimension: "state",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "channel",
+    dimension: "channel",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "product",
+    dimension: "product_category",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+]
+
 const GODREJ_GROUP_TITLES: Record<string, string> = {
   time: "Time-based Analysis",
-  channel: "Channel Performance",
+  state: "State Performance",
+  channel: "Channel-wise Performance",
   product: "Product Category Performance",
 }
 
@@ -188,13 +212,22 @@ export default function MultiGraphView({
   toDate,
 }: Props) {
   const isGodrej = source === "godrej"
+  const isGodrejClaims = isGodrej && datasetType === "claims"
   const activeGroupOrder = useMemo(
-    () => (isGodrej ? ["time", "channel", "product"] : GROUP_ORDER),
-    [isGodrej]
+    () => (
+      isGodrej
+        ? (isGodrejClaims ? ["time", "state", "channel", "product"] : ["time", "channel", "product"])
+        : GROUP_ORDER
+    ),
+    [isGodrej, isGodrejClaims]
   )
   const activePresets = useMemo(
-    () => (isGodrej ? GODREJ_PRESETS : Object.values(GRAPH_PRESETS)),
-    [isGodrej]
+    () => (
+      isGodrej
+        ? (isGodrejClaims ? GODREJ_CLAIMS_PRESETS : GODREJ_SALES_PRESETS)
+        : Object.values(GRAPH_PRESETS)
+    ),
+    [isGodrej, isGodrejClaims]
   )
 
   const [fullscreen, setFullscreen] = useState<FullscreenGraph>(null)
@@ -425,6 +458,7 @@ export default function MultiGraphView({
                     fromDate={fromDate}
                     toDate={toDate}
                     fetchDelayMs={fetchDelayMs}
+                    deferUntilVisible={queueIndex >= FAST_LOAD_COUNT}
                   />
                     )
                   })()}

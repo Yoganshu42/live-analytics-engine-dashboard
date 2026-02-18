@@ -210,7 +210,7 @@ export default function LoginPage() {
                         role === item ? "text-indigo-600" : "text-slate-500 hover:text-slate-700"
                       }`}
                     >
-                      {item === "admin" ? "Admin" : "Employee"}
+                      {item === "admin" ? "Admin" : "Business User"}
                       {role === item && (
                         <motion.div 
                           layoutId="activeRole"

@@ -1,14 +1,35 @@
 # services/analytics/samsung_engine.py
 
+import logging
+import time
+import threading
+import re
 import pandas as pd
 from sqlalchemy.orm import Session
 
-from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
+from services.analytics_repository import get_dataframe
 
 REPORT_START = pd.Timestamp("2000-01-01")
 REPORT_END = pd.Timestamp("2100-12-31")
 ZOPPER_GST_MULTIPLIER = 1.18
+logger = logging.getLogger(__name__)
+SAMSUNG_SOURCE_VARIANTS = (
+    "samsung_vs",
+    "samsung_croma",
+    "samsung_vijay_sales",
+    "samsung",
+)
+SAMSUNG_LOAD_CACHE_TTL_SECONDS = 300
+_samsung_load_cache_lock = threading.Lock()
+_samsung_load_cache: dict[
+    tuple[str, str, str, str, str, bool, bool],
+    tuple[float, dict[str, pd.DataFrame]],
+] = {}
+_samsung_load_inflight: dict[
+    tuple[str, str, str, str, str, bool, bool],
+    threading.Event,
+] = {}
 
 
 class SamsungAnalyticsEngine(BaseAnalyticsEngine):
@@ -23,6 +44,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
     ):
         super().__init__(db=db, job_id=job_id, source=source)
         self.dataset_type = dataset_type or "sales"
+        self._loaded_data_cache: dict[tuple[bool, bool], dict[str, pd.DataFrame]] = {}
         self.apply_date_filter = bool(from_date or to_date)
         self.report_start = pd.to_datetime(from_date, errors="coerce") if from_date else REPORT_START
         self.report_end = pd.to_datetime(to_date, errors="coerce") if to_date else REPORT_END
@@ -30,6 +52,25 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             self.report_start = REPORT_START
         if pd.isna(self.report_end):
             self.report_end = REPORT_END
+
+    def _shared_load_cache_key(self, include_sales: bool, include_claims: bool) -> tuple[str, str, str, str, str, bool, bool]:
+        from_key = self.report_start.date().isoformat() if self.apply_date_filter and self.report_start is not None else ""
+        to_key = self.report_end.date().isoformat() if self.apply_date_filter and self.report_end is not None else ""
+        return (
+            (self.source or "").strip().lower(),
+            (self.dataset_type or "").strip().lower(),
+            (self.job_id or "").strip(),
+            from_key,
+            to_key,
+            include_sales,
+            include_claims,
+        )
+
+    def _clone_loaded_data(self, data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        return {
+            "sales": data.get("sales", pd.DataFrame()).copy(deep=False),
+            "claims": data.get("claims", pd.DataFrame()).copy(deep=False),
+        }
 
     # --------------------------------------------------
     # MONTH PARSING (CONSISTENT)
@@ -117,164 +158,442 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         df[target] = combined
         return df
 
+    def _clean_text_series(self, series: pd.Series) -> pd.Series:
+        cleaned = series.astype(str).str.strip()
+        return cleaned.replace(
+            {
+                "": pd.NA,
+                "nan": pd.NA,
+                "none": pd.NA,
+                "null": pd.NA,
+                "NaN": pd.NA,
+                "None": pd.NA,
+                "NULL": pd.NA,
+            }
+        )
+
+    def _canonicalize_device_plan_category(
+        self,
+        series: pd.Series,
+        model_series: pd.Series | None = None,
+    ) -> pd.Series:
+        raw = self._clean_text_series(series)
+        if model_series is not None:
+            model_ref = (
+                self._clean_text_series(model_series)
+                .fillna("")
+                .astype(str)
+                .str.lower()
+                .str.replace(r"\s+", " ", regex=True)
+                .str.strip()
+            )
+        else:
+            model_ref = pd.Series("", index=raw.index, dtype="object")
+
+        normalized = (
+            raw.fillna("")
+            .astype(str)
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+            .str.replace("superpremium", "super premium", regex=False)
+            .str.replace("flip luxury", "luxury flip", regex=False)
+            .str.replace("fold luxury", "luxury fold", regex=False)
+        )
+
+        def _label(value: str, model_value: str):
+            if not value:
+                return pd.NA
+            if "super" in value and "premium" in value:
+                return "Super Premium"
+            if "luxury" in value and "flip" in value:
+                return "Luxury Flip"
+            if "luxury" in value and "fold" in value:
+                return "Luxury Fold"
+            if value.startswith("mass"):
+                return "Mass"
+            if value.startswith("mid"):
+                return "Mid"
+            if value == "high" or value.startswith("high "):
+                return "High"
+            if value == "premium" or ("premium" in value and "super" not in value):
+                return "Premium"
+            if value == "luxury" or "luxury" in value:
+                if "flip" in model_value or re.search(r"\bf7\d{2}\b", model_value):
+                    return "Luxury Flip"
+                if "fold" in model_value or re.search(r"\bf9\d{2}\b", model_value):
+                    return "Luxury Fold"
+                return "Luxury Fold"
+            return pd.NA
+
+        return pd.Series(
+            [_label(v, m) for v, m in zip(normalized.tolist(), model_ref.tolist())],
+            index=series.index,
+            dtype="object",
+        )
+
+    def _filter_claims_partner_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or not self.source:
+            return df
+
+        src = (self.source or "").strip().lower()
+        is_vs = ("vijay" in src) or src in {"samsung_vs", "samsung_vijay_sales"}
+        is_croma = "croma" in src
+        if not is_vs and not is_croma:
+            return df
+
+        candidate_columns = [
+            "Claim Marketplace",
+            "Partner Name",
+            "Partner",
+            "Channel",
+            "Market Name",
+        ]
+        present_columns = [col for col in candidate_columns if col in df.columns]
+        if not present_columns:
+            return df
+
+        mask = pd.Series(False, index=df.index)
+        for col in present_columns:
+            values = df[col].astype(str).str.lower().str.strip()
+            if is_vs:
+                mask |= values.str.contains("vijay", na=False)
+                mask |= values.str.fullmatch(r"v\\.?s\\.?|vs", na=False)
+            elif is_croma:
+                mask |= values.str.contains("croma", na=False)
+
+        filtered = df[mask]
+        # If mapping mismatches for some partner files, avoid dropping to empty.
+        return filtered if not filtered.empty else df
+
     # --------------------------------------------------
     # LOAD DATA
     # --------------------------------------------------
-    def load_data(self) -> dict[str, pd.DataFrame]:
-        sales_query = (
-            self.db.query(DataRow)
-            .filter(DataRow.dataset_type == "sales")
-        )
-        claims_query = (
-            self.db.query(DataRow)
-            .filter(DataRow.dataset_type == "claims")
-        )
+    def load_data(self, include_sales: bool = True, include_claims: bool = True) -> dict[str, pd.DataFrame]:
+        cache_key = (include_sales, include_claims)
+        if cache_key in self._loaded_data_cache:
+            return self._loaded_data_cache[cache_key]
 
-        if self.source == "samsung":
-            sales_query = sales_query.filter(DataRow.source.ilike("samsung%"))
-            claims_query = claims_query.filter(DataRow.source.ilike("samsung%"))
-        else:
-            if self.dataset_type == "claims" and self.source and self.source.startswith("samsung"):
-                # For claims analytics, loss_ratio needs sales; allow samsung-wide sales fallback
-                sales_query = sales_query.filter(DataRow.source.ilike("samsung%"))
-            else:
-                sales_query = sales_query.filter(DataRow.source == self.source)
-            if self.source and self.source.startswith("samsung"):
-                # claims are stored with partner names inside, so pull all samsung claims
-                claims_query = claims_query.filter(DataRow.source.ilike("samsung%"))
-            else:
-                claims_query = claims_query.filter(DataRow.source == self.source)
+        shared_key = self._shared_load_cache_key(include_sales, include_claims)
+        is_loader = False
+        while True:
+            now = time.time()
+            wait_event: threading.Event | None = None
+            with _samsung_load_cache_lock:
+                shared_cached = _samsung_load_cache.get(shared_key)
+                if shared_cached is not None:
+                    expires_at, cached_value = shared_cached
+                    if expires_at >= now:
+                        cloned = self._clone_loaded_data(cached_value)
+                        self._loaded_data_cache[cache_key] = cloned
+                        return cloned
+                    _samsung_load_cache.pop(shared_key, None)
 
-        def _fetch_with_optional_job(query):
-            if not self.job_id:
-                return query.all()
-            with_job = query.filter(DataRow.job_id == self.job_id).all()
-            if with_job:
-                return with_job
-            return query.all()
+                wait_event = _samsung_load_inflight.get(shared_key)
+                if wait_event is None:
+                    wait_event = threading.Event()
+                    _samsung_load_inflight[shared_key] = wait_event
+                    is_loader = True
+                    break
 
-        sales_rows = _fetch_with_optional_job(sales_query)
-        claims_rows = _fetch_with_optional_job(claims_query)
+            # Another request is computing the same payload; wait for it and
+            # then re-check cache before doing duplicate heavy dataframe work.
+            wait_event.wait(timeout=20)
 
-        sales_df = pd.DataFrame([r.data for r in sales_rows])
-        claims_df = pd.DataFrame([r.data for r in claims_rows])
+        try:
+            total_started = time.perf_counter()
+            source_key = (self.source or "").strip().lower()
 
-        if sales_df.empty and claims_df.empty:
-            return {"sales": sales_df, "claims": claims_df}
+            def _canonical_source(value: str) -> str:
+                key = (value or "").strip().lower()
+                if key in {"samsung_vs", "samsung_vijay_sales"}:
+                    return "samsung_vs"
+                return key
 
-        # normalize column names (trim)
-        if not sales_df.empty:
-            sales_df.columns = [str(c).strip() for c in sales_df.columns]
+            def _dedupe_sources(values: list[str]) -> list[str]:
+                out: list[str] = []
+                seen: set[str] = set()
+                for value in values:
+                    key = _canonical_source(value)
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
+                return out
 
-        # Coalesce common variants into canonical columns (works even when both variants exist).
-        if not sales_df.empty:
-            sales_df = self._coalesce_columns(sales_df, "Start_Date", ["Start_Date", "Start Date", "Plan Start Date"])
-            sales_df = self._coalesce_columns(sales_df, "End_Date", ["End_Date", "End Date", "Plan End Date"])
-            sales_df = self._coalesce_columns(sales_df, "Month", ["Month", "Month ", "Month Name", "Month_Name"])
-            sales_df = self._coalesce_columns(sales_df, "State", ["State", "State / City", "State/City"])
+            def _sources_for(dataset_type: str) -> list[str]:
+                if dataset_type == "sales":
+                    if not include_sales:
+                        return []
+                    if source_key == "samsung":
+                        return list(SAMSUNG_SOURCE_VARIANTS)
+                    if self.dataset_type == "claims" and source_key.startswith("samsung"):
+                        # Claims loss_ratio uses sales as denominator across samsung partners.
+                        return list(SAMSUNG_SOURCE_VARIANTS)
+                    return [self.source] if self.source else []
 
-        if not sales_df.empty:
-            try:
-                sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], format="mixed", errors="coerce")
-            except TypeError:
-                sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], errors="coerce")
-            try:
-                sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], format="mixed", errors="coerce")
-            except TypeError:
-                sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], errors="coerce")
-            if "Date" in sales_df.columns:
-                try:
-                    sales_df["Date"] = pd.to_datetime(sales_df["Date"], format="mixed", errors="coerce")
-                except TypeError:
-                    sales_df["Date"] = pd.to_datetime(sales_df["Date"], errors="coerce")
-            # Keep raw Month values; parsing is handled centrally in _parse_month_series
+                if dataset_type == "claims":
+                    if not include_claims:
+                        return []
+                    if source_key.startswith("samsung"):
+                        # Claims source is partner-dependent in payloads; pull samsung-wide claims.
+                        return list(SAMSUNG_SOURCE_VARIANTS)
+                    return [self.source] if self.source else []
+
+                return []
+
+            def _load_frames(dataset_type: str, sources: list[str]) -> pd.DataFrame:
+                frames: list[pd.DataFrame] = []
+                for src in _dedupe_sources(sources):
+                    frame = get_dataframe(
+                        db=self.db,
+                        job_id=self.job_id,
+                        source=src,
+                        dataset_type=dataset_type,
+                    )
+                    if frame is None or frame.empty:
+                        continue
+                    frames.append(frame.copy(deep=False))
+
+                if not frames:
+                    return pd.DataFrame()
+                if len(frames) == 1:
+                    return frames[0].copy(deep=False)
+                return pd.concat(frames, ignore_index=True, sort=False)
+
+            dataframe_started = time.perf_counter()
+            sales_df = _load_frames("sales", _sources_for("sales"))
+            claims_df = _load_frames("claims", _sources_for("claims"))
+            dataframe_duration_ms = (time.perf_counter() - dataframe_started) * 1000
+            logger.info(
+                "TIMING samsung.load_data.fetch_rows source=%s dataset=%s job_id=%s sales_rows=%s claims_rows=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                self.job_id,
+                len(sales_df),
+                len(claims_df),
+                dataframe_duration_ms,
+            )
+
+            logger.info(
+                "TIMING samsung.load_data.dataframes source=%s dataset=%s sales_shape=%s claims_shape=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                sales_df.shape,
+                claims_df.shape,
+                dataframe_duration_ms,
+            )
+
+            if sales_df.empty and claims_df.empty:
+                logger.info(
+                    "TIMING samsung.load_data.total source=%s dataset=%s duration_ms=%.2f",
+                    self.source,
+                    self.dataset_type,
+                    (time.perf_counter() - total_started) * 1000,
+                )
+                result = {"sales": sales_df, "claims": claims_df}
+                self._loaded_data_cache[cache_key] = result
+                with _samsung_load_cache_lock:
+                    _samsung_load_cache[shared_key] = (time.time() + SAMSUNG_LOAD_CACHE_TTL_SECONDS, self._clone_loaded_data(result))
+                return result
+
+            # normalize column names (trim)
+            sales_normalization_started = time.perf_counter()
+            if not sales_df.empty:
+                sales_df.columns = [str(c).strip() for c in sales_df.columns]
+
+            # Coalesce common variants into canonical columns (works even when both variants exist).
+            if not sales_df.empty:
+                sales_df = self._coalesce_columns(sales_df, "Start_Date", ["Start_Date", "Start Date", "Plan Start Date"])
+                sales_df = self._coalesce_columns(sales_df, "End_Date", ["End_Date", "End Date", "Plan End Date"])
+                sales_df = self._coalesce_columns(sales_df, "Month", ["Month", "Month ", "Month Name", "Month_Name"])
+                sales_df = self._coalesce_columns(sales_df, "State", ["State", "State / City", "State/City"])
+
+            if not sales_df.empty:
+                if "Start_Date" in sales_df.columns:
+                    try:
+                        sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], format="mixed", errors="coerce")
+                    except TypeError:
+                        sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], errors="coerce")
+                if "End_Date" in sales_df.columns:
+                    try:
+                        sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], format="mixed", errors="coerce")
+                    except TypeError:
+                        sales_df["End_Date"] = pd.to_datetime(sales_df["End_Date"], errors="coerce")
+                if "Date" in sales_df.columns:
+                    try:
+                        sales_df["Date"] = pd.to_datetime(sales_df["Date"], format="mixed", errors="coerce")
+                    except TypeError:
+                        sales_df["Date"] = pd.to_datetime(sales_df["Date"], errors="coerce")
+                # Keep raw Month values; parsing is handled centrally in _parse_month_series
 
 
-        # Flag Extended Warranty (EW) rows for downstream logic
-        if not sales_df.empty:
-            sales_df["_ew"] = self._is_ew_plan(sales_df)
-            if "Start_Date" in sales_df.columns:
-                sales_df["_adj_start_date"] = sales_df["Start_Date"].where(~sales_df["_ew"])
-                sales_df.loc[sales_df["_ew"], "_adj_start_date"] = sales_df.loc[
-                    sales_df["_ew"], "Start_Date"
-                ] + pd.DateOffset(years=1)
-            if "End_Date" in sales_df.columns:
-                sales_df["_adj_end_date"] = sales_df["End_Date"].where(~sales_df["_ew"])
-                sales_df.loc[sales_df["_ew"], "_adj_end_date"] = sales_df.loc[
-                    sales_df["_ew"], "End_Date"
-                ] + pd.DateOffset(years=1)
+            # Flag Extended Warranty (EW) rows for downstream logic
+            if not sales_df.empty:
+                sales_df["_ew"] = self._is_ew_plan(sales_df)
+                if "Start_Date" in sales_df.columns:
+                    sales_df["_adj_start_date"] = sales_df["Start_Date"].where(~sales_df["_ew"])
+                    sales_df.loc[sales_df["_ew"], "_adj_start_date"] = sales_df.loc[
+                        sales_df["_ew"], "Start_Date"
+                    ] + pd.DateOffset(years=1)
+                if "End_Date" in sales_df.columns:
+                    sales_df["_adj_end_date"] = sales_df["End_Date"].where(~sales_df["_ew"])
+                    sales_df.loc[sales_df["_ew"], "_adj_end_date"] = sales_df.loc[
+                        sales_df["_ew"], "End_Date"
+                    ] + pd.DateOffset(years=1)
+            logger.info(
+                "TIMING samsung.load_data.sales_normalization source=%s dataset=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                (time.perf_counter() - sales_normalization_started) * 1000,
+            )
 
-        # Normalize claims columns
-        if not claims_df.empty:
-            claims_df.columns = [str(c).strip() for c in claims_df.columns]
-            rename_map = {
-                "Partner Name": "Partner Name",
-                "Partner_Name": "Partner Name",
-                "Net Amount": "Net Amount",
-                "Net_Amount": "Net Amount",
-                "otd amount": "OTD Amount",
-                "OTD Amount": "OTD Amount",
-                "One time deductible": "OTD Amount",
+            # Normalize claims columns
+            claims_normalization_started = time.perf_counter()
+            if not claims_df.empty:
+                claims_df.columns = [str(c).strip() for c in claims_df.columns]
+                has_explicit_device_category = any(
+                    col in claims_df.columns
+                    for col in ["Device Plan Category", "Device_Plan_Category", "Category", "Device Category"]
+                )
+                rename_map = {
+                    "Partner Name": "Partner Name",
+                    "Partner_Name": "Partner Name",
+                    "Claim Marketplace": "Claim Marketplace",
+                    "Claim_Marketplace": "Claim Marketplace",
+                    "Net Amount": "Net Amount",
+                    "Net_Amount": "Net Amount",
+                    "otd amount": "OTD Amount",
+                    "OTD Amount": "OTD Amount",
+                    "One time deductible": "OTD Amount",
                 "One Time Deductible": "OTD Amount",
                 "Plan Category": "Plan Category",
                 "Plan_Category": "Plan Category",
                 "Device Plan Category": "Device Plan Category",
                 "Device_Plan_Category": "Device Plan Category",
                 "Day of Call_Date": "Day of Call_Date",
-                "Call Date": "Call_Date",
-                "Call_Date": "Call_Date",
-                "Month": "Month",
-                "Month Name": "Month",
-                "Month_Name": "Month",
-                "Fiscal Month": "Fiscal Month",
-                "State / City": "State",
-                "State/City": "State",
-                "Pack type": "Device Plan Category",
-            }
-            col_renames = {}
-            for src, dest in rename_map.items():
-                if src in claims_df.columns and dest not in claims_df.columns:
-                    col_renames[src] = dest
-            if col_renames:
-                claims_df = claims_df.rename(columns=col_renames)
+                    "Call Date": "Call_Date",
+                    "Call_Date": "Call_Date",
+                    "Month": "Month",
+                    "Month-Year": "Month",
+                    "Month Year": "Month",
+                    "Month_Year": "Month",
+                    "Month Name": "Month",
+                    "Month_Name": "Month",
+                    "Fiscal Month": "Fiscal Month",
+                    "State / City": "State",
+                    "State/City": "State",
+                    "Pack type": "Plan Category",
+                    "Category": "Device Plan Category",
+                    "Device Category": "Device Plan Category",
+                }
+                col_renames = {}
+                for src, dest in rename_map.items():
+                    if src in claims_df.columns and dest not in claims_df.columns:
+                        col_renames[src] = dest
+                if col_renames:
+                    claims_df = claims_df.rename(columns=col_renames)
 
-            # Samsung claims: treat Plan Category as Device Plan Category when missing
-            if "Device Plan Category" not in claims_df.columns and "Plan Category" in claims_df.columns:
-                claims_df["Device Plan Category"] = claims_df["Plan Category"]
+                # Canonicalize claim categories:
+                # - Plan Category comes from plan type fields (ADLD/Combo/SP...)
+                # - Device Plan Category comes from device-segment fields (Mass/Mid/High...)
+                if "Plan Category" in claims_df.columns:
+                    claims_df["Plan Category"] = self._clean_text_series(claims_df["Plan Category"])
+                else:
+                    claims_df["Plan Category"] = pd.NA
+                if "Pack type" in claims_df.columns:
+                    claims_df["Pack type"] = self._clean_text_series(claims_df["Pack type"])
+                    claims_df["Plan Category"] = claims_df["Plan Category"].fillna(claims_df["Pack type"])
 
-            if "Partner Name" in claims_df.columns:
-                claims_df["Partner Name"] = (
-                    claims_df["Partner Name"]
-                    .astype(str)
-                    .str.replace(" Bulk", "", regex=False)
-                    .str.strip()
+                if "Device Plan Category" in claims_df.columns:
+                    claims_df["Device Plan Category"] = self._clean_text_series(claims_df["Device Plan Category"])
+                else:
+                    claims_df["Device Plan Category"] = pd.NA
+                for device_fallback_col in ["Category", "Device Category"]:
+                    if device_fallback_col in claims_df.columns:
+                        claims_df[device_fallback_col] = self._clean_text_series(claims_df[device_fallback_col])
+                        claims_df["Device Plan Category"] = claims_df["Device Plan Category"].fillna(
+                            claims_df[device_fallback_col]
+                        )
+
+                model_ref: pd.Series | None = None
+                for model_col in ["Model Code", "Model Code-1", "Model"]:
+                    if model_col in claims_df.columns:
+                        claims_df[model_col] = self._clean_text_series(claims_df[model_col])
+                        model_ref = (
+                            claims_df[model_col]
+                            if model_ref is None
+                            else model_ref.fillna(claims_df[model_col])
+                        )
+                claims_df["Device Plan Category"] = self._canonicalize_device_plan_category(
+                    claims_df["Device Plan Category"],
+                    model_ref,
                 )
 
-            # Apply date filter to claims (prefer Day of Call_Date, Call_Date, then Month/Fiscal Month)
-            date_series = None
-            for col in ["Day of Call_Date", "Call_Date", "Month", "Fiscal Month"]:
-                if col in claims_df.columns:
-                    if col == "Fiscal Month":
-                        fm = claims_df[col].astype(str).str.strip()
-                        series = pd.to_datetime(
-                            fm.where(~fm.str.fullmatch(r"\d{6}"), fm.str.slice(0, 4) + "-" + fm.str.slice(4, 6) + "-01"),
-                            errors="coerce",
-                        )
-                    else:
-                        series = pd.to_datetime(claims_df[col], errors="coerce")
-                    if not series.isna().all():
-                        date_series = series
-                        break
+                # Legacy fallback: if no device segment column exists in the upload,
+                # keep dashboard populated using plan categories.
+                if (
+                    not has_explicit_device_category
+                    and "Plan Category" in claims_df.columns
+                    and claims_df["Device Plan Category"].isna().all()
+                ):
+                    claims_df["Device Plan Category"] = claims_df["Plan Category"]
 
-            if self.apply_date_filter and date_series is not None:
-                mask = pd.Series(True, index=claims_df.index)
-                if self.report_start is not None:
-                    mask &= date_series >= self.report_start
-                if self.report_end is not None:
-                    mask &= date_series <= self.report_end
-                claims_df = claims_df[mask]
+                if "Partner Name" in claims_df.columns:
+                    claims_df["Partner Name"] = (
+                        claims_df["Partner Name"]
+                        .astype(str)
+                        .str.replace(" Bulk", "", regex=False)
+                        .str.strip()
+                    )
 
-        return {"sales": sales_df, "claims": claims_df}
+                # Apply date filter to claims (prefer Day of Call_Date, Call_Date, then Month/Fiscal Month)
+                date_series = None
+                for col in ["Day of Call_Date", "Call_Date", "Month", "Month-Year", "Fiscal Month"]:
+                    if col in claims_df.columns:
+                        if col == "Fiscal Month":
+                            fm = claims_df[col].astype(str).str.strip()
+                            series = pd.to_datetime(
+                                fm.where(~fm.str.fullmatch(r"\d{6}"), fm.str.slice(0, 4) + "-" + fm.str.slice(4, 6) + "-01"),
+                                errors="coerce",
+                            )
+                        else:
+                            series = pd.to_datetime(claims_df[col], errors="coerce")
+                        if not series.isna().all():
+                            date_series = series
+                            break
+
+                if self.apply_date_filter and date_series is not None:
+                    mask = pd.Series(True, index=claims_df.index)
+                    if self.report_start is not None:
+                        mask &= date_series >= self.report_start
+                    if self.report_end is not None:
+                        mask &= date_series <= self.report_end
+                    claims_df = claims_df[mask]
+            logger.info(
+                "TIMING samsung.load_data.claims_normalization source=%s dataset=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                (time.perf_counter() - claims_normalization_started) * 1000,
+            )
+            logger.info(
+                "TIMING samsung.load_data.total source=%s dataset=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                (time.perf_counter() - total_started) * 1000,
+            )
+            result = {"sales": sales_df, "claims": claims_df}
+            self._loaded_data_cache[cache_key] = result
+            with _samsung_load_cache_lock:
+                _samsung_load_cache[shared_key] = (time.time() + SAMSUNG_LOAD_CACHE_TTL_SECONDS, self._clone_loaded_data(result))
+            return result
+        finally:
+            if is_loader:
+                with _samsung_load_cache_lock:
+                    event = _samsung_load_inflight.pop(shared_key, None)
+                if event is not None:
+                    event.set()
 
     # --------------------------------------------------
     # EARNED (ROW LEVEL)
@@ -373,27 +692,18 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
             return parsed
 
-        if "Date" in df.columns:
-            series = _parse(df["Date"])
+        # For earned/loss calculations prefer policy period dates over transaction "Date".
+        if use_adjusted:
+            preferred_cols = ["_adj_start_date", "Start_Date", "_adj_end_date", "End_Date", "Month", "Date"]
+        else:
+            preferred_cols = ["Date", "Start_Date", "Month", "End_Date"]
+
+        for col in preferred_cols:
+            if col not in df.columns:
+                continue
+            series = _parse(df[col])
             if not series.isna().all():
                 return series
-        if "Start_Date" in df.columns:
-            series = _parse(df["Start_Date"])
-            if not series.isna().all():
-                return series
-        if "Month" in df.columns:
-            series = _parse(df["Month"])
-            if not series.isna().all():
-                return series
-        if use_adjusted and "_adj_start_date" in df.columns:
-            series = _parse(df["_adj_start_date"])
-            if not series.isna().all():
-                return series
-        for col in ["End_Date"]:
-            if col in df.columns:
-                series = _parse(df[col])
-                if not series.isna().all():
-                    return series
         return None
 
     def _apply_sales_date_filter(
@@ -417,27 +727,43 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
     # MAIN AGGREGATION
     # --------------------------------------------------
     def compute_by_dimension(self, dimension: str, metric: str) -> list[dict]:
-        data = self.load_data()
+        total_started = time.perf_counter()
+        load_started = time.perf_counter()
+        needs_sales = self.dataset_type == "sales" or metric == "loss_ratio"
+        needs_claims = self.dataset_type == "claims"
+        data = self.load_data(include_sales=needs_sales, include_claims=needs_claims)
+        logger.info(
+            "TIMING samsung.compute_by_dimension.load_data source=%s dataset=%s dimension=%s metric=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            dimension,
+            metric,
+            (time.perf_counter() - load_started) * 1000,
+        )
         if self.dataset_type == "claims":
             df = data["claims"]
         else:
             df = data["sales"]
 
         if df.empty:
+            logger.info(
+                "TIMING samsung.compute_by_dimension.total source=%s dataset=%s dimension=%s metric=%s rows=0 duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                dimension,
+                metric,
+                (time.perf_counter() - total_started) * 1000,
+            )
             return []
 
         policy_col = self._find_policy_column(df)
 
         # ---------------- METRIC ----------------
+        metric_started = time.perf_counter()
         loss_ratio_mode = False
         if self.dataset_type == "claims":
             # Partner split based on source for samsung overview
-            if self.source and "Partner Name" in df.columns:
-                src = self.source.lower()
-                if "vijay" in src:
-                    df = df[df["Partner Name"].astype(str) == "Vijay Sales"]
-                elif "croma" in src:
-                    df = df[df["Partner Name"].astype(str) == "Croma"]
+            df = self._filter_claims_partner_rows(df)
 
             if metric == "claims":
                 if "Net Amount" not in df.columns:
@@ -485,10 +811,20 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
             else:
                 return []
+        logger.info(
+            "TIMING samsung.compute_by_dimension.metric_prep source=%s dataset=%s dimension=%s metric=%s rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            dimension,
+            metric,
+            len(df),
+            (time.perf_counter() - metric_started) * 1000,
+        )
 
         # ---------------- DIMENSION ----------------
+        dimension_started = time.perf_counter()
         DIMENSION_MAP = {
-            "month": ["Month", "Date", "month", "Fiscal Month", "Day of Call_Date", "Call_Date"],
+            "month": ["Month", "Month-Year", "Date", "month", "Fiscal Month", "Day of Call_Date", "Call_Date"],
             "state": [
                 "State",
                 "State Name",
@@ -526,24 +862,47 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             # try normalized match
             matched = _find_dim_column(df, candidates)
             if matched is None:
+                # Claims files often carry only Device Plan Category; for plan_category
+                # views use it as the nearest categorical fallback.
+                if self.dataset_type == "claims" and dim_key == "plan_category":
+                    device_candidates = DIMENSION_MAP.get("device_plan_category", ["Device Plan Category"])
+                    matched_device = _find_dim_column(df, device_candidates)
+                    if matched_device is not None:
+                        dim = matched_device
+                    else:
+                        return []
                 # special: derive Month from Start_Date if missing
-                if dim_key == "month" and "Start_Date" in df.columns:
+                elif dim_key == "month" and "Start_Date" in df.columns:
                     df = df.copy()
                     df["Month"] = pd.to_datetime(df["Start_Date"], errors="coerce")
                     dim = "Month"
-                else:
+                elif dim is None:
                     return []
             else:
                 dim = matched
 
-        # For loss ratio, align plan_category to device plan category if present
-        if loss_ratio_mode and dim_key == "plan_category" and "Device Plan Category" in df.columns:
+        # For plan_category loss ratio, prefer true plan category labels.
+        # Fall back to device category only when plan category isn't available.
+        if (
+            loss_ratio_mode
+            and dim_key == "plan_category"
+            and dim not in {"Plan_Category", "Plan Category"}
+            and "Device Plan Category" in df.columns
+        ):
             dim = "Device Plan Category"
 
         # 🔥 FIX: DEDUPE FOR CATEGORY DIMENSIONS
-        if policy_col and dim in ("Plan_Category", "Device_Plan_Category"):
+        if policy_col and dim in ("Plan_Category", "Plan Category", "Device_Plan_Category", "Device Plan Category"):
             df = df.dropna(subset=[dim])
             df = df.drop_duplicates(subset=[policy_col, dim])
+
+        if dim_key == "device_plan_category" and dim in df.columns:
+            model_ref: pd.Series | None = None
+            for model_col in ["Model Code", "Model Code-1", "Model"]:
+                if model_col in df.columns:
+                    model_ref = df[model_col] if model_ref is None else model_ref.fillna(df[model_col])
+            df = df.copy()
+            df[dim] = self._canonicalize_device_plan_category(df[dim], model_ref)
 
         if dim_key == "month":
             if self.dataset_type == "claims":
@@ -578,16 +937,24 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             if sales_df.empty:
                 return []
 
-            sales_dim = _find_dim_column(sales_df, candidates)
-            if sales_dim is None:
-                return []
-
-            # For loss ratio, align plan_category to device plan category if present
-            if dim_key == "plan_category" and "Device Plan Category" in sales_df.columns:
-                sales_dim = "Device Plan Category"
-
             if "Net Amount" not in df.columns:
                 return []
+
+            def _norm_dim(series: pd.Series) -> pd.Series:
+                return (
+                    series
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .str.replace(r"^\d+\s*-\s*", "", regex=True)
+                    .str.replace("_", " ", regex=False)
+                    .str.replace(r"[^a-z0-9]+", " ", regex=True)
+                    .str.replace(r"\s+", " ", regex=True)
+                    .str.replace(r"\bsp\b", "screen protection", regex=True)
+                    .str.replace(r"\bplan\b", "", regex=True)
+                    .str.replace(r"\s+", " ", regex=True)
+                    .str.strip()
+                )
 
             claims_df = df.copy()
             net_amt = pd.to_numeric(claims_df["Net Amount"], errors="coerce").fillna(0)
@@ -600,16 +967,70 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             if "Zopper Share" not in sales_df.columns or "Start_Date" not in sales_df.columns or "End_Date" not in sales_df.columns:
                 return []
 
+            sales_dim_candidates: list[str] = []
+            primary_sales_dim = _find_dim_column(sales_df, candidates)
+            if primary_sales_dim is not None:
+                sales_dim_candidates.append(primary_sales_dim)
+            if dim_key in {"plan_category", "device_plan_category"}:
+                for alt_candidates in (
+                    DIMENSION_MAP.get("plan_category", ["Plan Category"]),
+                    DIMENSION_MAP.get("device_plan_category", ["Device Plan Category"]),
+                ):
+                    alt_dim = _find_dim_column(sales_df, alt_candidates)
+                    if alt_dim is not None and alt_dim not in sales_dim_candidates:
+                        sales_dim_candidates.append(alt_dim)
+            if not sales_dim_candidates:
+                return []
+
+            if dim_key in {"plan_category", "device_plan_category"} and len(sales_dim_candidates) > 1:
+                claim_values = _norm_dim(claims_df[dim]).dropna().astype(str)
+                claim_set = set(claim_values.tolist())
+                best_dim = sales_dim_candidates[0]
+                best_score = -1
+                for candidate_dim in sales_dim_candidates:
+                    candidate_values = _norm_dim(sales_df[candidate_dim]).dropna().astype(str)
+                    score = len(set(candidate_values.tolist()) & claim_set)
+                    if score > best_score:
+                        best_score = score
+                        best_dim = candidate_dim
+                sales_dim = best_dim
+            else:
+                sales_dim = sales_dim_candidates[0]
+
             sales_df = sales_df.copy()
-            sales_df = self._apply_sales_date_filter(sales_df, use_adjusted=True)
+            if dim_key == "device_plan_category" and sales_dim in sales_df.columns:
+                sales_df[sales_dim] = self._canonicalize_device_plan_category(sales_df[sales_dim])
+            if self.apply_date_filter and self.report_start is not None and self.report_end is not None:
+                # Loss ratio denominator should include policies overlapping the
+                # report window, not only those whose start date falls inside it.
+                if "_adj_start_date" in sales_df.columns and "_adj_end_date" in sales_df.columns:
+                    overlap_mask = (
+                        (sales_df["_adj_end_date"] >= self.report_start)
+                        & (sales_df["_adj_start_date"] <= self.report_end)
+                    )
+                    sales_df = sales_df[overlap_mask]
+                elif "Start_Date" in sales_df.columns and "End_Date" in sales_df.columns:
+                    overlap_mask = (
+                        (sales_df["End_Date"] >= self.report_start)
+                        & (sales_df["Start_Date"] <= self.report_end)
+                    )
+                    sales_df = sales_df[overlap_mask]
+                else:
+                    sales_df = self._apply_sales_date_filter(sales_df, use_adjusted=True)
+            else:
+                sales_df = self._apply_sales_date_filter(sales_df, use_adjusted=True)
             if dim_key == "month":
                 start_series = None
-                if "Date" in sales_df.columns:
+                if "_adj_start_date" in sales_df.columns:
+                    adj_series = pd.to_datetime(sales_df["_adj_start_date"], errors="coerce")
+                    if not adj_series.isna().all():
+                        start_series = adj_series
+                if start_series is None and "Start_Date" in sales_df.columns:
+                    start_series = sales_df["Start_Date"]
+                if start_series is None and "Date" in sales_df.columns:
                     date_series = pd.to_datetime(sales_df["Date"], errors="coerce")
                     if not date_series.isna().all():
                         start_series = date_series
-                if start_series is None and "Start_Date" in sales_df.columns:
-                    start_series = sales_df["Start_Date"]
                 if start_series is not None and not start_series.isna().all():
                     month_source = start_series
                 else:
@@ -638,17 +1059,6 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 .sum()
                 .reset_index()
             )
-
-            def _norm_dim(series: pd.Series) -> pd.Series:
-                return (
-                    series
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    .str.replace(r"^\d+\s*-\s*", "", regex=True)
-                    .str.replace("_", " ", regex=False)
-                    .str.replace(r"\s+", " ", regex=True)
-                )
 
             claims_out["_k"] = _norm_dim(claims_out[dim])
             sales_out["_k"] = _norm_dim(sales_out[sales_dim])
@@ -699,33 +1109,38 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             out = out.drop(columns=["_month_key"])
             dim = "Month"
 
-        if dim_key in ("device_plan_category", "plan_category"):
+        if dim_key == "device_plan_category":
             order = [
-                "mass",
-                "mid",
-                "high",
-                "premium",
-                "super premium",
-                "luxury flip",
-                "luxury fold",
+                "Mass",
+                "Mid",
+                "High",
+                "Premium",
+                "Super Premium",
+                "Luxury Flip",
+                "Luxury Fold",
             ]
+            out[dim] = self._canonicalize_device_plan_category(out[dim])
+            value_col = "loss_ratio" if loss_ratio_mode else metric
+            out = out[out[dim].notna()].copy()
+            if value_col in out.columns:
+                existing = set(out[dim].dropna().astype(str).str.strip().tolist())
+                missing = [label for label in order if label not in existing]
+                if missing:
+                    out = pd.concat(
+                        [
+                            out,
+                            pd.DataFrame(
+                                {
+                                    dim: missing,
+                                    value_col: [0.0] * len(missing),
+                                }
+                            ),
+                        ],
+                        ignore_index=True,
+                    )
             order_index = {v: i for i, v in enumerate(order)}
-            normalized = (
-                out[dim]
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .str.replace(r"\s+", " ", regex=True)
-                .str.replace("flip luxury", "luxury flip", regex=False)
-                .str.replace("fold luxury", "luxury fold", regex=False)
-            )
-            has_device_plan_values = normalized.isin(order).any()
-            if dim_key == "device_plan_category" or has_device_plan_values:
-                out["_o"] = normalized.map(order_index)
-                out = out.sort_values(
-                    by=["_o", dim],
-                    na_position="last",
-                ).drop(columns="_o")
+            out["_o"] = out[dim].astype(str).str.strip().map(order_index).fillna(len(order))
+            out = out.sort_values(by=["_o", dim], na_position="last").drop(columns="_o")
 
         if dim_key == "month":
             out["_s"] = pd.to_datetime(out[dim], format="%b-%y", errors="coerce")
@@ -734,18 +1149,54 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             else:
                 out = out.drop(columns="_s")
 
-        out = out.fillna(0)
-        out = out.replace([float("inf"), float("-inf")], 0)
+        if dim_key in {"plan_category", "device_plan_category"} and dim in out.columns:
+            dim_as_text = out[dim].astype(str).str.strip().str.lower()
+            out = out[
+                out[dim].notna()
+                & ~dim_as_text.isin({"", "nan", "none", "null"})
+            ].copy()
+
+        value_cols = [c for c in out.columns if c != dim]
+        if value_cols:
+            out[value_cols] = out[value_cols].replace([float("inf"), float("-inf")], 0).fillna(0)
+        logger.info(
+            "TIMING samsung.compute_by_dimension.dimension_and_aggregation source=%s dataset=%s dimension=%s metric=%s out_rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            dimension,
+            metric,
+            len(out),
+            (time.perf_counter() - dimension_started) * 1000,
+        )
+        logger.info(
+            "TIMING samsung.compute_by_dimension.total source=%s dataset=%s dimension=%s metric=%s out_rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            dimension,
+            metric,
+            len(out),
+            (time.perf_counter() - total_started) * 1000,
+        )
         return out.to_dict(orient="records")
 
     # --------------------------------------------------
     # ✅ SUMMARY (REQUIRED BY ROUTER)
     # --------------------------------------------------
     def compute_summary(self) -> dict:
-        data = self.load_data()
+        total_started = time.perf_counter()
+        data = self.load_data(
+            include_sales=self.dataset_type != "claims",
+            include_claims=self.dataset_type == "claims",
+        )
         if self.dataset_type == "claims":
             df = data["claims"]
             if df.empty:
+                logger.info(
+                    "TIMING samsung.compute_summary.total source=%s dataset=%s rows=0 duration_ms=%.2f",
+                    self.source,
+                    self.dataset_type,
+                    (time.perf_counter() - total_started) * 1000,
+                )
                 return {
                     "gross_premium": 0,
                     "earned_premium": 0,
@@ -753,13 +1204,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                     "units_sold": 0,
                 }
 
-            # Partner split for samsung overview
-            if self.source and "Partner Name" in df.columns:
-                src = self.source.lower()
-                if "vijay" in src:
-                    df = df[df["Partner Name"].astype(str) == "Vijay Sales"]
-                elif "croma" in src:
-                    df = df[df["Partner Name"].astype(str) == "Croma"]
+            df = self._filter_claims_partner_rows(df)
 
             if "Net Amount" in df.columns:
                 claims = pd.to_numeric(df["Net Amount"], errors="coerce").fillna(0).sum()
@@ -780,6 +1225,12 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
         df = data["sales"]
         if df.empty:
+            logger.info(
+                "TIMING samsung.compute_summary.total source=%s dataset=%s rows=0 duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                (time.perf_counter() - total_started) * 1000,
+            )
             return {
                 "gross_premium": 0,
                 "earned_premium": 0,
@@ -884,12 +1335,20 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         else:
             zopper_earned = 0.0
 
-        return {
+        result = {
             "gross_premium": float(gross),
             "earned_premium": float(earned),
             "zopper_earned_premium": float(zopper_earned),
             "units_sold": int(len(df_qty)),
         }
+        logger.info(
+            "TIMING samsung.compute_summary.total source=%s dataset=%s rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            len(df_qty),
+            (time.perf_counter() - total_started) * 1000,
+        )
+        return result
 
     def compute(self) -> dict:
         return {}

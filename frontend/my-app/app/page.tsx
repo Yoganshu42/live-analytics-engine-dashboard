@@ -17,8 +17,10 @@ import {
 import Sidebar from "@/components/Sidebar"
 import Tabs from "@/components/Tabs"
 import GraphSection from "@/components/GraphSection"
+import { clearGraphDataCache } from "@/components/GraphView"
 import ResultCard from "@/components/ResultCard"
 import LastUpdatedCard from "@/components/LastUpdatedCard"
+import AdminFileAccess from "@/components/AdminFileAccess"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
 
 // --- ENHANCED ANIMATION VARIANTS ---
@@ -63,9 +65,7 @@ export default function DashboardPage() {
   }, [])
 
   const clampToCurrentMonth = useCallback((value: string) => {
-    if (!value) return value
-    const maxDate = currentMonthDateMax()
-    return value > maxDate ? maxDate : value
+    return value
   }, [currentMonthDateMax])
 
   const normalizeToken = (value: string | null) => {
@@ -126,9 +126,7 @@ export default function DashboardPage() {
         : null
 
     const normalizedBrand = storedBrand ? normalizeBrand(storedBrand) : "samsung"
-    let normalizedMode: "sales" | "claims" = storedMode === "claims" ? "claims" : "sales"
-    // Samsung currently has sales data only in the deployed dataset.
-    if (normalizedBrand.startsWith("samsung")) normalizedMode = "sales"
+    const normalizedMode: "sales" | "claims" = storedMode === "claims" ? "claims" : "sales"
 
     return {
       view: storedView === "dashboard" ? "dashboard" : "home",
@@ -146,6 +144,7 @@ export default function DashboardPage() {
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [isLoggingOut, setIsLoggingOut] = useState(false)
   const [jobId] = useState<string | null>(initialDashboardState.jobId)
+  const effectiveJobId = brand === "godrej" && mode === "claims" ? null : jobId
   const [authRole, setAuthRole] = useState<"admin" | "employee" | null>(null)
   const [authName, setAuthName] = useState<string>("")
   const [authReady, setAuthReady] = useState(false)
@@ -157,6 +156,7 @@ export default function DashboardPage() {
   const [defaultFromDate, setDefaultFromDate] = useState<string>("")
   const [defaultToDate, setDefaultToDate] = useState<string>("")
   const [defaultKey, setDefaultKey] = useState<string>("")
+  const [filterRefreshTick, setFilterRefreshTick] = useState(0)
 
   const dateStateRef = useRef({
     fromDate: initialDashboardState.from,
@@ -180,10 +180,18 @@ export default function DashboardPage() {
     }
   }, [fromDate, toDate, draftFromDate, draftToDate, defaultFromDate, defaultToDate, defaultKey])
 
+  const forceFilterRefresh = useCallback(() => {
+    clearGraphDataCache()
+    setFilterRefreshTick((prev) => prev + 1)
+  }, [])
+
+  const todayIso = useCallback(() => new Date().toISOString().slice(0, 10), [])
+
   const applyBrandChange = (nextBrandRaw: string) => {
     const nextBrand = normalizeBrand(nextBrandRaw)
+    const nextMode: "sales" | "claims" = mode
     setBrand(nextBrand)
-    if (nextBrand.startsWith("samsung")) setMode("sales")
+    setMode(nextMode)
     setIsFullscreen(false)
     setDefaultKey("")
     setFromDate("")
@@ -191,6 +199,16 @@ export default function DashboardPage() {
     setDraftFromDate("")
     setDraftToDate("")
     setView("dashboard")
+    if (typeof window !== "undefined") {
+      localStorage.setItem("dashboard_brand", nextBrand)
+      localStorage.setItem("dashboard_mode", nextMode)
+      localStorage.setItem("dashboard_view", "dashboard")
+      localStorage.setItem("dashboard_from_date", "")
+      localStorage.setItem("dashboard_to_date", "")
+      window.setTimeout(() => {
+        window.location.reload()
+      }, 0)
+    }
   }
 
   useEffect(() => {
@@ -246,12 +264,12 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (!brand || !mode) return
-    const nextKey = `${brand}|${mode}|${jobId || ""}`
+    const nextKey = `${brand}|${mode}|${effectiveJobId || ""}`
     const snapshot = dateStateRef.current
     if (snapshot.defaultKey === nextKey && (snapshot.defaultFromDate || snapshot.defaultToDate)) return
     let mounted = true
 
-    fetchDateBounds({ job_id: jobId || undefined, source: brand, dataset_type: mode })
+    fetchDateBounds({ job_id: effectiveJobId || undefined, source: brand, dataset_type: mode })
       .then((res) => {
         if (!mounted) return
         const min = clampToCurrentMonth(res?.min_date ?? "")
@@ -260,46 +278,61 @@ export default function DashboardPage() {
         setDefaultToDate(max)
         setDefaultKey(nextKey)
 
+        const today = clampToCurrentMonth(todayIso())
+        const clamp = (value: string) => {
+          if (!value) return value
+          if (!min || !max) return value
+          if (value < min) return min
+          if (value > max) return max
+          return value
+        }
+        const todayBounded = clamp(today)
+        const isNewKeyLoad = snapshot.defaultKey !== nextKey
+
         if (!min || !max) {
-          setFromDate("")
-          setToDate("")
-          setDraftFromDate("")
-          setDraftToDate("")
+          setDefaultFromDate(todayBounded)
+          setDefaultToDate(todayBounded)
+          setFromDate(todayBounded)
+          setToDate(todayBounded)
+          setDraftFromDate(todayBounded)
+          setDraftToDate(todayBounded)
           return
         }
 
-        if (!snapshot.fromDate && !snapshot.toDate) {
-          setFromDate(min); setToDate(max); setDraftFromDate(min); setDraftToDate(max);
-        } else if (min && max) {
-          const clamp = (value: string) => {
-            if (!value) return value
-            if (value < min) return min
-            if (value > max) return max
-            return value
-          }
-          const nextFrom = clamp(clampToCurrentMonth(snapshot.fromDate || min))
-          const nextTo = clamp(clampToCurrentMonth(snapshot.toDate || max))
-          const orderedFrom = nextFrom <= nextTo ? nextFrom : min
-          const orderedTo = nextFrom <= nextTo ? nextTo : max
-          if (orderedFrom !== snapshot.fromDate || orderedTo !== snapshot.toDate) {
-            setFromDate(orderedFrom); setToDate(orderedTo)
-          }
-          if (orderedFrom !== snapshot.draftFromDate || orderedTo !== snapshot.draftToDate) {
-            setDraftFromDate(orderedFrom); setDraftToDate(orderedTo)
-          }
+        if (isNewKeyLoad) {
+          setFromDate(min)
+          setToDate(todayBounded)
+          setDraftFromDate(min)
+          setDraftToDate(todayBounded)
+          return
+        }
+
+        const nextFrom = clamp(clampToCurrentMonth(snapshot.fromDate || min))
+        const nextTo = clamp(clampToCurrentMonth(snapshot.toDate || todayBounded))
+        const orderedFrom = nextFrom <= nextTo ? nextFrom : min
+        const orderedTo = nextFrom <= nextTo ? nextTo : todayBounded
+        if (orderedFrom !== snapshot.fromDate || orderedTo !== snapshot.toDate) {
+          setFromDate(orderedFrom); setToDate(orderedTo)
+        }
+        if (orderedFrom !== snapshot.draftFromDate || orderedTo !== snapshot.draftToDate) {
+          setDraftFromDate(orderedFrom); setDraftToDate(orderedTo)
         }
       })
     return () => { mounted = false }
-  }, [brand, mode, jobId, clampToCurrentMonth])
+  }, [brand, mode, effectiveJobId, clampToCurrentMonth, todayIso])
 
   const handleModeChange = (nextMode: "sales" | "claims") => {
     setIsFullscreen(false)
-    // Samsung currently has sales data only in the deployed dataset.
-    if (brand.startsWith("samsung") && nextMode === "claims") {
-      setMode("sales")
-      return
-    }
+    if (nextMode === mode) return
+
     setMode(nextMode)
+    if (typeof window !== "undefined") {
+      localStorage.setItem("dashboard_mode", nextMode)
+      localStorage.setItem("dashboard_view", "dashboard")
+      window.setTimeout(() => {
+        window.location.reload()
+      }, 0)
+    }
   }
 
   const theme = useMemo(() => ({
@@ -308,7 +341,7 @@ export default function DashboardPage() {
     accent: mode === "sales" ? "text-indigo-600" : "text-rose-600",
     bgLight: mode === "sales" ? "bg-indigo-50/50" : "bg-rose-50/50",
   }), [mode])
-  const activeDateKey = `${brand}|${mode}|${jobId || ""}`
+  const activeDateKey = `${brand}|${mode}|${effectiveJobId || ""}`
   const hasResolvedDateBounds = defaultKey === activeDateKey
   const hasDateBounds = Boolean(defaultFromDate && defaultToDate)
   const isDashboardDataReady =
@@ -425,7 +458,7 @@ export default function DashboardPage() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0, scale: 0.98 }}
             transition={{ duration: 0.5 }}
-            className="relative flex-1 flex items-center justify-center p-6 overflow-hidden"
+            className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-6"
           >
             {/* Background Elements */}
             <div className="absolute inset-0 -z-10">
@@ -546,7 +579,7 @@ export default function DashboardPage() {
               </div>
             </motion.div>
 
-            <div className="w-full max-w-6xl relative z-20">
+            <div className="w-full max-w-6xl mx-auto relative z-20 min-h-full flex flex-col justify-center py-6 items-center">
               <div className="text-center mb-20">
                 <motion.div variants={staggerContainer} initial="initial" animate="animate">
                   <motion.div variants={fadeIn} className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white border border-slate-200 shadow-sm mb-8">
@@ -557,14 +590,14 @@ export default function DashboardPage() {
                     <span className="text-[#1E6FFF] text-[10px] font-black uppercase tracking-[0.25em]">Unified Data Experience</span>
                   </motion.div>
 
-                  <motion.h2 variants={fadeIn} className="font-black tracking-tight mb-8">
+                  <motion.h2 variants={fadeIn} className="font-black tracking-tight mb-8 text-center">
                     <span className="block text-slate-900 leading-tight text-2xl md:text-3xl">Welcome to</span>
                     <span className="block text-5xl md:text-7xl text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 via-purple-600 to-rose-500 italic font-serif">
                      Business Control Centre
                     </span>
                   </motion.h2>
                   
-                  <motion.p variants={fadeIn} className="text-slate-500 text-xl max-w-2xl mx-auto leading-relaxed font-medium">
+                  <motion.p variants={fadeIn} className="text-slate-500 text-xl max-w-2xl mx-auto leading-relaxed font-medium text-center">
                     Navigate through partner ecosystems with precision. <br/>Real-time performance metrics at your fingertips.
                   </motion.p>
                 </motion.div>
@@ -574,7 +607,7 @@ export default function DashboardPage() {
                 variants={staggerContainer} 
                 initial="initial" 
                 animate="animate"
-                className="grid grid-cols-1 md:grid-cols-3 gap-8"
+                className="grid grid-cols-1 md:grid-cols-3 gap-8 justify-items-center"
               >
                 {brandConfigs.map((cfg) => (
                   <motion.div
@@ -584,7 +617,7 @@ export default function DashboardPage() {
                     onClick={() => {
                       applyBrandChange(cfg.value)
                     }}
-                    className="group cursor-pointer relative bg-white/70 backdrop-blur-md border border-white p-10 rounded-[48px] shadow-2xl transition-all duration-500"
+                    className="group cursor-pointer relative bg-white/70 backdrop-blur-md border border-white p-10 rounded-[48px] shadow-2xl transition-all duration-500 text-center w-full max-w-[380px]"
                   >
                     <div className="h-24 flex items-center justify-center mb-10 overflow-hidden">
                       <motion.div
@@ -599,8 +632,8 @@ export default function DashboardPage() {
                         />
                       </motion.div>
                     </div>
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between">
+                    <div className="space-y-4 text-center">
+                      <div className="flex items-center justify-center gap-3">
                         <h3 className="font-bold text-2xl text-slate-800 tracking-tight">{cfg.label}</h3>
                         <div className="w-10 h-10 rounded-full flex items-center justify-center bg-slate-900 text-white scale-0 group-hover:scale-100 transition-transform duration-300">
                            <ChevronRight size={20} />
@@ -611,6 +644,19 @@ export default function DashboardPage() {
                   </motion.div>
                 ))}
               </motion.div>
+
+              {authRole === "admin" && (
+                <div className="mt-8 w-full md:max-w-[1204px]">
+                  <div className="grid grid-cols-1 md:grid-cols-3">
+                    <div className="md:col-start-2 flex justify-center">
+                      <div className="w-full max-w-xs">
+                        <AdminFileAccess isAdmin />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
             </div>
           </motion.div>
         ) : (
@@ -657,32 +703,47 @@ export default function DashboardPage() {
                         {brand === "samsung_croma" && <Image src="/croma_logo.jpg" width={96} height={32} className="h-8 w-auto" alt="Croma" />}
                       </motion.div>
                     )}
-                    <Tabs value={mode} onChange={handleModeChange} disableClaims={brand.startsWith("samsung")} />
+                    <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
                   </div>
                 </motion.div>
 
                 <motion.div variants={staggerContainer} initial="initial" animate="animate" className="grid grid-cols-1 lg:grid-cols-12 gap-8 mb-10">
-                  <motion.div variants={fadeIn} className="lg:col-span-4">
+                  <motion.div variants={fadeIn} className="lg:col-span-4 h-full">
                     {isDashboardDataReady ? (
-                      <ResultCard source={brand} datasetType={mode} color={theme.primary} jobId={jobId || undefined} fromDate={fromDate || undefined} toDate={toDate || undefined} />
+                      <ResultCard
+                        source={brand}
+                        datasetType={mode}
+                        color={theme.primary}
+                        jobId={effectiveJobId || undefined}
+                        fromDate={fromDate || undefined}
+                        toDate={toDate || undefined}
+                        refreshTick={filterRefreshTick}
+                      />
                     ) : (
-                      <div className="h-full min-h-[220px] rounded-[32px] border border-slate-200 bg-white p-8 flex items-center justify-center text-sm text-slate-400">
+                      <div className="h-full min-h-[320px] rounded-[32px] border border-slate-200 bg-white p-8 flex items-center justify-center text-sm text-slate-400">
                         Loading summary...
                       </div>
                     )}
                   </motion.div>
                   
-                  <motion.div variants={fadeIn} className="lg:col-span-4">
+                  <motion.div variants={fadeIn} className="lg:col-span-4 h-full">
                     {isDashboardDataReady ? (
-                      <LastUpdatedCard source={brand} datasetType={mode} jobId={jobId || undefined} fromDate={fromDate || undefined} toDate={toDate || undefined} />
+                      <LastUpdatedCard
+                        source={brand}
+                        datasetType={mode}
+                        jobId={effectiveJobId || undefined}
+                        fromDate={fromDate || undefined}
+                        toDate={toDate || undefined}
+                        refreshTick={filterRefreshTick}
+                      />
                     ) : (
-                      <div className="h-full min-h-[220px] rounded-[32px] border border-slate-200 bg-white p-8 flex items-center justify-center text-sm text-slate-400">
+                      <div className="h-full min-h-[320px] rounded-[32px] border border-slate-200 bg-white p-8 flex items-center justify-center text-sm text-slate-400">
                         Loading freshness...
                       </div>
                     )}
                   </motion.div>
 
-                  <motion.div variants={fadeIn} className="lg:col-span-4 bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm flex flex-col justify-between">
+                  <motion.div variants={fadeIn} className="lg:col-span-4 bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm flex flex-col justify-between h-full min-h-[320px]">
                     <div>
                       <div className="flex gap-3 items-center mb-6">
                         <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-100 text-slate-600"><Calendar size={20} /></div>
@@ -691,11 +752,11 @@ export default function DashboardPage() {
                       <div className="grid grid-cols-2 gap-3 mb-6">
                         <div className="space-y-1">
                           <label className="text-[9px] font-bold uppercase text-slate-400 ml-1">From</label>
-                          <input type="date" value={draftFromDate} max={currentMonthDateMax()} onChange={e => setDraftFromDate(clampToCurrentMonth(e.target.value))} className="w-full border-slate-200 rounded-2xl px-4 py-3 text-xs font-bold focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none bg-slate-50/50" />
+                          <input type="date" value={draftFromDate} onChange={e => setDraftFromDate(clampToCurrentMonth(e.target.value))} className="w-full border-slate-200 rounded-2xl px-4 py-3 text-xs font-bold focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none bg-slate-50/50" />
                         </div>
                         <div className="space-y-1">
                           <label className="text-[9px] font-bold uppercase text-slate-400 ml-1">To</label>
-                          <input type="date" value={draftToDate} max={currentMonthDateMax()} onChange={e => setDraftToDate(clampToCurrentMonth(e.target.value))} className="w-full border-slate-200 rounded-2xl px-4 py-3 text-xs font-bold focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none bg-slate-50/50" />
+                          <input type="date" value={draftToDate} onChange={e => setDraftToDate(clampToCurrentMonth(e.target.value))} className="w-full border-slate-200 rounded-2xl px-4 py-3 text-xs font-bold focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none bg-slate-50/50" />
                         </div>
                       </div>
                     </div>
@@ -714,13 +775,42 @@ export default function DashboardPage() {
                           setDraftToDate(next.to)
                           setFromDate(next.from)
                           setToDate(next.to)
+                          forceFilterRefresh()
                         }}
                       >
                         Apply Filters
                       </motion.button>
-                      <button className="px-5 py-4 rounded-2xl border border-slate-200 bg-white hover:bg-slate-50 transition-all text-xs font-bold text-slate-400" onClick={() => {
-                        setFromDate(defaultFromDate); setToDate(defaultToDate); setDraftFromDate(defaultFromDate); setDraftToDate(defaultToDate);
-                      }}>Reset</button>
+                      <button
+                        className="px-5 py-4 rounded-2xl border border-slate-200 bg-white hover:bg-slate-50 transition-all text-xs font-bold text-slate-500"
+                        onClick={() => {
+                          const today = todayIso()
+                          setFromDate(today)
+                          setToDate(today)
+                          setDraftFromDate(today)
+                          setDraftToDate(today)
+                          forceFilterRefresh()
+                        }}
+                      >
+                        Reset
+                      </button>
+                      <button
+                        className="px-5 py-4 rounded-2xl border border-slate-200 bg-white hover:bg-slate-50 transition-all text-xs font-bold text-slate-500"
+                        onClick={() => {
+                          const next = normalizeDateRange(
+                            draftFromDate,
+                            draftToDate,
+                            fromDate || defaultFromDate,
+                            toDate || defaultToDate
+                          )
+                          setDraftFromDate(next.from)
+                          setDraftToDate(next.to)
+                          setFromDate(next.from)
+                          setToDate(next.to)
+                          forceFilterRefresh()
+                        }}
+                      >
+                        Refresh
+                      </button>
                     </div>
                   </motion.div>
                 </motion.div>
@@ -746,7 +836,16 @@ export default function DashboardPage() {
                   </div>
                   <div className="min-h-[500px] w-full">
                     {isDashboardDataReady ? (
-                      <GraphSection source={brand} datasetType={mode} jobId={jobId} primaryColor={theme.primary} secondaryColor={theme.secondary} fromDate={fromDate || undefined} toDate={toDate || undefined} />
+                      <GraphSection
+                        key={`main-graph-${brand}-${mode}-${effectiveJobId || ""}-${fromDate}-${toDate}-${filterRefreshTick}`}
+                        source={brand}
+                        datasetType={mode}
+                        jobId={effectiveJobId}
+                        primaryColor={theme.primary}
+                        secondaryColor={theme.secondary}
+                        fromDate={fromDate || undefined}
+                        toDate={toDate || undefined}
+                      />
                     ) : (
                       <div className="h-[500px] flex items-center justify-center text-sm text-slate-400">
                         Loading charts...
@@ -778,7 +877,15 @@ export default function DashboardPage() {
             </div>
             <div className="flex-1 p-12 overflow-auto">
               {isDashboardDataReady ? (
-                <GraphSection source={brand} datasetType={mode} jobId={jobId} primaryColor={theme.primary} fromDate={fromDate || undefined} toDate={toDate || undefined} />
+                <GraphSection
+                  key={`fullscreen-graph-${brand}-${mode}-${effectiveJobId || ""}-${fromDate}-${toDate}-${filterRefreshTick}`}
+                  source={brand}
+                  datasetType={mode}
+                  jobId={effectiveJobId}
+                  primaryColor={theme.primary}
+                  fromDate={fromDate || undefined}
+                  toDate={toDate || undefined}
+                />
               ) : (
                 <div className="h-full min-h-[500px] flex items-center justify-center text-sm text-slate-400">
                   Loading charts...

@@ -10,6 +10,7 @@ type Props = {
   jobId?: string
   fromDate?: string
   toDate?: string
+  refreshTick?: number
 }
 
 type LastUpdated = {
@@ -33,6 +34,7 @@ export default function LastUpdatedCard({
   jobId,
   fromDate,
   toDate,
+  refreshTick,
 }: Props) {
   const [data, setData] = useState<LastUpdated | null>(null)
   const [error, setError] = useState(false)
@@ -67,10 +69,10 @@ export default function LastUpdatedCard({
     return () => {
       mounted = false
     }
-  }, [jobId, source, datasetType, fromDate, toDate])
+  }, [jobId, source, datasetType, fromDate, toDate, refreshTick])
 
   return (
-    <div className="bg-white p-7 rounded-[24px] border border-slate-200 shadow-sm relative overflow-hidden group">
+    <div className="bg-white p-7 rounded-[24px] border border-slate-200 shadow-sm relative overflow-hidden group h-full min-h-[320px] flex flex-col">
       <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:scale-110 transition-transform">
         <Calendar size={80} />
       </div>
@@ -88,7 +90,7 @@ export default function LastUpdatedCard({
       ) : (
         <>
           <div className="text-xs font-bold uppercase text-slate-400">
-          Last Start Date
+          Last Data Saved Date
           </div>
           <div className="text-3xl font-black text-slate-900">
             {formatDate(data.data_upto)}

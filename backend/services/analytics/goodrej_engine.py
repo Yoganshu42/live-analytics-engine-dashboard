@@ -1,10 +1,13 @@
 import pandas as pd
 import numpy as np
+import time
+import logging
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
 
 VALUATION_DATE = pd.Timestamp("2025-12-31")
+logger = logging.getLogger(__name__)
 
 REVENUE_SPLIT = {
     'D2D':     {'channel':0.25,'godrej':0.35,'zopper':0.40},
@@ -15,6 +18,39 @@ REVENUE_SPLIT = {
 }
 
 class GodrejAnalyticsEngine(BaseAnalyticsEngine):
+    CLAIM_CHANNEL_MAP = {
+        "d2d": "D2D",
+        "pod": "POD",
+        "pos": "POS",
+        "calling process": "Calling Process",
+        "callingprocess": "Calling Process",
+        "calling_process": "Calling Process",
+        "amazon": "Amazon",
+    }
+    STATE_ALIAS_MAP = {
+        "delhi": "Delhi",
+        "new delhi": "Delhi",
+        "ghaziabad": "Uttar Pradesh",
+        "lucknow": "Uttar Pradesh",
+        "faridabad": "Haryana",
+        "mumbai": "Maharashtra",
+        "pune": "Maharashtra",
+        "pune goa": "Maharashtra",
+        "kolkata": "West Bengal",
+        "bangalore": "Karnataka",
+        "bengaluru": "Karnataka",
+        "bhubaneshwar": "Odisha",
+        "bhubaneswar": "Odisha",
+        "chennai": "Tamil Nadu",
+        "coimbatore": "Tamil Nadu",
+        "hyderabad": "Telangana",
+        "patna": "Bihar",
+        "kochi": "Kerala",
+        "vijayawada": "Andhra Pradesh",
+        "bhopal": "Madhya Pradesh",
+        "ahmedabad": "Gujarat",
+        "ranchi": "Jharkhand",
+    }
 
     def __init__(
         self,
@@ -27,6 +63,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     ):
         super().__init__(db=db, job_id=job_id, source=source)
         self.dataset_type = dataset_type or "sales"
+        self._loaded_data_cache: dict[tuple[bool, bool], dict[str, pd.DataFrame]] = {}
         self.apply_date_filter = bool(from_date or to_date)
         self.report_start = pd.to_datetime(from_date, errors="coerce") if from_date else None
         self.report_end = pd.to_datetime(to_date, errors="coerce") if to_date else None
@@ -36,9 +73,25 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     # --------------------------------------------------
 
     def load_data(self, include_sales: bool = True, include_claims: bool = True) -> dict[str, pd.DataFrame]:
+        cache_key = (include_sales, include_claims)
+        if cache_key in self._loaded_data_cache:
+            return self._loaded_data_cache[cache_key]
+        started = time.perf_counter()
         sales = self._load_rows("sales") if include_sales else pd.DataFrame()
         claims = self._load_rows("claims") if include_claims else pd.DataFrame()
-        return {"sales": sales, "claims": claims}
+        result = {"sales": sales, "claims": claims}
+        self._loaded_data_cache[cache_key] = result
+        logger.info(
+            "TIMING godrej.load_data source=%s dataset=%s include_sales=%s include_claims=%s sales_rows=%s claims_rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            include_sales,
+            include_claims,
+            len(sales),
+            len(claims),
+            (time.perf_counter() - started) * 1000,
+        )
+        return result
 
     def _load_rows(self, dataset_type):
         q = self.db.query(DataRow.data).filter(DataRow.dataset_type == dataset_type)
@@ -48,9 +101,21 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 (DataRow.source.ilike("goodrej%")) |
                 (DataRow.source.ilike("goddrej%"))
             )
-        # Goodrej dashboards should aggregate across all uploads, even when a job_id
-        # is passed from the UI. This ensures totals reflect the full database.
+        base_query = q
+        tag = (self.job_id or "").strip()
+        aggregate_claims_across_tags = dataset_type == "claims" and self.dataset_type == "claims"
+        if tag and not aggregate_claims_across_tags:
+            q = q.filter(DataRow.job_id == tag)
         rows = q.all()
+        if (
+            tag
+            and not rows
+            and dataset_type == "sales"
+            and self.dataset_type == "claims"
+        ):
+            # Claims loss-ratio can be requested for tags that only have claims uploads.
+            # Fall back to available sales rows so ratio graphs still render.
+            rows = base_query.all()
         payloads = [r[0] if isinstance(r, tuple) else r.data for r in rows]
         df = pd.DataFrame(payloads)
         if df.empty:
@@ -90,6 +155,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                     col_map[col] = "Month"
             if col_map:
                 df = df.rename(columns=col_map)
+        df = self._dedupe_columns(df)
         if dataset_type == "sales":
             df = self.compute_premiums(df)
         else:
@@ -169,30 +235,328 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     # HELPERS
     # --------------------------------------------------
 
+    @staticmethod
+    def _as_series(value, index: pd.Index | None = None) -> pd.Series:
+        if isinstance(value, pd.DataFrame):
+            if value.shape[1] == 0:
+                return pd.Series(dtype=float, index=index)
+            out = value.iloc[:, 0]
+            if value.shape[1] > 1:
+                for i in range(1, value.shape[1]):
+                    out = out.where(out.notna(), value.iloc[:, i])
+            return out
+        if isinstance(value, pd.Series):
+            return value
+        if index is None:
+            return pd.Series(value)
+        return pd.Series(value, index=index)
+
+    @staticmethod
+    def _normalize_col_key(value: str) -> str:
+        return (
+            str(value)
+            .lower()
+            .replace("_", "")
+            .replace(" ", "")
+            .replace("/", "")
+            .replace("-", "")
+            .replace("(", "")
+            .replace(")", "")
+            .replace(".", "")
+            .strip()
+        )
+
+    @classmethod
+    def _canonical_claim_channel(cls, series: pd.Series) -> pd.Series:
+        normalized = (
+            series
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        return normalized.map(cls.CLAIM_CHANNEL_MAP).fillna("Unknown")
+
+    @classmethod
+    def _canonical_state(cls, series: pd.Series) -> pd.Series:
+        cleaned = (
+            series
+            .astype(str)
+            .str.strip()
+            .str.replace("_", " ", regex=False)
+            .str.replace("/", " ", regex=False)
+            .str.replace("-", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        normalized = cleaned.str.lower()
+        mapped = normalized.map(cls.STATE_ALIAS_MAP)
+        base_title = cleaned.str.title()
+        return mapped.where(mapped.notna(), base_title)
+
+    @staticmethod
+    def _is_identifier_like(value: str) -> bool:
+        s = str(value or "").strip()
+        if not s:
+            return True
+        low = s.lower()
+        if low in {"unknown", "nan", "none", "null", "0"}:
+            return True
+        compact = s.replace(" ", "")
+        if len(compact) < 8 or " " in s:
+            return False
+        alnum = "".join(ch for ch in compact if ch.isalnum())
+        if len(alnum) < 8:
+            return False
+        has_alpha = any(ch.isalpha() for ch in alnum)
+        has_digit = any(ch.isdigit() for ch in alnum)
+        if not (has_alpha and has_digit):
+            return False
+        return (len(alnum) / max(len(compact), 1)) >= 0.85
+
+    def _drop_noise_buckets(self, out: pd.DataFrame, dimension: str) -> pd.DataFrame:
+        if out.empty or dimension not in out.columns:
+            return out
+        labels = out[dimension].astype(str).str.strip()
+        normalized = (
+            labels
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        bad = normalized.isin({"", "0", "unknown", "nan", "none", "null"})
+        if dimension == "product_category":
+            bad = bad | labels.map(self._is_identifier_like)
+            bad = bad | normalized.str.match(
+                r"^(q[1-4]\b|(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b)",
+                na=False,
+            )
+        if dimension == "state":
+            channel_labels = {value.lower() for value in self.CLAIM_CHANNEL_MAP.values()}
+            compact = labels.str.replace(" ", "", regex=False)
+            bad = bad | labels.map(self._is_identifier_like)
+            bad = bad | (compact.str.len().ge(6) & compact.str.isdigit())
+            bad = bad | normalized.isin(channel_labels)
+        return out.loc[~bad].copy()
+
+    def _pick_first_series(self, df: pd.DataFrame, candidates: list[str], default: float = 0.0) -> pd.Series:
+        normalized = [self._normalize_col_key(c) for c in df.columns]
+        for candidate in candidates:
+            target = self._normalize_col_key(candidate)
+            idxs = [i for i, key in enumerate(normalized) if key == target]
+            if not idxs:
+                continue
+            selected = df.iloc[:, idxs]
+            return self._as_series(selected, index=df.index)
+        return pd.Series(default, index=df.index)
+
+    def _as_numeric_series(self, df: pd.DataFrame, candidates: list[str], default: float = 0.0) -> pd.Series:
+        series = self._pick_first_series(df, candidates, default=default)
+        return pd.to_numeric(series, errors="coerce").fillna(0)
+
+    def _claim_amount_series(self, df: pd.DataFrame) -> pd.Series:
+        if "Claim_Amount" in df.columns:
+            return pd.to_numeric(df["Claim_Amount"], errors="coerce").fillna(0)
+        return self._as_numeric_series(
+            df,
+            [
+                "Claim_Amount",
+                "Claim Amount",
+                "Net Claim Amount",
+                "Net_Claim_Amount",
+                "Amount",
+                "Invoice Amount",
+                "Payment Amount",
+            ],
+        )
+
+    def _coalesce_numeric_series(self, df: pd.DataFrame, candidates: list[str], default: float = 0.0) -> pd.Series:
+        normalized = [self._normalize_col_key(c) for c in df.columns]
+        out = pd.Series(np.nan, index=df.index, dtype=float)
+
+        for candidate in candidates:
+            target = self._normalize_col_key(candidate)
+            idxs = [i for i, key in enumerate(normalized) if key == target]
+            if not idxs:
+                continue
+            selected = df.iloc[:, idxs]
+            series = self._as_series(selected, index=df.index)
+            parsed = pd.to_numeric(series, errors="coerce")
+            out = out.where(out.notna(), parsed)
+
+        return out.fillna(default)
+
+    def _coalesce_text_series(self, df: pd.DataFrame, candidates: list[str], default: str = "Unknown") -> pd.Series:
+        normalized = [self._normalize_col_key(c) for c in df.columns]
+        out = pd.Series(pd.NA, index=df.index, dtype="object")
+
+        for candidate in candidates:
+            target = self._normalize_col_key(candidate)
+            idxs = [i for i, key in enumerate(normalized) if key == target]
+            if not idxs:
+                continue
+            selected = df.iloc[:, idxs]
+            series = self._as_series(selected, index=df.index)
+            text = series.astype(str).str.strip()
+            text = text.replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "None": pd.NA})
+            out = out.where(out.notna(), text)
+
+        return out.fillna(default)
+
+    def _coalesce_datetime_series(self, df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+        out = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+        for candidate in candidates:
+            if candidate not in df.columns:
+                continue
+            parsed = self._parse_month_series(df[candidate])
+            if parsed is None:
+                continue
+            out = out.where(out.notna(), parsed)
+        return out
+
+    def _dedupe_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or not df.columns.duplicated().any():
+            return df
+        merged = pd.DataFrame(index=df.index)
+        seen: set[str] = set()
+        for col in df.columns:
+            if col in seen:
+                continue
+            seen.add(col)
+            same = df.loc[:, df.columns == col]
+            merged[col] = self._as_series(same, index=df.index)
+        return merged
+
     def _normalize_claims(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        def _as_series(value):
-            if isinstance(value, pd.DataFrame):
-                if value.shape[1] == 0:
-                    return pd.Series(dtype=float, index=df.index)
-                return value.iloc[:, 0]
-            if isinstance(value, pd.Series):
-                return value
-            return pd.Series(value, index=df.index)
+        df = self._dedupe_columns(df)
 
-        if "Claim_Amount" not in df.columns:
-            for alt in ["Claim Amount", "Net Claim Amount", "Net_Claim_Amount"]:
-                if alt in df.columns:
-                    df["Claim_Amount"] = df[alt]
-                    break
-        if "Claim_Amount" not in df.columns and "Customer Premium" in df.columns:
-            # Some Goodrej claim uploads carry premium fields instead of claim amount.
-            df["Claim_Amount"] = df["Customer Premium"]
-        if "Claim_Amount" in df.columns:
-            claim_amount = _as_series(df["Claim_Amount"])
-            df["Claim_Amount"] = pd.to_numeric(
-                claim_amount, errors="coerce"
-            ).fillna(0)
+        # Claims uploads can contain multiple amount-like columns across files.
+        # Coalesce row-by-row across known variants.
+        claim_amount = self._coalesce_numeric_series(
+            df,
+            [
+                "Claim_Amount",
+                "Claim Amount",
+                "Net Claim Amount",
+                "Net_Claim_Amount",
+                "Amount",
+                "Invoice Amount",
+                "Payment Amount",
+            ],
+        )
+        df["Claim_Amount"] = claim_amount
+
+        product_category = self._coalesce_text_series(
+            df,
+            [
+                "Product_Category",
+                "Product Category",
+                "Prodcut Category",
+                "Category",
+                "Item Description",
+                "Appliance Model Name",
+                "Item Name",
+                "item",
+                "Type",
+            ],
+            default="Unknown",
+        )
+        product_category = product_category.astype(str).str.strip()
+        product_category = product_category.replace({"": "Unknown", "nan": "Unknown", "none": "Unknown", "None": "Unknown"})
+        code_like_mask = product_category.map(self._is_identifier_like)
+        if code_like_mask.any():
+            fallback_category = self._coalesce_text_series(
+                df,
+                [
+                    "Item Description",
+                    "Appliance Model Name",
+                    "Type",
+                    "Item Name",
+                ],
+                default="Unknown",
+            ).astype(str).str.strip()
+            fallback_category = fallback_category.replace({"": "Unknown", "nan": "Unknown", "none": "Unknown", "None": "Unknown"})
+            product_category = product_category.where(~code_like_mask, fallback_category)
+            code_like_mask = product_category.map(self._is_identifier_like)
+            product_category = product_category.where(~code_like_mask, "Unknown")
+        df["Product_Category"] = product_category
+
+        raw_channel = self._coalesce_text_series(
+            df,
+            [
+                "Channel",
+                "Channel Name",
+                "Channel_Name",
+            ],
+            default="",
+        ).astype(str).str.strip()
+        df["Channel"] = self._canonical_claim_channel(raw_channel)
+
+        state = self._coalesce_text_series(
+            df,
+            [
+                "State",
+                "Customer_State",
+                "Customer State",
+                "Location",
+                "Branch",
+                "Branch Name",
+                "Store Name",
+                "Customer_City",
+                "Customer City",
+                "City",
+            ],
+            default="",
+        )
+        state = state.astype(str).str.strip()
+        state = state.replace({"": "Unknown", "nan": "Unknown", "none": "Unknown", "None": "Unknown"})
+        state_norm = (
+            state
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        raw_channel_norm = (
+            raw_channel
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        known_channels = set(self.CLAIM_CHANNEL_MAP.keys())
+        fallback_state = state_norm.isin({"unknown", "nan", "none", "null", "0"})
+        fallback_state &= ~raw_channel_norm.isin(known_channels | {"", "nan", "none", "null"})
+        state = state.where(~fallback_state, raw_channel)
+        state_norm = (
+            state
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        state = state.where(~state_norm.isin(known_channels), "Unknown")
+        state = state.astype(str).str.strip()
+        state = state.replace({"": "Unknown", "nan": "Unknown", "none": "Unknown", "None": "Unknown"})
+        state_no_digits = ~state.str.contains(r"\d", regex=True)
+        state = state.where(~state_no_digits, state.str.title())
+        df["State"] = state
+
+        df["Month"] = self._coalesce_text_series(
+            df,
+            [
+                "Month",
+                "Payment_date",
+                "Payment Date",
+                "Claim Date",
+                "Claim_Date",
+                "Date",
+                "Date of Claim",
+                "Warranty Purchase Date",
+                "Warranty Start Date",
+            ],
+            default="",
+        )
         return df
 
     def _parse_month_series(self, series: pd.Series) -> pd.Series:
@@ -222,6 +586,26 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                     parsed = parsed_try
                     break
 
+        if parsed.notna().any():
+            base_year = (
+                self.report_start.year
+                if self.report_start is not None and self.report_start is not pd.NaT
+                else pd.Timestamp.today().year
+            )
+            bad_year = parsed.dt.year < 2000
+            if bad_year.any():
+                parsed = parsed.where(
+                    ~bad_year,
+                    pd.to_datetime(
+                        {
+                            "year": base_year,
+                            "month": parsed.dt.month.clip(1, 12),
+                            "day": 1,
+                        },
+                        errors="coerce",
+                    ),
+                )
+
         return parsed
 
     def _resolve_dimension(
@@ -237,21 +621,19 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "Channel",
                 "Channel Name",
                 "Channel_Name",
-                "State",
-                "State Name",
-                "State/City",
-                "State / City",
-                "Region",
             ],
             "product_category": [
                 "Product_Category",
                 "Product Category",
+                "Prodcut Category",
                 "Product_Category_Name",
                 "Product Category Name",
                 "Category",
             ],
             "month": [
                 "Month",
+                "Payment_date",
+                "Payment Date",
                 "Warranty Start Date",
                 "Warranty Start_Date",
                 "Warranty Start",
@@ -266,11 +648,18 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             ],
             "state": [
                 "State",
+                "Customer_State",
+                "Customer State",
+                "Location",
+                "Branch",
+                "Branch Name",
+                "Customer_City",
+                "Customer City",
+                "City",
                 "State Name",
                 "State/City",
                 "State / City",
                 "Region",
-                "Channel",
             ],
             "plan_category": [
                 "Plan Category",
@@ -330,33 +719,52 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         if df.empty or not self.apply_date_filter:
             return df
 
-        date_candidates = [
-            "Warranty Start Date",
-            "Warranty Start_Date",
-            "Start Date",
-            "Start_Date",
-            "Month",
-            "Claim Date",
-            "Claim_Date",
-            "Day of Call_Date",
-            "Call_Date",
-            "Date",
-            "Date of Claim",
-        ]
+        if dataset_type == "claims":
+            date_candidates = [
+                "Month",
+                "Payment_date",
+                "Payment Date",
+                "Claim Date",
+                "Claim_Date",
+                "Day of Call_Date",
+                "Call_Date",
+                "Call Date",
+                "Date",
+                "Date of Claim",
+                "Warranty Purchase Date",
+                "Warranty Start Date",
+                "Warranty Start_Date",
+                "Start Date",
+                "Start_Date",
+            ]
+        else:
+            date_candidates = [
+                "Warranty Start Date",
+                "Warranty Start_Date",
+                "Start Date",
+                "Start_Date",
+                "Month",
+                "Payment_date",
+                "Payment Date",
+                "Date",
+            ]
 
-        date_col = next((c for c in date_candidates if c in df.columns), None)
-        if date_col is None:
-            return df
-
-        series = self._parse_month_series(df[date_col])
+        series = self._coalesce_datetime_series(df, date_candidates)
         if series.isna().all():
             return df
 
         mask = pd.Series(True, index=df.index)
+        include_undated = dataset_type == "claims"
         if self.report_start is not None and self.report_start is not pd.NaT:
-            mask &= series >= self.report_start
+            lower = series >= self.report_start
+            if include_undated:
+                lower = lower | series.isna()
+            mask &= lower
         if self.report_end is not None and self.report_end is not pd.NaT:
-            mask &= series <= self.report_end
+            upper = series <= self.report_end
+            if include_undated:
+                upper = upper | series.isna()
+            mask &= upper
         return df[mask]
 
     # --------------------------------------------------
@@ -409,10 +817,14 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 return s.fillna("Unknown")
             sales_df[sales_dim] = _clean_dim(sales_df[sales_dim])
             claims_df[claims_dim] = _clean_dim(claims_df[claims_dim])
+        elif dimension == "state":
+            sales_df[sales_dim] = self._canonical_state(sales_df[sales_dim])
+            claims_df[claims_dim] = self._canonical_state(claims_df[claims_dim])
 
-        claims_df["_claims"] = pd.to_numeric(
-            claims_df.get("Claim_Amount", 0), errors="coerce"
-        ).fillna(0)
+        claims_df["_claims"] = self._claim_amount_series(claims_df)
+        claims_df = claims_df[claims_df["_claims"] > 0]
+        if claims_df.empty:
+            return []
 
         sales_df["_zp"] = pd.to_numeric(
             sales_df.get("Zopper_Share_EP", 0), errors="coerce"
@@ -423,12 +835,14 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             .groupby(claims_dim, dropna=False)["_claims"]
             .sum()
             .reset_index()
+            .rename(columns={claims_dim: "_dim_claims"})
         )
         sales_out = (
             sales_df
             .groupby(sales_dim, dropna=False)["_zp"]
             .sum()
             .reset_index()
+            .rename(columns={sales_dim: "_dim_sales"})
         )
 
         def _norm_dim(series: pd.Series) -> pd.Series:
@@ -441,19 +855,24 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 .str.replace(r"\s+", " ", regex=True)
             )
 
-        claims_out["_k"] = _norm_dim(claims_out[claims_dim])
-        sales_out["_k"] = _norm_dim(sales_out[sales_dim])
+        claims_out["_k"] = _norm_dim(claims_out["_dim_claims"])
+        sales_out["_k"] = _norm_dim(sales_out["_dim_sales"])
 
         merged = claims_out.merge(sales_out, on="_k", how="left").fillna(0)
         merged["loss_ratio"] = (
             merged["_claims"] / merged["_zp"] * 100
         ).replace([float("inf"), float("-inf")], 0).fillna(0)
 
-        dim_col = claims_dim if claims_dim in merged.columns else sales_dim
-        out = merged[[dim_col, "loss_ratio"]].rename(columns={dim_col: dimension})
+        out = merged[["_dim_claims", "loss_ratio"]].rename(columns={"_dim_claims": dimension})
 
         if dimension == "month" and "month" in out.columns:
-            out["month"] = pd.to_datetime(out["month"], errors="coerce").dt.strftime("%b-%y")
+            month_series = pd.to_datetime(out["month"], errors="coerce")
+            out = out[month_series.notna()].copy()
+            out["_month_sort"] = month_series[month_series.notna()]
+            out["month"] = out["_month_sort"].dt.strftime("%b-%y")
+            out = out.sort_values("_month_sort").drop(columns=["_month_sort"])
+        else:
+            out = self._drop_noise_buckets(out, dimension)
 
         return out.to_dict(orient="records")
 
@@ -479,10 +898,17 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         df = df.copy()
 
         if self.dataset_type == "claims":
+            claim_amount = self._claim_amount_series(df)
+            positive_claims = claim_amount > 0
+            if not positive_claims.any():
+                return []
+            df = df[positive_claims].copy()
+            claim_amount = claim_amount[positive_claims]
+
             if metric == "claims":
-                df["_value"] = pd.to_numeric(df.get("Claim_Amount", 0), errors="coerce").fillna(0)
+                df["_value"] = claim_amount
             elif metric == "net_claims":
-                df["_value"] = pd.to_numeric(df.get("Claim_Amount", 0), errors="coerce").fillna(0)
+                df["_value"] = claim_amount
             elif metric == "quantity":
                 df["_value"] = 1
             else:
@@ -518,9 +944,18 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         )
 
         if dimension == "month" and "month" in out.columns:
-            out["month"] = pd.to_datetime(out["month"], errors="coerce").dt.strftime("%b-%y")
+            month_series = pd.to_datetime(out["month"], errors="coerce")
+            out = out[month_series.notna()].copy()
+            out["_month_sort"] = month_series[month_series.notna()]
+            out["month"] = out["_month_sort"].dt.strftime("%b-%y")
+            out = out.sort_values("_month_sort").drop(columns=["_month_sort"])
+        else:
+            out = self._drop_noise_buckets(out, dimension)
 
-        return out.fillna(0).to_dict(orient="records")
+        if metric in out.columns:
+            out[metric] = pd.to_numeric(out[metric], errors="coerce").fillna(0)
+
+        return out.to_dict(orient="records")
 
     # --------------------------------------------------
     # SUMMARY
@@ -542,12 +977,28 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                     "units_sold": 0,
                 }
             df = self._apply_date_filter(df, "claims")
-            claims = pd.to_numeric(df.get("Claim_Amount", 0), errors="coerce").fillna(0).sum()
+            if df.empty:
+                return {
+                    "gross_premium": 0,
+                    "earned_premium": 0,
+                    "zopper_earned_premium": 0,
+                    "units_sold": 0,
+                }
+            claim_amount = self._claim_amount_series(df)
+            positive_claims = claim_amount > 0
+            if not positive_claims.any():
+                return {
+                    "gross_premium": 0,
+                    "earned_premium": 0,
+                    "zopper_earned_premium": 0,
+                    "units_sold": 0,
+                }
+            claims = claim_amount[positive_claims].sum()
             return {
                 "gross_premium": float(claims),
                 "earned_premium": float(claims),
                 "zopper_earned_premium": float(claims),
-                "units_sold": int(len(df)),
+                "units_sold": int(positive_claims.sum()),
             }
 
         df = data["sales"]

@@ -10,6 +10,7 @@ type Props = {
   jobId?: string
   fromDate?: string
   toDate?: string
+  refreshTick?: number
 }
 
 type Summary = {
@@ -34,6 +35,7 @@ export default function ResultCard({
   jobId,
   fromDate,
   toDate,
+  refreshTick,
 }: Props) {
   const [data, setData] = useState<Summary | null>(null)
   const [loading, setLoading] = useState(false)
@@ -90,11 +92,11 @@ export default function ResultCard({
     return () => {
       mounted = false
     }
-  }, [jobId, source, datasetType, fromDate, toDate])
+  }, [jobId, source, datasetType, fromDate, toDate, refreshTick])
 
   if (loading) {
     return (
-      <div className="bg-white p-6 rounded-2xl border text-sm text-gray-400">
+      <div className="bg-white p-6 rounded-2xl border text-sm text-gray-400 h-full min-h-[320px]">
         Loading summary...
       </div>
     )
@@ -102,7 +104,7 @@ export default function ResultCard({
 
   if (error || !data) {
     return (
-      <div className="bg-white p-6 rounded-2xl border text-sm text-gray-400">
+      <div className="bg-white p-6 rounded-2xl border text-sm text-gray-400 h-full min-h-[320px]">
         Summary unavailable
       </div>
     )
@@ -115,7 +117,7 @@ export default function ResultCard({
 
   if (datasetType === "claims") {
     return (
-      <div className="bg-white p-6 rounded-2xl border space-y-4">
+      <div className="bg-white p-6 rounded-2xl border space-y-4 h-full min-h-[320px]">
         <div>
           <div className="text-xs font-bold uppercase text-gray-400">
             Total Claims Cost
@@ -148,7 +150,7 @@ export default function ResultCard({
   }
 
   return (
-    <div className="bg-white p-6 rounded-2xl border space-y-4">
+    <div className="bg-white p-6 rounded-2xl border space-y-4 h-full min-h-[320px]">
       <div>
         <div className="text-xs font-bold uppercase text-gray-400">
           Gross Premium

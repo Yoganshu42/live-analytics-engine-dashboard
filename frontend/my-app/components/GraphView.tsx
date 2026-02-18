@@ -22,6 +22,7 @@ type Props = {
   fromDate?: string
   toDate?: string
   fetchDelayMs?: number
+  deferUntilVisible?: boolean
   onDataReady?: (snapshot: GraphDataSnapshot) => void
 }
 
@@ -54,9 +55,11 @@ const formatValue = (value: number, measure: string) => {
   if (m.includes("quantity") || m.includes("count")) {
     return value.toLocaleString()
   }
-  if (value >= 1e7) return `Rs ${(value / 1e7).toFixed(2)} Cr`
-  if (value >= 1e5) return `Rs ${(value / 1e5).toFixed(2)} L`
-  if (value >= 1e3) return `Rs ${(value / 1e3).toFixed(1)} K`
+  const absValue = Math.abs(value)
+  const sign = value < 0 ? "-" : ""
+  if (absValue >= 1e7) return `Rs ${sign}${(absValue / 1e7).toFixed(2)} Cr`
+  if (absValue >= 1e5) return `Rs ${sign}${(absValue / 1e5).toFixed(2)} L`
+  if (absValue >= 1e3) return `Rs ${sign}${(absValue / 1e3).toFixed(1)} K`
   return `Rs ${value.toLocaleString()}`
 }
 
@@ -112,6 +115,24 @@ const normalizeDimValue = (value: unknown, dimKey: string) => {
     }
   }
   return raw
+}
+
+const DIMENSION_ALIASES: Record<string, string[]> = {
+  plan_category: ["device_plan_category"],
+  device_plan_category: ["plan_category"],
+}
+
+const pickDimensionValue = (row: Row, dimKey: string) => {
+  const primary = row[dimKey]
+  if (primary != null && String(primary).trim() !== "") return primary
+
+  const aliases = DIMENSION_ALIASES[dimKey] || []
+  for (const alias of aliases) {
+    const value = row[alias]
+    if (value != null && String(value).trim() !== "") return value
+  }
+
+  return primary
 }
 
 const asNumber = (value: unknown) => {
@@ -178,16 +199,13 @@ const filterByRange = (
   if (!fromDate && !toDate) return rows
   if (!(dimKey.includes("month") || dimKey.includes("date"))) return rows
 
-  const now = new Date()
-  const monthCap = new Date(now.getFullYear(), now.getMonth() + 1, 0).getTime()
   const clampFrom = source === "reliance" ? "2025-07-01" : null
   const fromVal = fromDate || clampFrom
   const from = fromVal ? new Date(fromVal).getTime() : null
-  const toRaw = toDate ? new Date(toDate).getTime() : null
-  const to = toRaw === null ? monthCap : Math.min(toRaw, monthCap)
+  const to = toDate ? new Date(toDate).getTime() : null
+
   return rows.filter(r => {
-    const rawTime = new Date(String(r[dimKey] ?? "")).getTime()
-    const t = Math.min(rawTime, monthCap)
+    const t = toTimeValue(r[dimKey])
     if (Number.isNaN(t)) return false
     if (from !== null && t < from) return false
     if (to !== null && t > to) return false
@@ -211,15 +229,21 @@ type FetchRowsResult = {
   ts: number
   data: Row[]
   measure: string
+  usedRangeFallback?: boolean
 }
 
 const GRAPH_RESULT_TTL_MS = 120000
 const graphResultCache = new Map<string, { expiresAt: number; value: FetchRowsResult }>()
 const graphInFlight = new Map<string, Promise<FetchRowsResult>>()
 
+export const clearGraphDataCache = () => {
+  graphResultCache.clear()
+  graphInFlight.clear()
+}
+
 const DEFAULT_API_BASE =
   typeof window !== "undefined"
-    ? `http://${window.location.hostname || "127.0.0.1"}:8000`
+    ? (window.location.origin || "")
     : "http://127.0.0.1:8000"
 
 const normalizeApiBase = (value: string) => {
@@ -248,6 +272,13 @@ const API_FALLBACKS = Array.from(
       .filter(Boolean)
   )
 )
+const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
+let preferredApiBase = API_FALLBACKS[0] || ""
+
+const orderedApiBases = () => {
+  const ordered = [preferredApiBase, ...API_FALLBACKS].filter(Boolean)
+  return Array.from(new Set(ordered))
+}
 
 const normalizeToken = (value: string | null) => {
   if (!value) return null
@@ -297,6 +328,16 @@ const buildQuery = ({
 
 const buildUrl = (base: string, query: string) => `${base}/analytics/by-dimension?${query}`
 
+const fetchWithTimeout = async (url: string, init: RequestInit) => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 class NoFallbackError extends Error {
   noFallback = true
 }
@@ -323,10 +364,10 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
   const requestPromise = (async (): Promise<FetchRowsResult> => {
     const errors: string[] = []
     let sawUnauthorized = false
-    for (const base of API_FALLBACKS) {
+    for (const base of orderedApiBases()) {
       const url = buildUrl(base, query)
       try {
-        const res = await fetch(url, { headers, mode: "cors" })
+        const res = await fetchWithTimeout(url, { headers, mode: "cors" })
         if (!res.ok) {
           let detail = ""
           try {
@@ -348,8 +389,9 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
         }
 
         const raw = await res.json()
+        preferredApiBase = base
         if (!Array.isArray(raw) || raw.length === 0) {
-          return { ts: Date.now(), data: [], measure: metricKey }
+          return { ts: Date.now(), data: [], measure: metricKey, usedRangeFallback: false }
         }
 
         const processed: Row[] = raw.map(row => {
@@ -357,7 +399,7 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
           Object.entries(row).forEach(([k, v]) => {
             out[toSafeKey(k)] = v
           })
-          out[dimKey] = normalizeDimValue(out[dimKey], dimKey)
+          out[dimKey] = normalizeDimValue(pickDimensionValue(out, dimKey), dimKey)
           return out
         })
 
@@ -365,6 +407,7 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
           ts: Date.now(),
           data: processed,
           measure: metricKey,
+          usedRangeFallback: false,
         }
       } catch (error) {
         if (error instanceof NoFallbackError) {
@@ -383,10 +426,14 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
   graphInFlight.set(cacheKey, requestPromise)
   try {
     const result = await requestPromise
-    graphResultCache.set(cacheKey, {
-      expiresAt: Date.now() + GRAPH_RESULT_TTL_MS,
-      value: result,
-    })
+    if (result.data.length > 0) {
+      graphResultCache.set(cacheKey, {
+        expiresAt: Date.now() + GRAPH_RESULT_TTL_MS,
+        value: result,
+      })
+    } else {
+      graphResultCache.delete(cacheKey)
+    }
     return result
   } finally {
     graphInFlight.delete(cacheKey)
@@ -394,38 +441,16 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
 }
 
 const fetchRowsWithRangeFallback = async (params: FetchParams): Promise<FetchRowsResult> => {
-  const primary = await fetchRows(params)
-  if (primary.data.length) return primary
-  if (!params.from_date && !params.to_date) return primary
-  if (params.source === "reliance") return primary
-  return fetchRows({
-    ...params,
-    from_date: undefined,
-    to_date: undefined,
-  })
+  return fetchRows(params)
 }
 
 export const prefetchGraphData = async (params: FetchParams) => {
   if (!params.source || !params.dimension || !params.metric) return
-  if (params.source === "samsung") {
-    await Promise.all([
-      fetchRows({ ...params, source: "samsung_vs" }),
-      fetchRows({ ...params, source: "samsung_croma" }),
-    ])
-    return
-  }
   await fetchRows(params)
 }
 
 export const hasGraphData = async (params: FetchParams): Promise<boolean> => {
   if (!params.source || !params.dimension || !params.metric) return false
-  if (params.source === "samsung") {
-    const [vs, croma] = await Promise.all([
-      fetchRowsWithRangeFallback({ ...params, source: "samsung_vs" }),
-      fetchRowsWithRangeFallback({ ...params, source: "samsung_croma" }),
-    ])
-    return vs.data.length > 0 || croma.data.length > 0
-  }
   const result = await fetchRowsWithRangeFallback(params)
   return result.data.length > 0
 }
@@ -522,8 +547,11 @@ export default function GraphView({
   fromDate,
   toDate,
   fetchDelayMs,
+  deferUntilVisible = false,
   onDataReady,
 }: Props) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const [isVisible, setIsVisible] = useState(!deferUntilVisible)
   const [data, setData] = useState<Row[]>([])
   const [measure, setMeasure] = useState("")
   const [compareMode, setCompareMode] = useState(false)
@@ -534,7 +562,32 @@ export default function GraphView({
   const gradientIdAlt = useId()
 
   useEffect(() => {
+    if (!deferUntilVisible) {
+      setIsVisible(true)
+      return
+    }
+    if (isVisible) return
+    const node = containerRef.current
+    if (!node || typeof IntersectionObserver === "undefined") {
+      setIsVisible(true)
+      return
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some(entry => entry.isIntersecting)) {
+          setIsVisible(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: "240px 0px 240px 0px" }
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [deferUntilVisible, isVisible, source, dimension, metric, datasetType, fromDate, toDate])
+
+  useEffect(() => {
     if (!dimension || !source || !metric) return
+    if (deferUntilVisible && !isVisible) return
     const requestId = ++requestIdRef.current
 
     const fetchData = async () => {
@@ -565,7 +618,6 @@ export default function GraphView({
             samsung_croma: asNumber(row["samsung_croma"]),
           }))
 
-          merged = filterByRange(merged, dimKey, fromDate, toDate, source)
           if (dimKey.includes("month") || dimKey.includes("date")) {
             merged = sortTemporalRows(merged, dimKey)
           }
@@ -605,19 +657,34 @@ export default function GraphView({
           return
         }
 
-        if (!(metricKey in single.data[0])) {
-          if (requestId !== requestIdRef.current) return
-          onDataReady?.({
-            rows: [],
-            measure: metricKey,
-            dimensionKey: dimKey,
-            compareMode: false,
-          })
-          setData([])
-          return
+        let normalizedSingle = single.data
+        if (!(metricKey in normalizedSingle[0])) {
+          const partnerMetricKey =
+            source === "samsung_vs" || source === "samsung_vijay_sales"
+              ? "samsung_vs"
+              : source === "samsung_croma"
+                ? "samsung_croma"
+                : ""
+
+          if (partnerMetricKey && partnerMetricKey in normalizedSingle[0]) {
+            normalizedSingle = normalizedSingle.map((row) => ({
+              ...row,
+              [metricKey]: asNumber(row[partnerMetricKey]),
+            }))
+          } else {
+            if (requestId !== requestIdRef.current) return
+            onDataReady?.({
+              rows: [],
+              measure: metricKey,
+              dimensionKey: dimKey,
+              compareMode: false,
+            })
+            setData([])
+            return
+          }
         }
 
-        let next = filterByRange(single.data, dimKey, fromDate, toDate, source)
+        let next = normalizedSingle
         if (dimKey.includes("month") || dimKey.includes("date")) {
           next = sortTemporalRows(next, dimKey)
         }
@@ -659,11 +726,19 @@ export default function GraphView({
     return () => {
       if (timer) clearTimeout(timer)
     }
-  }, [source, dimension, metric, datasetType, bucket, jobId, fromDate, toDate, fetchDelayMs, onDataReady])
+  }, [source, dimension, metric, datasetType, bucket, jobId, fromDate, toDate, fetchDelayMs, onDataReady, deferUntilVisible, isVisible])
+
+  if (deferUntilVisible && !isVisible) {
+    return (
+      <div ref={containerRef} className="h-72 flex items-center justify-center text-sm text-gray-400">
+        Loading chart...
+      </div>
+    )
+  }
 
   if (loading) {
     return (
-      <div className="h-72 flex items-center justify-center text-sm text-gray-500">
+      <div ref={containerRef} className="h-72 flex items-center justify-center text-sm text-gray-500">
         Loading...
       </div>
     )
@@ -671,7 +746,7 @@ export default function GraphView({
 
   if (error || !data.length || !measure) {
     return (
-      <div className="h-72 flex items-center justify-center text-sm text-gray-400">
+      <div ref={containerRef} className="h-72 flex items-center justify-center text-sm text-gray-400">
         No Data Available
       </div>
     )
@@ -691,8 +766,26 @@ export default function GraphView({
     measure.includes("quantity") &&
     data.some(row => row.ew_count != null)
 
+  const isLossRatio = measure.includes("loss_ratio")
+  const clampToZero = !isLossRatio || source === "reliance"
+  const chartData: Row[] = clampToZero
+    ? data.map((row) => {
+        const next: Row = { ...row }
+        if (compareMode) {
+          next.samsung_vs = Math.max(0, asNumber(row.samsung_vs))
+          next.samsung_croma = Math.max(0, asNumber(row.samsung_croma))
+          return next
+        }
+        next[measure] = Math.max(0, asNumber(row[measure]))
+        if (showEwCounts) {
+          next.ew_count = Math.max(0, asNumber(row.ew_count))
+        }
+        return next
+      })
+    : data
+
   return (
-    <div className="h-72">
+    <div ref={containerRef} className="h-72">
       {compareMode && (
         <div className="flex items-center gap-3 text-[11px] font-semibold text-slate-500 mb-2">
           <span className="flex items-center gap-1.5">
@@ -712,7 +805,7 @@ export default function GraphView({
         </div>
       )}
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{ top: 12, right: 8, left: 0, bottom: 6 }} barCategoryGap={14}>
+        <BarChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 6 }} barCategoryGap={14}>
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor={mixWithWhite(primaryColor, 0.35)} />
@@ -734,6 +827,7 @@ export default function GraphView({
             }
           />
           <YAxis
+            domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
             tick={{ fontSize: 11 }}
             tickFormatter={(v) => formatValue(v as number, measure)}
           />

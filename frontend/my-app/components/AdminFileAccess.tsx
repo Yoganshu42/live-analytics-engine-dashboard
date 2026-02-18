@@ -10,7 +10,7 @@ import {
   downloadAdminFile,
   fetchAdminFiles,
   fetchAdminUsers,
-  replaceAdminFile,
+  updateAdminFile,
   updateAdminUserPassword,
 } from "@/app/lib/api"
 
@@ -40,8 +40,8 @@ export default function AdminFileAccess({ isAdmin }: Props) {
       </button>
 
       {open && (
-        <div className="fixed inset-0 z-[120] bg-black/40 backdrop-blur-[1px] p-4 sm:p-8">
-          <div className="mx-auto h-full max-w-6xl rounded-2xl border border-slate-200 bg-white shadow-2xl flex flex-col overflow-hidden">
+        <div className="fixed inset-0 z-[120] overflow-y-auto bg-black/40 backdrop-blur-[1px] p-4 sm:p-8">
+          <div className="mx-auto my-4 flex min-h-[calc(100vh-2rem)] max-h-[calc(100vh-2rem)] max-w-6xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
             <div className="flex items-center justify-between border-b px-5 py-4">
               <div>
                 <h2 className="text-sm font-black uppercase tracking-wider text-slate-700">Admin Manual Access</h2>
@@ -97,6 +97,14 @@ function DataUpdationPanel() {
 
   const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "reliance", "godrej"], [])
 
+  const refreshDashboard = useCallback(() => {
+    if (typeof window === "undefined") return
+    localStorage.setItem("dashboard_data_refresh_at", new Date().toISOString())
+    window.setTimeout(() => {
+      window.location.reload()
+    }, 350)
+  }, [])
+
   const loadItems = useCallback(async () => {
     setLoading(true)
     setError("")
@@ -114,10 +122,10 @@ function DataUpdationPanel() {
     loadItems()
   }, [loadItems])
 
-  const handleReplace = async (e: FormEvent<HTMLFormElement>) => {
+  const handleUpdate = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!file) {
-      setError("Select a file to update the selected tag")
+      setError("Select a file to update data")
       return
     }
 
@@ -125,17 +133,18 @@ function DataUpdationPanel() {
     setError("")
     setMessage("")
     try {
-      const res = await replaceAdminFile({
+      const res = await updateAdminFile({
         file,
         source,
         dataset_type: datasetType,
         job_id: jobId || undefined,
       })
-      setMessage(`Updated tag. Deleted ${res.deleted_rows} rows, inserted ${res.rows_inserted} rows.`)
+      setMessage(`Updated data. Inserted ${res.rows_inserted} rows for ${source}:${datasetType}:${jobId || "untagged"}.`)
       setFile(null)
       await loadItems()
+      refreshDashboard()
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update file tag")
+      setError(err instanceof Error ? err.message : "Failed to update data")
     } finally {
       setSubmitting(false)
     }
@@ -155,6 +164,7 @@ function DataUpdationPanel() {
       })
       setMessage(`Deleted ${res.deleted_rows} rows from ${item.tag}`)
       await loadItems()
+      refreshDashboard()
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete file tag")
     }
@@ -188,7 +198,7 @@ function DataUpdationPanel() {
     setSource(item.source)
     setDatasetType(item.dataset_type)
     setJobId(item.job_id || "")
-    setMessage(`Selected tag ${item.tag}. Choose a file and click Replace Tag.`)
+    setMessage(`Selected tag ${item.tag}. Choose a file and click Update Data.`)
     setError("")
   }
 
@@ -205,7 +215,7 @@ function DataUpdationPanel() {
         </button>
       </div>
 
-      <form onSubmit={handleReplace} className="mb-3 space-y-2">
+      <form onSubmit={handleUpdate} className="mb-3 space-y-2">
         <div className="grid grid-cols-2 gap-2">
           <select
             value={source}
@@ -245,7 +255,7 @@ function DataUpdationPanel() {
           disabled={submitting}
           className="w-full rounded bg-indigo-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {submitting ? "Replacing..." : "Replace Tag Data (Update)"}
+          {submitting ? "Updating..." : "Update Data"}
         </button>
       </form>
 
@@ -320,6 +330,9 @@ function UserManagementPanel() {
       setLoading(false)
     }
   }, [])
+
+  const roleLabel = (roleValue: "admin" | "employee") =>
+    roleValue === "employee" ? "Business user" : "admin"
 
   useEffect(() => {
     loadUsers("")
@@ -407,7 +420,7 @@ function UserManagementPanel() {
           onChange={(e) => setRole(e.target.value as "admin" | "employee")}
           className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
         >
-          <option value="employee">employee</option>
+          <option value="employee">Business user</option>
           <option value="admin">admin</option>
         </select>
         <button
@@ -462,7 +475,7 @@ function UserManagementPanel() {
               users.map((user) => (
                 <tr key={user.email} className="border-t border-slate-100">
                   <td className="px-2 py-1.5 text-slate-700">{user.email}</td>
-                  <td className="px-2 py-1.5 text-slate-700">{user.role}</td>
+                  <td className="px-2 py-1.5 text-slate-700">{roleLabel(user.role)}</td>
                   <td className="px-2 py-1.5 text-slate-700">{user.is_active ? "active" : "inactive"}</td>
                   <td className="px-2 py-1.5">
                     <div className="flex flex-wrap gap-1">

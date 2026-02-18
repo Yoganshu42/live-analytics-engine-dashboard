@@ -21,6 +21,14 @@ def _cache_key(source: str, dataset_type: str, job_id: str | None) -> tuple[str,
     )
 
 
+def _source_variants(source: str | None) -> list[str]:
+    source_key = (source or "").strip().lower()
+    if source_key in {"samsung_vs", "samsung_vijay_sales"}:
+        # Keep both aliases readable without requiring a data migration first.
+        return ["samsung_vs", "samsung_vijay_sales"]
+    return [source_key]
+
+
 def invalidate_dataframe_cache(
     source: str | None = None,
     dataset_type: str | None = None,
@@ -31,14 +39,20 @@ def invalidate_dataframe_cache(
             _df_cache.clear()
             return None
 
-        src = (source or "").strip().lower() if source is not None else None
+        src_values: set[str] | None = None
+        if source is not None:
+            src = (source or "").strip().lower()
+            if src in {"samsung_vs", "samsung_vijay_sales"}:
+                src_values = {"samsung_vs", "samsung_vijay_sales"}
+            else:
+                src_values = {src}
         ds = (dataset_type or "").strip().lower() if dataset_type is not None else None
         jb = (job_id or "").strip() if job_id is not None else None
 
         keys_to_delete = []
         for key in _df_cache.keys():
             key_source, key_dataset, key_job = key
-            if src is not None and key_source != src:
+            if src_values is not None and key_source not in src_values:
                 continue
             if ds is not None and key_dataset != ds:
                 continue
@@ -76,15 +90,19 @@ def get_data_rows(
     Fetch raw rows from data_rows table and return JSON payloads.
     """
     # Use raw SQL for speed here too if needed, but this is less critical than get_dataframe
-    rows = (
+    source_values = _source_variants(source)
+    query = (
         db.query(DataRow.data)
         .filter(
             DataRow.job_id == job_id,
-            DataRow.source == source,
             DataRow.dataset_type == dataset_type,
         )
-        .all()
     )
+    if len(source_values) == 1:
+        query = query.filter(DataRow.source == source_values[0])
+    else:
+        query = query.filter(DataRow.source.in_(source_values))
+    rows = query.all()
 
     out = []
     for row in rows:
@@ -115,8 +133,12 @@ def get_dataframe(
 
     # RAW SQL QUERY for performance (bypasses ORM overhead)
     # We select only the 'data' column.
-    stmt = "SELECT data FROM data_rows WHERE source = :source AND dataset_type = :dataset_type"
-    params = {"source": source, "dataset_type": dataset_type}
+    source_values = _source_variants(source)
+    source_placeholders = ", ".join([f":source_{idx}" for idx in range(len(source_values))])
+    stmt = f"SELECT data FROM data_rows WHERE source IN ({source_placeholders}) AND dataset_type = :dataset_type"
+    params = {"dataset_type": dataset_type}
+    for idx, value in enumerate(source_values):
+        params[f"source_{idx}"] = value
     
     if job_id:
         stmt += " AND job_id = :job_id"
@@ -127,13 +149,6 @@ def get_dataframe(
         result = db.execute(text(stmt), params)
         rows = result.fetchall()
         
-        # If job_id was requested but returned nothing, try fallback to all rows (matching logic in original code)
-        if job_id and not rows:
-            stmt = "SELECT data FROM data_rows WHERE source = :source AND dataset_type = :dataset_type"
-            params = {"source": source, "dataset_type": dataset_type}
-            result = db.execute(text(stmt), params)
-            rows = result.fetchall()
-            
     except Exception as e:
         # Fallback or error handling
         print(f"DB Error in get_dataframe: {e}")

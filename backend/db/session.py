@@ -34,15 +34,20 @@ if DATABASE_URL.startswith("postgresql"):
     engine_kwargs.update(
         {
             "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "900")),
-            "pool_size": int(os.getenv("DB_POOL_SIZE", "3")),
-            "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "2")),
-            "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "30")),
+            "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
+            "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "20")),
+            "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "60")),
             "pool_use_lifo": os.getenv("DB_POOL_USE_LIFO", "1") == "1",
         }
     )
 
     if _needs_ssl(DATABASE_URL) and "sslmode=" not in DATABASE_URL:
         connect_args["sslmode"] = "require"
+        # Help keep long-lived TLS sockets stable for managed Postgres endpoints.
+        connect_args["keepalives"] = 1
+        connect_args["keepalives_idle"] = int(os.getenv("DB_KEEPALIVES_IDLE", "30"))
+        connect_args["keepalives_interval"] = int(os.getenv("DB_KEEPALIVES_INTERVAL", "10"))
+        connect_args["keepalives_count"] = int(os.getenv("DB_KEEPALIVES_COUNT", "5"))
 
     connect_args["application_name"] = os.getenv("DB_APP_NAME", "live-dashboard-api")
 

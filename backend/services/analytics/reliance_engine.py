@@ -1,6 +1,7 @@
 # services/analytics/reliance_engine.py
 
 import logging
+import time
 import pandas as pd
 from sqlalchemy.orm import Session
 
@@ -32,6 +33,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
     ):
         super().__init__(db=db, job_id=job_id, source=source)
         self.dataset_type = dataset_type or "sales"
+        self._loaded_data_cache: dict[str, pd.DataFrame] | None = None
         # The original notebook logic hard-coded a Jul-Dec 2025 window.
         # For the dashboard deployment we must respect the user-provided range,
         # and otherwise default to "no extra filtering" (let the API date-bounds drive it).
@@ -141,11 +143,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         if parsed.notna().any():
             bad_year = parsed.dt.year < 2000
             if bad_year.any():
+                base_year = (
+                    self.report_start.year
+                    if self.report_start is not None
+                    else pd.Timestamp.today().year
+                )
                 parsed = parsed.where(
                     ~bad_year,
                     pd.to_datetime(
                         {
-                            "year": self.report_start.year,
+                            "year": base_year,
                             "month": parsed.dt.month.clip(1, 12),
                             "day": 1,
                         },
@@ -164,6 +171,9 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
     # --------------------------------------------------
 
     def load_data(self) -> dict[str, pd.DataFrame]:
+        if self._loaded_data_cache is not None:
+            return self._loaded_data_cache
+        started = time.perf_counter()
         sales_df = get_dataframe(
             db=self.db,
             job_id=self.job_id,
@@ -265,6 +275,12 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     "Day of Call Date",
                     "Call_Date",
                     "Call Date",
+                    "Month_Year",
+                    "Call_Registered_Date",
+                    "Call_Initiated_Date",
+                    "Claim Redeemed Date",
+                    "Warranty_start_date_",
+                    "Invoice_Date_",
                     "Date",
                 ],
             )
@@ -275,24 +291,28 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
 
             if "Month" in claims_df.columns:
                 claims_df["Month"] = self._parse_month_series(claims_df["Month"])
-                claims_df = claims_df[claims_df["Month"].dt.year == 2025]
-                claims_df = claims_df[
-                    (claims_df["Month"] >= self.report_start)
-                    & (claims_df["Month"] <= self.report_end)
-                ]
+            elif "Month_Year" in claims_df.columns:
+                claims_df["Month"] = self._parse_month_series(claims_df["Month_Year"])
             elif "Day of Call_Date" in claims_df.columns:
-                claims_df = claims_df[
-                    claims_df["Day of Call_Date"].dt.year == 2025
-                ]
-                claims_df = claims_df[
-                    (claims_df["Day of Call_Date"] >= self.report_start)
-                    & (claims_df["Day of Call_Date"] <= self.report_end)
-                ]
+                claims_df["Month"] = self._month_key(claims_df["Day of Call_Date"])
+
+            if "Month" in claims_df.columns:
+                claims_df = claims_df[claims_df["Month"].notna()]
+                if self.report_start is not None:
+                    claims_df = claims_df[claims_df["Month"] >= self.report_start]
+                if self.report_end is not None:
+                    claims_df = claims_df[claims_df["Month"] <= self.report_end]
+            elif "Day of Call_Date" in claims_df.columns:
+                claims_df = claims_df[claims_df["Day of Call_Date"].notna()]
+                if self.report_start is not None:
+                    claims_df = claims_df[claims_df["Day of Call_Date"] >= self.report_start]
+                if self.report_end is not None:
+                    claims_df = claims_df[claims_df["Day of Call_Date"] <= self.report_end]
             else:
                 # No recognizable claims date column; keep rows rather than fail hard.
                 claims_df = claims_df.copy()
 
-            warranty_col = _pick_column(claims_df, ["Warranty Type"])
+            warranty_col = _pick_column(claims_df, ["Warranty Type", "Warranty_Type", "Plan_Name"])
             if warranty_col is not None:
                 claims_df[warranty_col] = claims_df[warranty_col].replace(
                     {"Screen Protection": "Cracked Screen"}
@@ -307,6 +327,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     "Product Brand (Group)",
                     "Product Brand",
                     "Brand",
+                    "Item_Brand",
                 ],
             )
             if brand_col is not None:
@@ -314,18 +335,54 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 if brand_col != "Product Brand(Group)":
                     claims_df["Product Brand(Group)"] = claims_df[brand_col]
 
+            cost_col = _pick_column(
+                claims_df,
+                [
+                    "Zopper's Cost",
+                    "Claim_Amount",
+                    "Claim Amount",
+                    "Payment_Amount",
+                    "Payment Amount",
+                    "last_estimation_amount",
+                ],
+            )
+            deductible_col = _pick_column(
+                claims_df,
+                [
+                    "One time deductible",
+                    "One Time Deductible",
+                    "OTD Amount",
+                    "OTD_Amount",
+                    "Deductible",
+                ],
+            )
+            customer_paid_col = _pick_column(
+                claims_df,
+                [
+                    "Customer Paid",
+                    "Customer Paid Amount",
+                    "Customer_Paid_Amount",
+                ],
+            )
+            state_col = _pick_column(claims_df, ["State", "Customer_State", "Customer State"])
+            if state_col is not None and state_col != "State":
+                claims_df["State"] = claims_df[state_col]
+
             claims_df["One time deductible"] = (
-                self._clean_number(claims_df.get("One time deductible"))
-                .fillna(999)
+                self._clean_number(claims_df[deductible_col])
+                if deductible_col is not None
+                else 0
             )
 
-            claims_df["Zopper's Cost"] = self._clean_number(
-                claims_df.get("Zopper's Cost")
+            claims_df["Zopper's Cost"] = (
+                self._clean_number(claims_df[cost_col])
+                if cost_col is not None
+                else 0
             )
 
-            if "Customer Paid" in claims_df.columns:
+            if customer_paid_col is not None:
                 claims_df["Customer Paid"] = self._clean_number(
-                    claims_df["Customer Paid"]
+                    claims_df[customer_paid_col]
                 )
             else:
                 claims_df["Customer Paid"] = 0
@@ -347,9 +404,13 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 - sales_df["Plan Start Date"]
             ).dt.days.clip(lower=1)
 
-            exposure_days = (
+            exposure_days_raw = (
                 VALUATION_DATE - sales_df["Plan Start Date"]
             ).dt.days
+            # Future-start policies should not generate negative earned premium.
+            # Also cap exposure at coverage days.
+            exposure_days = exposure_days_raw.clip(lower=0)
+            exposure_days = pd.concat([exposure_days, coverage_days], axis=1).min(axis=1)
 
             sales_df["Coverage Days"] = coverage_days
             sales_df["Exposure Days"] = exposure_days
@@ -374,8 +435,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 * sales_df["Exposure Days"]
                 / sales_df["Coverage Days"]
             ).fillna(0)
-
-        return {"sales": sales_df, "claims": claims_df, "sales_ew": sales_ew_df}
+        self._loaded_data_cache = {"sales": sales_df, "claims": claims_df, "sales_ew": sales_ew_df}
+        logger.info(
+            "TIMING reliance.load_data source=%s dataset=%s sales_rows=%s claims_rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            len(sales_df),
+            len(claims_df),
+            (time.perf_counter() - started) * 1000,
+        )
+        return self._loaded_data_cache
 
     # --------------------------------------------------
     # AGGREGATION
@@ -383,6 +452,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
 
 
     def compute_by_dimension(self, dimension: str, metric: str) -> list[dict]:
+        total_started = time.perf_counter()
         data = self.load_data()
         df = data["claims"] if self.dataset_type == "claims" else data["sales"]
         ew_df = data.get("sales_ew") if self.dataset_type == "sales" else None
@@ -415,7 +485,17 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 return []
             df["_value"] = df["Zopper's Cost"]
         elif metric == "loss_ratio":
-            return self._compute_loss_ratio(dimension)
+            out = self._compute_loss_ratio(dimension, data=data)
+            logger.info(
+                "TIMING reliance.compute_by_dimension source=%s dataset=%s dimension=%s metric=%s out_rows=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                dimension,
+                metric,
+                len(out),
+                (time.perf_counter() - total_started) * 1000,
+            )
+            return out
         else:
             return []
 
@@ -459,6 +539,8 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 if dimension == "state":
                     dim_col = _pick_column([
                         "State",
+                        "Customer_State",
+                        "Customer State",
                         "State Name",
                         "State_Name",
                         "State/City",
@@ -487,17 +569,23 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                         "Product Brand (Group)",
                         "Product Brand",
                         "Brand",
+                        "Item_Brand",
                         "Plan_Category",
                         "Plan Category",
                     ])
 
                 if dim_col not in local_df.columns:
                     if dimension == "month":
-                        date_col = (
-                            "Plan Start Date"
-                            if self.dataset_type == "sales"
-                            else "Day of Call_Date"
-                        )
+                        date_col = "Plan Start Date" if self.dataset_type == "sales" else _pick_column([
+                            "Day of Call_Date",
+                            "Month",
+                            "Month_Year",
+                            "Call_Registered_Date",
+                            "Call_Initiated_Date",
+                            "Call_Date",
+                            "Call Date",
+                            "Date",
+                        ])
                         if date_col in local_df.columns:
                             local_df["Month"] = self._month_key(local_df[date_col])
                             dim_col = "Month"
@@ -542,15 +630,25 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
 
         if dimension == "month" and "month" in out.columns:
             out["month"] = pd.to_datetime(out["month"], errors="coerce").dt.strftime("%b-%y")
-
-        return out.fillna(0).to_dict(orient="records")
+        result = out.fillna(0).to_dict(orient="records")
+        logger.info(
+            "TIMING reliance.compute_by_dimension source=%s dataset=%s dimension=%s metric=%s out_rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            dimension,
+            metric,
+            len(result),
+            (time.perf_counter() - total_started) * 1000,
+        )
+        return result
 
     # --------------------------------------------------
     # LOSS RATIO
     # --------------------------------------------------
 
-    def _compute_loss_ratio(self, dimension: str) -> list[dict]:
-        data = self.load_data()
+    def _compute_loss_ratio(self, dimension: str, data: dict[str, pd.DataFrame] | None = None) -> list[dict]:
+        if data is None:
+            data = self.load_data()
         sales = data["sales"]
         claims = data["claims"]
 
@@ -572,6 +670,15 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             elif "Day of Call_Date" in claims.columns:
                 claims = claims.copy()
                 claims["Month"] = self._month_key(claims["Day of Call_Date"])
+            elif "Month_Year" in claims.columns:
+                claims = claims.copy()
+                claims["Month"] = self._month_key(claims["Month_Year"])
+            elif "Call_Registered_Date" in claims.columns:
+                claims = claims.copy()
+                claims["Month"] = self._month_key(claims["Call_Registered_Date"])
+            elif "Call_Initiated_Date" in claims.columns:
+                claims = claims.copy()
+                claims["Month"] = self._month_key(claims["Call_Initiated_Date"])
         elif dimension == "state":
             def _normalize_key(value: str) -> str:
                 return (
@@ -595,6 +702,8 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
 
             state_candidates = [
                 "State",
+                "Customer_State",
+                "Customer State",
                 "State Name",
                 "State_Name",
                 "State/City",
@@ -651,6 +760,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 "Product Brand (Group)",
                 "Product Brand",
                 "Brand",
+                "Item_Brand",
                 "Device Plan Category",
                 "Device Category",
             ]
@@ -737,7 +847,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
 
         merged["loss_ratio"] = (
             merged["Net Claims"] / merged["Zopper Earned Premium"] * 100
-        ).replace([float("inf"), float("-inf")], 0)
+        ).replace([float("inf"), float("-inf")], 0).fillna(0)
 
         out = merged[[dim_sales, "loss_ratio"]].rename(
             columns={dim_sales: dimension}
@@ -751,6 +861,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
     # --------------------------------------------------
 
     def compute_summary(self) -> dict:
+        started = time.perf_counter()
         data = self.load_data()
 
         if self.dataset_type == "claims":
@@ -769,12 +880,20 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     "zopper_earned_premium": 0,
                     "units_sold": int(len(df)),
                 }
-            return {
+            result = {
                 "gross_premium": float(df["Zopper's Cost"].sum()),
                 "earned_premium": float(df["Net Claims"].sum()),
                 "zopper_earned_premium": float(df["Net Claims"].sum()),
                 "units_sold": int(len(df)),
             }
+            logger.info(
+                "TIMING reliance.compute_summary source=%s dataset=%s rows=%s duration_ms=%.2f",
+                self.source,
+                self.dataset_type,
+                len(df),
+                (time.perf_counter() - started) * 1000,
+            )
+            return result
 
         df = data["sales"]
         if df.empty:
@@ -795,12 +914,20 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 "zopper_earned_premium": 0,
                 "units_sold": int(len(df)),
             }
-        return {
+        result = {
             "gross_premium": float(df["Gross Premium"].sum()),
             "earned_premium": float(df["Earned Premium"].sum()),
             "zopper_earned_premium": float(df["Zopper Earned Premium"].sum()),
             "units_sold": int(len(df)),
         }
+        logger.info(
+            "TIMING reliance.compute_summary source=%s dataset=%s rows=%s duration_ms=%.2f",
+            self.source,
+            self.dataset_type,
+            len(df),
+            (time.perf_counter() - started) * 1000,
+        )
+        return result
 
     def compute(self) -> dict:
         return {}
