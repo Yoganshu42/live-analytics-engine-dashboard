@@ -482,7 +482,24 @@ def compute_summary_values(
             from_date=from_date,
             to_date=to_date,
         )
-        return engine.compute_summary()
+        summary = engine.compute_summary()
+
+        # For Godrej sales, Gross Premium and Units Sold must always be global totals,
+        # irrespective of date range or selected tag.
+        if resolved_source == "godrej" and dataset_type == "sales":
+            global_engine = engine_cls(
+                db=db,
+                job_id=None,
+                source=resolved_source,
+                dataset_type=dataset_type,
+                from_date=None,
+                to_date=None,
+            )
+            global_summary = global_engine.compute_summary()
+            summary["gross_premium"] = float(global_summary.get("gross_premium", 0) or 0)
+            summary["units_sold"] = int(global_summary.get("units_sold", 0) or 0)
+
+        return summary
 
     df = get_dataframe(
         db=db,
@@ -578,6 +595,7 @@ def analytics_summary(
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
+    force_live_summary = resolved_source == "godrej" and normalized_dataset == "sales"
 
     cached = get_precomputed_summary(
         db=db,
@@ -587,7 +605,7 @@ def analytics_summary(
         from_date=from_date,
         to_date=to_date,
     )
-    if cached is not None:
+    if cached is not None and not force_live_summary:
         gross_cached = float(cached.get("gross_premium", 0) or 0)
         earned_cached = float(cached.get("earned_premium", 0) or 0)
         zopper_cached = float(cached.get("zopper_earned_premium", 0) or 0)
@@ -653,6 +671,14 @@ def analytics_summary(
                 (time.perf_counter() - started) * 1000,
             )
             return cached
+    elif cached is not None and force_live_summary:
+        logger.info(
+            "Bypassing precomputed summary for Godrej sales; recomputing live source=%s dataset=%s from=%s to=%s",
+            resolved_source,
+            normalized_dataset,
+            from_date,
+            to_date,
+        )
 
     out = compute_summary_values(
         db=db,

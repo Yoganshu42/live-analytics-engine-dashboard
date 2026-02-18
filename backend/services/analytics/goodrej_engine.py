@@ -1010,17 +1010,20 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "units_sold": 0,
             }
 
-        df = self._apply_date_filter(df, "sales")
+        # Gross premium and units sold should reflect total uploaded sales rows,
+        # not the currently selected date slice.
+        df_all = df
+        df_period = self._apply_date_filter(df, "sales")
 
-        gross = pd.to_numeric(df.get("Customer Premium", 0), errors="coerce").fillna(0).sum()
-        earned = pd.to_numeric(df.get("Earned_Premium", 0), errors="coerce").fillna(0).sum()
-        zopper_earned = pd.to_numeric(df.get("Zopper_Share_EP", 0), errors="coerce").fillna(0).sum()
+        gross = pd.to_numeric(df_all.get("Customer Premium", 0), errors="coerce").fillna(0).sum()
+        earned = pd.to_numeric(df_period.get("Earned_Premium", 0), errors="coerce").fillna(0).sum()
+        zopper_earned = pd.to_numeric(df_period.get("Zopper_Share_EP", 0), errors="coerce").fillna(0).sum()
 
         return {
             "gross_premium": float(gross),
             "earned_premium": float(earned),
             "zopper_earned_premium": float(zopper_earned),
-            "units_sold": int(len(df)),
+            "units_sold": int(len(df_all)),
         }
 
     def compute(self) -> dict:

@@ -45,6 +45,10 @@ export default function ResultCard({
     let mounted = true
     setLoading(true)
     setError(false)
+    const sourceKey = (source || "").trim().toLowerCase()
+    const isGodrejSales =
+      datasetType === "sales" &&
+      (sourceKey === "godrej" || sourceKey === "goodrej" || sourceKey === "goddrej")
 
     const isZeroSummary = (summary: Summary) =>
       Number(summary.gross_premium || 0) === 0 &&
@@ -53,16 +57,22 @@ export default function ResultCard({
 
     const load = async () => {
       try {
-        let res = await fetchSummary({
-          job_id: jobId,
-          source,
-          dataset_type: datasetType,
-          from_date: fromDate,
-          to_date: toDate,
-        })
+        const params: Parameters<typeof fetchSummary>[0] = isGodrejSales
+          ? {
+              source,
+              dataset_type: datasetType,
+            }
+          : {
+              job_id: jobId,
+              source,
+              dataset_type: datasetType,
+              from_date: fromDate,
+              to_date: toDate,
+            }
+        let res = await fetchSummary(params)
 
         // Match graph behavior: if filtered summary is empty, retry once without date bounds.
-        if ((fromDate || toDate) && isZeroSummary(res)) {
+        if (!isGodrejSales && (fromDate || toDate) && isZeroSummary(res)) {
           res = await fetchSummary({
             job_id: jobId,
             source,
