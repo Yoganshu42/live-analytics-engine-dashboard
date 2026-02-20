@@ -318,6 +318,14 @@ function UserManagementPanel() {
   const [role, setRole] = useState<"admin" | "employee">("employee")
   const [submitting, setSubmitting] = useState(false)
 
+  const refreshDashboard = useCallback(() => {
+    if (typeof window === "undefined") return
+    localStorage.setItem("dashboard_data_refresh_at", new Date().toISOString())
+    window.setTimeout(() => {
+      window.location.reload()
+    }, 350)
+  }, [])
+
   const loadUsers = useCallback(async (q?: string) => {
     setLoading(true)
     setError("")
@@ -350,6 +358,7 @@ function UserManagementPanel() {
       setPassword("")
       setRole("employee")
       await loadUsers(search)
+      refreshDashboard()
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create user")
     } finally {
@@ -366,6 +375,7 @@ function UserManagementPanel() {
       await deleteAdminUser(targetEmail)
       setMessage(`Deleted user: ${targetEmail}`)
       await loadUsers(search)
+      refreshDashboard()
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete user")
     }
@@ -379,6 +389,7 @@ function UserManagementPanel() {
     try {
       await updateAdminUserPassword(targetEmail, newPassword)
       setMessage(`Password updated for ${targetEmail}`)
+      refreshDashboard()
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update password")
     }

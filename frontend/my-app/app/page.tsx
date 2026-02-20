@@ -3,7 +3,7 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from "react"
 import Image from "next/image"
 import { useRouter } from "next/navigation"
-import { motion, AnimatePresence, Variants } from "framer-motion"
+import { motion, AnimatePresence, Variants, useReducedMotion } from "framer-motion"
 import {
   Maximize2,
   BarChart3,
@@ -21,6 +21,7 @@ import { clearGraphDataCache } from "@/components/GraphView"
 import ResultCard from "@/components/ResultCard"
 import LastUpdatedCard from "@/components/LastUpdatedCard"
 import AdminFileAccess from "@/components/AdminFileAccess"
+import DateRangePicker from "@/components/DateRangePicker"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
 
 // --- ENHANCED ANIMATION VARIANTS ---
@@ -58,15 +59,9 @@ type InitialDashboardState = {
 }
 
 export default function DashboardPage() {
-  const currentMonthDateMax = useCallback(() => {
-    const now = new Date()
-    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0)
-    return monthEnd.toISOString().slice(0, 10)
-  }, [])
-
   const clampToCurrentMonth = useCallback((value: string) => {
     return value
-  }, [currentMonthDateMax])
+  }, [])
 
   const normalizeToken = (value: string | null) => {
     if (!value) return null
@@ -86,7 +81,7 @@ export default function DashboardPage() {
     return key
   }
 
-  const normalizeDateRange = (
+  const normalizeDateRange = useCallback((
     from: string,
     to: string,
     fallbackFrom = "",
@@ -97,7 +92,7 @@ export default function DashboardPage() {
     if (!nextFrom || !nextTo) return { from: nextFrom, to: nextTo }
     if (nextFrom <= nextTo) return { from: nextFrom, to: nextTo }
     return { from: nextTo, to: nextFrom }
-  }
+  }, [clampToCurrentMonth])
 
   const router = useRouter()
   const [initialDashboardState] = useState<InitialDashboardState>(() => {
@@ -141,13 +136,17 @@ export default function DashboardPage() {
   const [view, setView] = useState<"home" | "dashboard">(initialDashboardState.view)
   const [brand, setBrand] = useState<string>(initialDashboardState.brand)
   const [mode, setMode] = useState<"sales" | "claims">(initialDashboardState.mode)
-  const [isFullscreen, setIsFullscreen] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return localStorage.getItem("dashboard_fullscreen") === "1"
+  })
   const [isLoggingOut, setIsLoggingOut] = useState(false)
   const [jobId] = useState<string | null>(initialDashboardState.jobId)
-  const effectiveJobId = brand === "godrej" && mode === "claims" ? null : jobId
+  const effectiveJobId = brand === "godrej" ? null : jobId
   const [authRole, setAuthRole] = useState<"admin" | "employee" | null>(null)
   const [authName, setAuthName] = useState<string>("")
   const [authReady, setAuthReady] = useState(false)
+  const prefersReducedMotion = useReducedMotion()
 
   const [fromDate, setFromDate] = useState<string>(initialDashboardState.from)
   const [toDate, setToDate] = useState<string>(initialDashboardState.to)
@@ -157,6 +156,13 @@ export default function DashboardPage() {
   const [defaultToDate, setDefaultToDate] = useState<string>("")
   const [defaultKey, setDefaultKey] = useState<string>("")
   const [filterRefreshTick, setFilterRefreshTick] = useState(0)
+
+  const forcePageRefresh = useCallback((delayMs = 60) => {
+    if (typeof window === "undefined") return
+    window.setTimeout(() => {
+      window.location.reload()
+    }, delayMs)
+  }, [])
 
   const dateStateRef = useRef({
     fromDate: initialDashboardState.from,
@@ -205,10 +211,10 @@ export default function DashboardPage() {
       localStorage.setItem("dashboard_view", "dashboard")
       localStorage.setItem("dashboard_from_date", "")
       localStorage.setItem("dashboard_to_date", "")
-      window.setTimeout(() => {
-        window.location.reload()
-      }, 0)
+      localStorage.setItem("dashboard_fullscreen", "0")
     }
+    forceFilterRefresh()
+    forcePageRefresh()
   }
 
   useEffect(() => {
@@ -266,7 +272,7 @@ export default function DashboardPage() {
     if (!brand || !mode) return
     const nextKey = `${brand}|${mode}|${effectiveJobId || ""}`
     const snapshot = dateStateRef.current
-    if (snapshot.defaultKey === nextKey && (snapshot.defaultFromDate || snapshot.defaultToDate)) return
+    if (snapshot.defaultKey === nextKey && snapshot.defaultFromDate && snapshot.defaultToDate) return
     let mounted = true
 
     fetchDateBounds({ job_id: effectiveJobId || undefined, source: brand, dataset_type: mode })
@@ -274,43 +280,55 @@ export default function DashboardPage() {
         if (!mounted) return
         const min = clampToCurrentMonth(res?.min_date ?? "")
         const max = clampToCurrentMonth(res?.max_date ?? "")
-        setDefaultFromDate(min)
-        setDefaultToDate(max)
-        setDefaultKey(nextKey)
-
         const today = clampToCurrentMonth(todayIso())
-        const clamp = (value: string) => {
+        const hasAnyBounds = Boolean(min || max)
+        if (!hasAnyBounds) {
+          setDefaultFromDate("")
+          setDefaultToDate("")
+          setDefaultKey(nextKey)
+          setFromDate("")
+          setToDate("")
+          setDraftFromDate("")
+          setDraftToDate("")
+          return
+        }
+        const fallbackFrom = min || max || today
+        const fallbackTo = today
+        const upperBound = today
+        const clampToFilterWindow = (value: string) => {
           if (!value) return value
-          if (!min || !max) return value
-          if (value < min) return min
-          if (value > max) return max
+          if (min && value < min) return min
+          if (upperBound && value > upperBound) return upperBound
           return value
         }
-        const todayBounded = clamp(today)
+        const defaultRange = normalizeDateRange(
+          clampToFilterWindow(fallbackFrom),
+          clampToFilterWindow(fallbackTo),
+          clampToFilterWindow(fallbackFrom),
+          clampToFilterWindow(fallbackTo)
+        )
+        setDefaultFromDate(defaultRange.from)
+        setDefaultToDate(defaultRange.to)
+        setDefaultKey(nextKey)
+
         const isNewKeyLoad = snapshot.defaultKey !== nextKey
 
-        if (!min || !max) {
-          setDefaultFromDate(todayBounded)
-          setDefaultToDate(todayBounded)
-          setFromDate(todayBounded)
-          setToDate(todayBounded)
-          setDraftFromDate(todayBounded)
-          setDraftToDate(todayBounded)
-          return
-        }
-
         if (isNewKeyLoad) {
-          setFromDate(min)
-          setToDate(todayBounded)
-          setDraftFromDate(min)
-          setDraftToDate(todayBounded)
+          setFromDate(defaultRange.from)
+          setToDate(defaultRange.to)
+          setDraftFromDate(defaultRange.from)
+          setDraftToDate(defaultRange.to)
           return
         }
 
-        const nextFrom = clamp(clampToCurrentMonth(snapshot.fromDate || min))
-        const nextTo = clamp(clampToCurrentMonth(snapshot.toDate || todayBounded))
-        const orderedFrom = nextFrom <= nextTo ? nextFrom : min
-        const orderedTo = nextFrom <= nextTo ? nextTo : todayBounded
+        const normalizedSnapshotRange = normalizeDateRange(
+          clampToFilterWindow(clampToCurrentMonth(snapshot.fromDate || defaultRange.from)),
+          clampToFilterWindow(clampToCurrentMonth(snapshot.toDate || defaultRange.to)),
+          defaultRange.from,
+          defaultRange.to
+        )
+        const orderedFrom = normalizedSnapshotRange.from
+        const orderedTo = normalizedSnapshotRange.to
         if (orderedFrom !== snapshot.fromDate || orderedTo !== snapshot.toDate) {
           setFromDate(orderedFrom); setToDate(orderedTo)
         }
@@ -318,21 +336,72 @@ export default function DashboardPage() {
           setDraftFromDate(orderedFrom); setDraftToDate(orderedTo)
         }
       })
+      .catch((err: unknown) => {
+        if (!mounted) return
+        console.error("Date bounds fetch failed; continuing without bounds.", err)
+        const snapshot = dateStateRef.current
+        const fallbackRange = normalizeDateRange(
+          clampToCurrentMonth(snapshot.fromDate || ""),
+          clampToCurrentMonth(snapshot.toDate || ""),
+          "",
+          ""
+        )
+        setDefaultFromDate("")
+        setDefaultToDate("")
+        setDefaultKey(nextKey)
+        setFromDate(fallbackRange.from)
+        setToDate(fallbackRange.to)
+        setDraftFromDate(fallbackRange.from)
+        setDraftToDate(fallbackRange.to)
+      })
     return () => { mounted = false }
-  }, [brand, mode, effectiveJobId, clampToCurrentMonth, todayIso])
+  }, [brand, mode, effectiveJobId, clampToCurrentMonth, todayIso, normalizeDateRange])
 
   const handleModeChange = (nextMode: "sales" | "claims") => {
     setIsFullscreen(false)
-    if (nextMode === mode) return
+    if (nextMode === mode) {
+      if (typeof window !== "undefined") {
+        localStorage.setItem("dashboard_mode", nextMode)
+        localStorage.setItem("dashboard_view", "dashboard")
+        localStorage.setItem("dashboard_fullscreen", "0")
+      }
+      forcePageRefresh()
+      return
+    }
 
     setMode(nextMode)
+    setDefaultKey("")
+    setFromDate("")
+    setToDate("")
+    setDraftFromDate("")
+    setDraftToDate("")
     if (typeof window !== "undefined") {
       localStorage.setItem("dashboard_mode", nextMode)
       localStorage.setItem("dashboard_view", "dashboard")
-      window.setTimeout(() => {
-        window.location.reload()
-      }, 0)
+      localStorage.setItem("dashboard_fullscreen", "0")
     }
+    forceFilterRefresh()
+    forcePageRefresh()
+  }
+
+  const handleViewChange = (nextView: "home" | "dashboard") => {
+    setView(nextView)
+    if (typeof window !== "undefined") {
+      localStorage.setItem("dashboard_view", nextView)
+      if (nextView !== "dashboard") {
+        localStorage.setItem("dashboard_fullscreen", "0")
+      }
+    }
+    setIsFullscreen(false)
+    forcePageRefresh()
+  }
+
+  const handleFullscreenToggle = (next: boolean) => {
+    setIsFullscreen(next)
+    if (typeof window !== "undefined") {
+      localStorage.setItem("dashboard_fullscreen", next ? "1" : "0")
+    }
+    forcePageRefresh()
   }
 
   const theme = useMemo(() => ({
@@ -346,6 +415,43 @@ export default function DashboardPage() {
   const hasDateBounds = Boolean(defaultFromDate && defaultToDate)
   const isDashboardDataReady =
     hasResolvedDateBounds && (!hasDateBounds || Boolean(fromDate && toDate))
+
+  const handleGraphDateRangeApply = (nextFromRaw: string, nextToRaw: string) => {
+    const next = normalizeDateRange(
+      nextFromRaw,
+      nextToRaw,
+      fromDate || defaultFromDate,
+      toDate || defaultToDate
+    )
+    setDraftFromDate(next.from)
+    setDraftToDate(next.to)
+    setFromDate(next.from)
+    setToDate(next.to)
+    forceFilterRefresh()
+  }
+
+  const resetDateRange = useCallback(() => {
+    if (!defaultFromDate && !defaultToDate) {
+      setFromDate("")
+      setToDate("")
+      setDraftFromDate("")
+      setDraftToDate("")
+      forceFilterRefresh()
+      return
+    }
+    const defaultUpper = todayIso()
+    const resetRange = normalizeDateRange(
+      defaultFromDate,
+      defaultUpper,
+      defaultFromDate || fromDate || defaultUpper,
+      defaultUpper
+    )
+    setFromDate(resetRange.from)
+    setToDate(resetRange.to)
+    setDraftFromDate(resetRange.from)
+    setDraftToDate(resetRange.to)
+    forceFilterRefresh()
+  }, [defaultFromDate, defaultToDate, fromDate, todayIso, normalizeDateRange, forceFilterRefresh])
 
   const brandLabel = (value: string) => {
     const labels: Record<string, string> = {
@@ -380,7 +486,7 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-[#fbfcfd] text-slate-900 font-sans selection:bg-indigo-100 overflow-hidden">
+    <div className="smooth-surface h-screen flex flex-col bg-[#fbfcfd] text-slate-900 font-sans selection:bg-indigo-100 overflow-hidden">
       {/* HEADER */}
       <motion.header 
         variants={headerSlide}
@@ -391,7 +497,7 @@ export default function DashboardPage() {
         <div className="flex items-center gap-6">
           <motion.button
             whileHover={{ scale: 1.05 }}
-            onClick={() => setView("home")}
+            onClick={() => handleViewChange("home")}
             className="cursor-pointer"
           >
             <Image
@@ -458,11 +564,11 @@ export default function DashboardPage() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0, scale: 0.98 }}
             transition={{ duration: 0.5 }}
-            className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-6"
+            className="content-auto relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-6"
           >
             {/* Background Elements */}
             <div className="absolute inset-0 -z-10">
-               <video autoPlay muted loop playsInline className="h-full w-full object-cover opacity-20 scale-105 blur-[2px]">
+               <video autoPlay={!prefersReducedMotion} muted loop={!prefersReducedMotion} playsInline className="h-full w-full object-cover opacity-20 scale-105 blur-[2px]">
                 <source src="/Business_Analytics_Video_Generation_Prompt.mp4" type="video/mp4" />
               </video>
               <div className="absolute inset-0 bg-gradient-to-b from-white/80 via-white/40 to-white" />
@@ -671,7 +777,7 @@ export default function DashboardPage() {
               brand={brand}
               onChange={(b) => applyBrandChange(b)}
               currentView={view}
-              onViewChange={setView}
+              onViewChange={handleViewChange}
               authRole={authRole}
             />
 
@@ -749,68 +855,19 @@ export default function DashboardPage() {
                         <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-100 text-slate-600"><Calendar size={20} /></div>
                         <span className="text-[11px] font-black uppercase tracking-widest text-slate-500">Date Range</span>
                       </div>
-                      <div className="grid grid-cols-2 gap-3 mb-6">
-                        <div className="space-y-1">
-                          <label className="text-[9px] font-bold uppercase text-slate-400 ml-1">From</label>
-                          <input type="date" value={draftFromDate} onChange={e => setDraftFromDate(clampToCurrentMonth(e.target.value))} className="w-full border-slate-200 rounded-2xl px-4 py-3 text-xs font-bold focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none bg-slate-50/50" />
-                        </div>
-                        <div className="space-y-1">
-                          <label className="text-[9px] font-bold uppercase text-slate-400 ml-1">To</label>
-                          <input type="date" value={draftToDate} onChange={e => setDraftToDate(clampToCurrentMonth(e.target.value))} className="w-full border-slate-200 rounded-2xl px-4 py-3 text-xs font-bold focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none bg-slate-50/50" />
-                        </div>
-                      </div>
-                    </div>
-                    <div className="flex gap-3">
-                      <motion.button 
-                        whileTap={{ scale: 0.95 }}
-                        className="flex-1 text-xs font-black uppercase tracking-widest py-4 rounded-2xl bg-slate-900 text-white hover:bg-black transition-all shadow-lg shadow-slate-200" 
-                        onClick={() => {
-                          const next = normalizeDateRange(
-                            draftFromDate,
-                            draftToDate,
-                            defaultFromDate,
-                            defaultToDate
-                          )
-                          setDraftFromDate(next.from)
-                          setDraftToDate(next.to)
-                          setFromDate(next.from)
-                          setToDate(next.to)
-                          forceFilterRefresh()
+                      <DateRangePicker
+                        draftFromDate={draftFromDate}
+                        draftToDate={draftToDate}
+                        minDate={defaultFromDate || undefined}
+                        maxDate={defaultToDate && defaultToDate > todayIso() ? defaultToDate : todayIso()}
+                        compact
+                        onDraftChange={(from, to) => {
+                          setDraftFromDate(clampToCurrentMonth(from))
+                          setDraftToDate(clampToCurrentMonth(to))
                         }}
-                      >
-                        Apply Filters
-                      </motion.button>
-                      <button
-                        className="px-5 py-4 rounded-2xl border border-slate-200 bg-white hover:bg-slate-50 transition-all text-xs font-bold text-slate-500"
-                        onClick={() => {
-                          const today = todayIso()
-                          setFromDate(today)
-                          setToDate(today)
-                          setDraftFromDate(today)
-                          setDraftToDate(today)
-                          forceFilterRefresh()
-                        }}
-                      >
-                        Reset
-                      </button>
-                      <button
-                        className="px-5 py-4 rounded-2xl border border-slate-200 bg-white hover:bg-slate-50 transition-all text-xs font-bold text-slate-500"
-                        onClick={() => {
-                          const next = normalizeDateRange(
-                            draftFromDate,
-                            draftToDate,
-                            fromDate || defaultFromDate,
-                            toDate || defaultToDate
-                          )
-                          setDraftFromDate(next.from)
-                          setDraftToDate(next.to)
-                          setFromDate(next.from)
-                          setToDate(next.to)
-                          forceFilterRefresh()
-                        }}
-                      >
-                        Refresh
-                      </button>
+                        onApply={handleGraphDateRangeApply}
+                        onReset={resetDateRange}
+                      />
                     </div>
                   </motion.div>
                 </motion.div>
@@ -828,7 +885,7 @@ export default function DashboardPage() {
                     </div>
                     <motion.button 
                       whileHover={{ scale: 1.1, rotate: 90 }}
-                      onClick={() => setIsFullscreen(true)} 
+                      onClick={() => handleFullscreenToggle(true)}
                       className="p-3 bg-slate-50 hover:bg-slate-100 rounded-full transition-colors"
                     >
                       <Maximize2 size={20} className="text-slate-600" />
@@ -845,6 +902,9 @@ export default function DashboardPage() {
                         secondaryColor={theme.secondary}
                         fromDate={fromDate || undefined}
                         toDate={toDate || undefined}
+                        resetFromDate={defaultFromDate || undefined}
+                        resetToDate={defaultToDate || undefined}
+                        onDateRangeApply={handleGraphDateRangeApply}
                       />
                     ) : (
                       <div className="h-[500px] flex items-center justify-center text-sm text-slate-400">
@@ -873,7 +933,7 @@ export default function DashboardPage() {
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{mode === "sales" ? "Sales Velocity" : "Claims Integrity"}</p>
                 </div>
               </div>
-              <button className="px-8 py-3 bg-slate-900 text-white rounded-2xl text-xs font-bold hover:bg-black transition-all" onClick={() => setIsFullscreen(false)}>Close Focus View</button>
+              <button className="px-8 py-3 bg-slate-900 text-white rounded-2xl text-xs font-bold hover:bg-black transition-all" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
             </div>
             <div className="flex-1 p-12 overflow-auto">
               {isDashboardDataReady ? (
@@ -885,6 +945,9 @@ export default function DashboardPage() {
                   primaryColor={theme.primary}
                   fromDate={fromDate || undefined}
                   toDate={toDate || undefined}
+                  resetFromDate={defaultFromDate || undefined}
+                  resetToDate={defaultToDate || undefined}
+                  onDateRangeApply={handleGraphDateRangeApply}
                 />
               ) : (
                 <div className="h-full min-h-[500px] flex items-center justify-center text-sm text-slate-400">

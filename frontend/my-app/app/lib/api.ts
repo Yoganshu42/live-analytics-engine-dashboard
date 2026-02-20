@@ -77,6 +77,81 @@ type GraphInsightsResponse = {
   message?: string
 }
 
+export type ChatbotTurn = {
+  role: "user" | "assistant"
+  content: string
+}
+
+export type ChatbotPayload = {
+  message: string
+  history?: ChatbotTurn[]
+  system_prompt?: string
+  temperature?: number
+  max_tokens?: number
+  source?: string
+  dataset_type?: "sales" | "claims"
+  job_id?: string
+  from_date?: string
+  to_date?: string
+}
+
+export type ChatbotResponse = {
+  response: string
+  model?: string
+  message?: string
+}
+
+export type CityBreakdownParams = {
+  state: string
+  metric: string
+  source: string
+  dataset_type: "sales" | "claims"
+  job_id?: string
+  from_date?: string
+  to_date?: string
+  limit?: number
+}
+
+export type CityBreakdownRow = {
+  city: string
+  value: number
+}
+
+type CityBreakdownResponse = {
+  state: string
+  metric: string
+  rows: CityBreakdownRow[]
+  total?: number
+  message?: string
+}
+
+export type CategoryPercentageParams = {
+  dimension: "plan_category" | "device_plan_category"
+  source: string
+  dataset_type: "sales" | "claims"
+  metric?: string
+  state?: string
+  job_id?: string
+  from_date?: string
+  to_date?: string
+  limit?: number
+}
+
+export type CategoryPercentageRow = {
+  label: string
+  value: number
+  percentage: number
+}
+
+type CategoryPercentageResponse = {
+  dimension: string
+  metric: string
+  state?: string
+  total?: number
+  rows: CategoryPercentageRow[]
+  message?: string
+}
+
 const DEFAULT_API_BASE =
   typeof window !== "undefined"
     ? (window.location.origin || "")
@@ -86,7 +161,8 @@ const normalizeApiBase = (value: string) => {
   const cleaned = value.replace(/\s+/g, "")
   const withoutMarker = cleaned.replace(/^-?NoNewline/i, "")
   const match = withoutMarker.match(/https?:\/\/.*/)
-  return match ? match[0] : withoutMarker
+  const normalized = match ? match[0] : withoutMarker
+  return normalized.replace(/\/+$/, "")
 }
 const ENV_API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE || "")
 const API_BASE = ENV_API_BASE || DEFAULT_API_BASE
@@ -95,6 +171,14 @@ const runtimeOverride =
   typeof window !== "undefined"
     ? normalizeApiBase(new URLSearchParams(window.location.search).get("api") || "")
     : ""
+
+const browserOriginApiBases =
+  typeof window !== "undefined"
+    ? [
+        `${window.location.origin}/api`,
+        window.location.origin,
+      ]
+    : []
 
 const browserHostApiBases =
   typeof window !== "undefined"
@@ -107,6 +191,7 @@ const browserHostApiBases =
 const API_FALLBACKS = Array.from(
   new Set([
     runtimeOverride,
+    ...browserOriginApiBases,
     ENV_API_BASE,
     ...browserHostApiBases,
     API_BASE,
@@ -117,6 +202,7 @@ const API_FALLBACKS = Array.from(
 )
 const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
 const ADMIN_UPLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_ADMIN_UPLOAD_TIMEOUT_MS || 180000)
+const CHATBOT_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_CHATBOT_TIMEOUT_MS || 60000)
 let preferredApiBase = API_FALLBACKS[0] || ""
 
 const orderedApiBases = () => {
@@ -450,4 +536,38 @@ export async function fetchGraphInsights(payload: GraphInsightsPayload): Promise
     method: "POST",
     body: JSON.stringify(payload),
   })
+}
+
+export async function sendChatbotMessage(payload: ChatbotPayload): Promise<ChatbotResponse> {
+  return fetchJsonWithFallback("/chatbot/message", "", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: CHATBOT_REQUEST_TIMEOUT_MS,
+  })
+}
+
+export async function fetchCityBreakdownByState(params: CityBreakdownParams): Promise<CityBreakdownResponse> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [k, v]) => {
+      if (v !== undefined && v !== null && String(v).trim() !== "") acc[k] = String(v)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  return fetchJsonWithFallback("/analytics/city-breakdown", query)
+}
+
+export async function fetchCategoryPercentage(
+  params: CategoryPercentageParams
+): Promise<CategoryPercentageResponse> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [k, v]) => {
+      if (v !== undefined && v !== null && String(v).trim() !== "") acc[k] = String(v)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  return fetchJsonWithFallback("/analytics/category-percentage", query)
 }

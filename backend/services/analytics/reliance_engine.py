@@ -297,11 +297,17 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 claims_df["Month"] = self._month_key(claims_df["Day of Call_Date"])
 
             if "Month" in claims_df.columns:
+                claims_filter_start = self.report_start
+                claims_filter_end = self.report_end
+                if claims_filter_start is not None:
+                    claims_filter_start = pd.Timestamp(claims_filter_start).to_period("M").to_timestamp()
+                if claims_filter_end is not None:
+                    claims_filter_end = pd.Timestamp(claims_filter_end).to_period("M").to_timestamp(how="end")
                 claims_df = claims_df[claims_df["Month"].notna()]
-                if self.report_start is not None:
-                    claims_df = claims_df[claims_df["Month"] >= self.report_start]
-                if self.report_end is not None:
-                    claims_df = claims_df[claims_df["Month"] <= self.report_end]
+                if claims_filter_start is not None:
+                    claims_df = claims_df[claims_df["Month"] >= claims_filter_start]
+                if claims_filter_end is not None:
+                    claims_df = claims_df[claims_df["Month"] <= claims_filter_end]
             elif "Day of Call_Date" in claims_df.columns:
                 claims_df = claims_df[claims_df["Day of Call_Date"].notna()]
                 if self.report_start is not None:

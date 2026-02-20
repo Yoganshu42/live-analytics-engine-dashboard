@@ -56,10 +56,17 @@ def _current_month_cap() -> pd.Timestamp:
 
 
 def _parse_series(series: pd.Series) -> pd.Series:
+    cleaned = series.astype(str).str.strip()
+    yyyymm = cleaned.str.replace(r"\.0$", "", regex=True)
+    yyyymm_mask = yyyymm.str.fullmatch(r"\d{6}")
+    normalized = yyyymm.where(
+        ~yyyymm_mask,
+        yyyymm.str.slice(0, 4) + "-" + yyyymm.str.slice(4, 6) + "-01",
+    )
     try:
-        parsed = pd.to_datetime(series, format="mixed", errors="coerce")
+        parsed = pd.to_datetime(normalized, format="mixed", errors="coerce")
     except TypeError:
-        parsed = pd.to_datetime(series, errors="coerce")
+        parsed = pd.to_datetime(normalized, errors="coerce")
     # Ignore implausible/legacy parsed dates that distort bounds (e.g. 1970 from malformed month codes).
     return parsed.where(parsed.dt.year >= 2000)
 
@@ -105,6 +112,564 @@ def _to_safe_key(key: str) -> str:
     return re.sub(r"[()%'.]", "", re.sub(r"\s+", "_", (key or "").strip().lower()))
 
 
+def _normalize_lookup_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").strip().lower())
+
+
+def _normalize_bucket_value(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _collapse_bucket_value(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", _normalize_bucket_value(value))
+
+
+_MISSING_LABELS = {"", "nan", "none", "null", "NaN", "None", "NULL"}
+_STATE_CODE_TO_NAME: dict[str, str] = {
+    "ap": "Andhra Pradesh",
+    "ar": "Arunachal Pradesh",
+    "as": "Assam",
+    "br": "Bihar",
+    "cg": "Chhattisgarh",
+    "ch": "Chandigarh",
+    "dd": "Daman And Diu",
+    "dl": "Delhi",
+    "dn": "Dadra And Nagar Haveli",
+    "ga": "Goa",
+    "gj": "Gujarat",
+    "hr": "Haryana",
+    "hp": "Himachal Pradesh",
+    "jh": "Jharkhand",
+    "jk": "Jammu And Kashmir",
+    "ka": "Karnataka",
+    "kl": "Kerala",
+    "la": "Ladakh",
+    "ld": "Lakshadweep",
+    "mh": "Maharashtra",
+    "ml": "Meghalaya",
+    "mn": "Manipur",
+    "mp": "Madhya Pradesh",
+    "mz": "Mizoram",
+    "nl": "Nagaland",
+    "od": "Odisha",
+    "or": "Odisha",
+    "pb": "Punjab",
+    "py": "Puducherry",
+    "rj": "Rajasthan",
+    "sk": "Sikkim",
+    "tg": "Telangana",
+    "tn": "Tamil Nadu",
+    "tr": "Tripura",
+    "ts": "Telangana",
+    "uk": "Uttarakhand",
+    "up": "Uttar Pradesh",
+    "ut": "Uttarakhand",
+    "wb": "West Bengal",
+}
+_TRAILING_GEO_CODE_TOKENS = {
+    "br",
+    "branch",
+    "city",
+    "code",
+    "dist",
+    "district",
+    "no",
+    "nos",
+    "reg",
+    "region",
+    "st",
+    "state",
+    "zone",
+}
+_TRAILING_STATE_CODES = set(_STATE_CODE_TO_NAME.keys())
+_TRAILING_CITY_CODES = set(_STATE_CODE_TO_NAME.keys()) | _TRAILING_GEO_CODE_TOKENS
+
+
+def _canonical_geo_label(value: Any, *, kind: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    cleaned = (
+        raw
+        .replace("_", " ")
+        .replace("/", " ")
+        .replace("\\", " ")
+    )
+    cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+    cleaned = re.sub(r"\s*-\s*", " ", cleaned)
+    cleaned = re.sub(r"[^0-9A-Za-z& ]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+
+    tokens = [token for token in cleaned.split(" ") if token]
+    if not tokens:
+        return ""
+
+    while len(tokens) > 1 and re.fullmatch(r"\d{1,4}", tokens[0] or ""):
+        tokens = tokens[1:]
+
+    if not tokens:
+        return ""
+
+    if kind in {"state", "region"} and len(tokens) == 1:
+        mapped = _STATE_CODE_TO_NAME.get(tokens[0].lower())
+        if mapped:
+            return mapped
+
+    if kind in {"state", "region"}:
+        trailing_codes = _TRAILING_STATE_CODES | _TRAILING_GEO_CODE_TOKENS
+    else:
+        trailing_codes = _TRAILING_CITY_CODES
+
+    while len(tokens) > 1:
+        last = tokens[-1]
+        last_low = last.lower()
+        alpha_num_suffix = re.fullmatch(r"([A-Za-z&]{2,})\d{1,4}", last)
+        if alpha_num_suffix:
+            tokens[-1] = alpha_num_suffix.group(1)
+            continue
+        if re.fullmatch(r"\d{1,4}", last):
+            tokens = tokens[:-1]
+            continue
+        if re.fullmatch(r"[A-Za-z]{1,3}\d{1,4}", last):
+            tokens = tokens[:-1]
+            continue
+        if last_low in trailing_codes:
+            tokens = tokens[:-1]
+            continue
+        break
+
+    canonical = re.sub(r"\s+", " ", " ".join(tokens)).strip()
+    if not canonical or canonical in _MISSING_LABELS:
+        return ""
+    return canonical.title()
+
+
+def _canonical_geo_series(series: pd.Series, *, kind: str) -> pd.Series:
+    out = (
+        series
+        .astype(str)
+        .map(lambda value: _canonical_geo_label(value, kind=kind))
+        .replace({k: pd.NA for k in _MISSING_LABELS})
+    )
+    return out.where(out.fillna("").astype(str).str.strip() != "", pd.NA)
+
+
+def _normalize_geo_for_match(value: Any, *, kind: str) -> str:
+    canonical = _canonical_geo_label(value, kind=kind)
+    seed = canonical if canonical else str(value or "")
+    return _normalize_bucket_value(seed)
+
+
+def _collapse_geo_for_match(value: Any, *, kind: str) -> str:
+    canonical = _canonical_geo_label(value, kind=kind)
+    seed = canonical if canonical else str(value or "")
+    return _collapse_bucket_value(seed)
+
+
+def _state_match_mask(series: pd.Series, selected_state: str) -> pd.Series:
+    normalized_series = series.map(lambda value: _normalize_geo_for_match(value, kind="state"))
+    compact_series = series.map(lambda value: _collapse_geo_for_match(value, kind="state"))
+    selected_norm = _normalize_geo_for_match(selected_state, kind="state")
+    selected_compact = _collapse_geo_for_match(selected_state, kind="state")
+
+    mask = normalized_series == selected_norm
+    if not mask.any() and selected_compact:
+        mask = compact_series == selected_compact
+    return mask
+
+
+def _normalize_dimension_rows(
+    rows: list[dict[str, Any]] | None,
+    *,
+    dimension: str,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    dim_key = _to_safe_key(dimension)
+    if dim_key in {"state", "region"}:
+        kind = "state"
+        alias_keys = {"state", "region"}
+    elif dim_key == "city":
+        kind = "city"
+        alias_keys = {"city"}
+    else:
+        return rows
+
+    merged: dict[str, dict[str, Any]] = {}
+    ordered: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+        dim_col = next((safe_map.get(key) for key in alias_keys if safe_map.get(key) is not None), None)
+        raw_label = row.get(dim_col) if dim_col is not None else row.get(dimension)
+        canonical_label = _canonical_geo_label(raw_label, kind=kind)
+        if not canonical_label:
+            continue
+
+        bucket = _collapse_bucket_value(canonical_label)
+        if bucket not in merged:
+            merged[bucket] = {dim_key: canonical_label}
+            ordered.append(bucket)
+        target = merged[bucket]
+
+        for key, value in row.items():
+            if _to_safe_key(str(key)) in alias_keys:
+                continue
+            try:
+                numeric = float(value)
+                if pd.notna(numeric):
+                    target[key] = float(target.get(key, 0.0) or 0.0) + numeric
+                    continue
+            except Exception:
+                pass
+
+            if key not in target and value is not None:
+                text = str(value).strip()
+                if text:
+                    target[key] = value
+
+    return [merged[key] for key in ordered]
+
+
+def _find_column(
+    df: pd.DataFrame,
+    candidates: list[str],
+    skip: set[str] | None = None,
+) -> str | None:
+    if df is None or df.empty:
+        return None
+    skip = skip or set()
+    normalized: dict[str, str] = {}
+    for col in df.columns:
+        col_name = str(col)
+        if col_name in skip:
+            continue
+        normalized[_normalize_lookup_key(col_name)] = col_name
+
+    for candidate in candidates:
+        key = _normalize_lookup_key(candidate)
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _load_city_breakdown_dataframe(
+    db: Session,
+    job_id: str | None,
+    resolved_source: str,
+    dataset_type: str,
+) -> pd.DataFrame:
+    if resolved_source == "samsung":
+        frames: list[pd.DataFrame] = []
+        for src in ["samsung_vs", "samsung_croma"]:
+            frame = get_dataframe(
+                db=db,
+                job_id=job_id,
+                source=src,
+                dataset_type=dataset_type,
+            )
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return get_dataframe(
+                db=db,
+                job_id=job_id,
+                source=resolved_source,
+                dataset_type=dataset_type,
+            )
+        if len(frames) == 1:
+            return frames[0]
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    return get_dataframe(
+        db=db,
+        job_id=job_id,
+        source=resolved_source,
+        dataset_type=dataset_type,
+    )
+
+
+def _to_numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    return pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+
+
+def _metric_series_for_city_breakdown(
+    df: pd.DataFrame,
+    metric: str,
+) -> pd.Series | None:
+    metric_key = _to_safe_key(metric)
+
+    if metric_key == "quantity":
+        return pd.Series(1.0, index=df.index, dtype="float64")
+
+    if metric_key == "gross_premium":
+        col = _find_column(
+            df,
+            [
+                "Amount",
+                "Gross Premium",
+                "gross_premium",
+                "Plan Selling Price",
+                "Customer Premium",
+            ],
+        )
+        return _to_numeric_series(df, col) if col else None
+
+    if metric_key == "earned_premium":
+        col = _find_column(
+            df,
+            [
+                "Earned Premium",
+                "earned_premium",
+                "Earned_Amount",
+                "Earned Amount",
+            ],
+        )
+        if col:
+            return _to_numeric_series(df, col)
+        fallback = _find_column(df, ["Amount", "Gross Premium", "Plan Selling Price"])
+        return _to_numeric_series(df, fallback) if fallback else None
+
+    if metric_key == "zopper_earned_premium":
+        col = _find_column(
+            df,
+            [
+                "earned_zopper",
+                "Zopper Earned Premium",
+                "zopper_earned_premium",
+                "Zopper_Share_EP",
+                "Zopper Share EP",
+                "Zopper Share",
+                "Zopper Shared ( Transfer Price )",
+            ],
+        )
+        return _to_numeric_series(df, col) if col else None
+
+    if metric_key in {"claims", "net_claims"}:
+        claims_col = _find_column(
+            df,
+            [
+                "Net Amount",
+                "Net_Amount",
+                "Claim Amount",
+                "Claim_Amount",
+                "Zopper's Cost",
+                "Zoppers Cost",
+            ],
+        )
+        if not claims_col:
+            return None
+        claims = _to_numeric_series(df, claims_col)
+        if metric_key == "claims":
+            return claims
+
+        otd_col = _find_column(
+            df,
+            [
+                "OTD Amount",
+                "OTD_Amount",
+                "One time deductible",
+                "One Time Deductible",
+            ],
+        )
+        if not otd_col:
+            return claims
+        return claims - _to_numeric_series(df, otd_col)
+
+    # Pie charting by loss ratio can be misleading; skip when source rows do not
+    # carry a stable precomputed denominator.
+    if metric_key == "loss_ratio":
+        return None
+
+    metric_col = _find_column(df, [metric])
+    return _to_numeric_series(df, metric_col) if metric_col else None
+
+
+_STATE_COLUMN_CANDIDATES = [
+    "State",
+    "State Name",
+    "State_Name",
+    "State/UT",
+    "State_UT",
+    "State_UT_Name",
+    "Customer_State",
+    "Customer State",
+    "Region",
+    "Region Name",
+    "Region_Name",
+    "Zone",
+    "Location",
+    "State / City",
+    "State/City",
+]
+
+
+def _filter_df_by_state(df: pd.DataFrame, state: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    state_col = _find_column(df, _STATE_COLUMN_CANDIDATES)
+    if not state_col:
+        return df.iloc[0:0]
+
+    state_series = df[state_col].astype(str).str.strip()
+    mask = _state_match_mask(state_series, state)
+
+    if not mask.any() and "-" in str(state):
+        fallback_state = str(state).split("-", 1)[0].strip()
+        mask = _state_match_mask(state_series, fallback_state)
+
+    return df[mask].copy()
+
+
+def _resolve_category_dimension_column(df: pd.DataFrame, dimension: str) -> str | None:
+    dim_key = _to_safe_key(dimension)
+    if dim_key == "plan_category":
+        return _find_column(
+            df,
+            [
+                "Plan Category",
+                "Plan_Category",
+                "Plan Type",
+                "Plan_Type",
+                "Warranty Type",
+                "Warranty_Type",
+                "Product Category",
+                "Product_Category",
+                "Category",
+            ],
+        )
+
+    if dim_key == "device_plan_category":
+        return _find_column(
+            df,
+            [
+                "Device Plan Category",
+                "Device_Plan_Category",
+                "Device Category",
+                "Device_Category",
+                "Product Brand(Group)",
+                "Product Brand (Group)",
+                "Product Brand",
+                "Brand",
+                "Item_Brand",
+                "Plan_Category",
+                "Plan Category",
+                "Category",
+            ],
+        )
+    return None
+
+
+def _rows_have_non_zero_metric(
+    rows: list[dict[str, Any]] | None,
+    metric: str,
+) -> bool:
+    if not rows:
+        return False
+    metric_key = _to_safe_key(metric)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+        metric_col = safe_map.get(metric_key) or safe_map.get(_to_safe_key(metric))
+        raw = row.get(metric_col) if metric_col is not None else row.get(metric)
+        try:
+            value = float(raw or 0)
+        except Exception:
+            value = 0.0
+        if pd.notna(value) and abs(value) > 1e-12:
+            return True
+    return False
+
+
+def _load_godrej_claims_dataframe(
+    *,
+    db: Session,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+):
+    engine_cls = ENGINE_REGISTRY.get("godrej")
+    if engine_cls is None:
+        return None, pd.DataFrame()
+    engine = engine_cls(
+        db=db,
+        job_id=job_id,
+        source="godrej",
+        dataset_type="claims",
+        from_date=from_date,
+        to_date=to_date,
+    )
+    data = engine.load_data(include_sales=False, include_claims=True)
+    df = data.get("claims", pd.DataFrame())
+    return engine, df
+
+
+def _godrej_claims_metric_series(df: pd.DataFrame, metric: str, engine) -> pd.Series | None:
+    metric_key = _to_safe_key(metric)
+    if metric_key == "quantity":
+        return pd.Series(1.0, index=df.index, dtype="float64")
+    if metric_key in {"claims", "net_claims"}:
+        return pd.to_numeric(engine._claim_amount_series(df), errors="coerce").fillna(0.0)
+    if metric_key == "loss_ratio":
+        return None
+    return None
+
+
+def _godrej_claims_state_series(df: pd.DataFrame, engine) -> pd.Series | None:
+    state_col = _find_column(
+        df,
+        [
+            "State",
+            "Customer_State",
+            "Customer State",
+            "Region",
+            "Region Name",
+            "Region_Name",
+            "Branch",
+            "Branch Name",
+            "City",
+            "Customer City",
+            "Customer_City",
+        ],
+    )
+    if not state_col:
+        return None
+
+    state_series = _canonical_geo_series(engine._canonical_state(df[state_col]), kind="state")
+    state_series = state_series.where(~state_series.fillna("").map(engine._is_identifier_like), pd.NA)
+    state_series = state_series.where(~state_series.fillna("").str.lower().isin({"unknown", "0"}), pd.NA)
+    return state_series
+
+
+def _godrej_claims_city_series(df: pd.DataFrame, engine) -> pd.Series | None:
+    city_col = _find_column(
+        df,
+        [
+            "Customer_City",
+            "Customer City",
+            "City",
+            "Branch",
+            "Branch Name",
+            "Store Name",
+            "State / City",
+            "State/City",
+            "Location",
+        ],
+    )
+    if not city_col:
+        return None
+
+    city_series = _canonical_geo_series(df[city_col], kind="city")
+    city_series = city_series.where(~city_series.fillna("").map(engine._is_identifier_like), pd.NA)
+    return city_series
+
+
 def _bounds_from_columns(df: pd.DataFrame, columns: list[str]) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     if df is None or df.empty:
         return None, None
@@ -134,6 +699,7 @@ def compute_by_dimension_rows(
     metric: str,
     source: str,
     dataset_type: str,
+    bucket: str | None = None,
     from_date: str | None,
     to_date: str | None,
 ) -> list[dict[str, Any]]:
@@ -185,6 +751,23 @@ def compute_by_dimension_rows(
                         merged[key][out_key] = 0.0
 
             def _fetch_and_merge(src: str, out_key: str):
+                partner_cached = get_precomputed_graph(
+                    db=db,
+                    source=src,
+                    dataset_type=dataset_type,
+                    job_id=job_id,
+                    dimension=dimension,
+                    metric=metric,
+                    bucket=bucket,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                # Empty cached payloads are stale for samsung overview merges.
+                # Fall back to live engine compute so one missing partner cache
+                # does not zero out compare rows for broad date ranges.
+                if partner_cached is not None and len(partner_cached) > 0:
+                    _merge(partner_cached, out_key)
+                    return
                 try:
                     engine = engine_cls(
                         db=db,
@@ -211,7 +794,7 @@ def compute_by_dimension_rows(
 
             if dim_key in {"month", "date"}:
                 out_rows.sort(key=lambda r: str(r.get(dim_key, "")))
-            return out_rows
+            return _normalize_dimension_rows(out_rows, dimension=dimension)
 
         engine = engine_cls(
             db=db,
@@ -225,7 +808,7 @@ def compute_by_dimension_rows(
             dimension=dimension,
             metric=metric,
         )
-        return out
+        return _normalize_dimension_rows(out, dimension=dimension)
 
     df = get_dataframe(
         db=db,
@@ -261,7 +844,8 @@ def compute_by_dimension_rows(
     if out_df is None or out_df.empty:
         return []
 
-    return out_df.to_dict(orient="records")
+    out_rows = out_df.to_dict(orient="records")
+    return _normalize_dimension_rows(out_rows, dimension=dimension)
 
 
 @router.get("/by-dimension")
@@ -271,6 +855,7 @@ def analytics_by_dimension(
     metric: str = Query(...),
     source: str = Query(...),
     dataset_type: str = Query(...),
+    bucket: str | None = Query(None),
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
     db: Session = Depends(get_db),
@@ -280,6 +865,10 @@ def analytics_by_dimension(
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
 
+    bucket_key = (bucket or "").strip().lower() or None
+    if bucket_key not in {None, "day", "week", "month"}:
+        bucket_key = None
+
     cached = get_precomputed_graph(
         db=db,
         source=resolved_source,
@@ -287,12 +876,17 @@ def analytics_by_dimension(
         job_id=job_id,
         dimension=dimension,
         metric=metric,
+        bucket=bucket_key,
         from_date=from_date,
         to_date=to_date,
     )
     if cached is not None and len(cached) > 0:
         is_stale_cached_shape = False
         is_stale_zero_metric = False
+        is_stale_samsung_partner_mismatch = False
+        is_stale_godrej_legacy_region = False
+        is_stale_godrej_claims_range_mismatch = False
+        is_stale_godrej_sales_month_mismatch = False
         metric_key = _to_safe_key(metric or "")
         dimension_key = _to_safe_key(dimension or "")
         if isinstance(cached[0], dict):
@@ -307,6 +901,84 @@ def analytics_by_dimension(
                 is_stale_cached_shape = True
             if metric_key and metric_key not in row_keys and not is_samsung_overview_shape:
                 is_stale_cached_shape = True
+
+        if resolved_source == "samsung":
+            merged_dim_values: set[str] = set()
+            merged_partner_totals = {"samsung_vs": 0.0, "samsung_croma": 0.0}
+
+            for row in cached:
+                if not isinstance(row, dict):
+                    continue
+                safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                dim_col = safe_map.get(dimension_key) or safe_map.get(_to_safe_key(dimension or ""))
+                if dim_col is None:
+                    if dimension_key == "plan_category":
+                        dim_col = safe_map.get("device_plan_category")
+                    elif dimension_key == "device_plan_category":
+                        dim_col = safe_map.get("plan_category")
+                dim_val = row.get(dim_col) if dim_col is not None else row.get(dimension)
+                if dim_val is not None:
+                    merged_dim_values.add(str(dim_val))
+
+                for partner_key in ("samsung_vs", "samsung_croma"):
+                    try:
+                        partner_value = float(row.get(partner_key, 0) or 0)
+                    except Exception:
+                        partner_value = 0.0
+                    if pd.notna(partner_value):
+                        merged_partner_totals[partner_key] += abs(partner_value)
+
+            def _partner_snapshot(partner_source: str) -> tuple[set[str], bool]:
+                partner_rows = get_precomputed_graph(
+                    db=db,
+                    source=partner_source,
+                    dataset_type=normalized_dataset,
+                    job_id=job_id,
+                    dimension=dimension,
+                    metric=metric,
+                    bucket=bucket_key,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                if partner_rows is None:
+                    return set(), False
+
+                partner_dims: set[str] = set()
+                has_non_zero = False
+                for prow in partner_rows:
+                    if not isinstance(prow, dict):
+                        continue
+                    safe_map = {_to_safe_key(str(k)): k for k in prow.keys()}
+                    dim_col = safe_map.get(dimension_key) or safe_map.get(_to_safe_key(dimension or ""))
+                    if dim_col is None:
+                        if dimension_key == "plan_category":
+                            dim_col = safe_map.get("device_plan_category")
+                        elif dimension_key == "device_plan_category":
+                            dim_col = safe_map.get("plan_category")
+                    dim_val = prow.get(dim_col) if dim_col is not None else prow.get(dimension)
+                    if dim_val is not None:
+                        partner_dims.add(str(dim_val))
+
+                    metric_col = safe_map.get(metric_key) or safe_map.get(_to_safe_key(metric or ""))
+                    raw_metric = prow.get(metric_col) if metric_col is not None else prow.get(metric)
+                    try:
+                        metric_value = float(raw_metric or 0)
+                    except Exception:
+                        metric_value = 0.0
+                    if pd.notna(metric_value) and abs(metric_value) > 1e-12:
+                        has_non_zero = True
+
+                return partner_dims, has_non_zero
+
+            vs_dims, vs_has_non_zero = _partner_snapshot("samsung_vs")
+            croma_dims, croma_has_non_zero = _partner_snapshot("samsung_croma")
+
+            if (vs_dims - merged_dim_values) or (croma_dims - merged_dim_values):
+                is_stale_samsung_partner_mismatch = True
+            if vs_has_non_zero and merged_partner_totals["samsung_vs"] <= 1e-12:
+                is_stale_samsung_partner_mismatch = True
+            if croma_has_non_zero and merged_partner_totals["samsung_croma"] <= 1e-12:
+                is_stale_samsung_partner_mismatch = True
 
         if (
             resolved_source == "godrej"
@@ -335,6 +1007,7 @@ def analytics_by_dimension(
                     job_id=job_id,
                     dimension=dimension,
                     metric="quantity",
+                    bucket=bucket_key,
                     from_date=from_date,
                     to_date=to_date,
                 )
@@ -352,8 +1025,100 @@ def analytics_by_dimension(
                 if any(v > 0 for v in quantity_values):
                     is_stale_zero_metric = True
 
-        if is_stale_cached_shape or is_stale_zero_metric:
-            reason = "shape" if is_stale_cached_shape else "all_zero_metric"
+        if (
+            resolved_source == "godrej"
+            and normalized_dataset == "claims"
+            and dimension_key in {"state", "region"}
+        ):
+            godrej_cls = ENGINE_REGISTRY.get("godrej")
+            alias_map = {
+                _normalize_bucket_value(k): str(v).strip()
+                for k, v in getattr(godrej_cls, "STATE_ALIAS_MAP", {}).items()
+            }
+            for row in cached:
+                if not isinstance(row, dict):
+                    continue
+                safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                dim_col = safe_map.get(dimension_key) or safe_map.get(_to_safe_key(dimension or ""))
+                raw_dim = row.get(dim_col) if dim_col is not None else row.get(dimension)
+                if raw_dim is None:
+                    continue
+                raw_label = str(raw_dim).strip()
+                normalized_label = _normalize_bucket_value(raw_label)
+                mapped_label = alias_map.get(normalized_label)
+                if mapped_label and _normalize_bucket_value(mapped_label) != normalized_label:
+                    is_stale_godrej_legacy_region = True
+                    break
+
+        if (
+            resolved_source == "godrej"
+            and normalized_dataset == "claims"
+            and (from_date or to_date)
+            and dimension_key in {"state", "region", "channel", "product_category"}
+            and _rows_have_non_zero_metric(cached, metric)
+        ):
+            month_quantity_cached = get_precomputed_graph(
+                db=db,
+                source=resolved_source,
+                dataset_type=normalized_dataset,
+                job_id=job_id,
+                dimension="month",
+                metric="quantity",
+                bucket=bucket_key,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            if month_quantity_cached is not None and not _rows_have_non_zero_metric(month_quantity_cached, "quantity"):
+                is_stale_godrej_claims_range_mismatch = True
+
+        if (
+            resolved_source == "godrej"
+            and normalized_dataset == "sales"
+            and dimension_key == "month"
+            and from_date
+        ):
+            from_dt = pd.to_datetime(from_date, errors="coerce")
+            if from_dt is not None and from_dt is not pd.NaT:
+                from_month = pd.Timestamp(from_dt).to_period("M").to_timestamp()
+                month_points: list[pd.Timestamp] = []
+                for row in cached:
+                    if not isinstance(row, dict):
+                        continue
+                    safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                    month_col = safe_map.get("month") or safe_map.get(dimension_key)
+                    raw_month = row.get(month_col) if month_col is not None else row.get("month")
+                    if raw_month is None:
+                        continue
+                    parsed = pd.to_datetime(raw_month, errors="coerce")
+                    if pd.isna(parsed):
+                        continue
+                    month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+
+                if month_points:
+                    cached_min_month = min(month_points)
+                    if from_month < cached_min_month:
+                        is_stale_godrej_sales_month_mismatch = True
+
+        if (
+            is_stale_cached_shape
+            or is_stale_zero_metric
+            or is_stale_samsung_partner_mismatch
+            or is_stale_godrej_legacy_region
+            or is_stale_godrej_claims_range_mismatch
+            or is_stale_godrej_sales_month_mismatch
+        ):
+            if is_stale_cached_shape:
+                reason = "shape"
+            elif is_stale_zero_metric:
+                reason = "all_zero_metric"
+            elif is_stale_godrej_legacy_region:
+                reason = "godrej_legacy_region"
+            elif is_stale_godrej_claims_range_mismatch:
+                reason = "godrej_range_mismatch"
+            elif is_stale_godrej_sales_month_mismatch:
+                reason = "godrej_sales_month_mismatch"
+            else:
+                reason = "samsung_partner_mismatch"
             logger.warning(
                 "Stale precomputed graph detected (%s); recomputing live source=%s dataset=%s dimension=%s metric=%s",
                 reason,
@@ -363,16 +1128,17 @@ def analytics_by_dimension(
                 metric,
             )
         else:
+            normalized_cached = _normalize_dimension_rows(cached, dimension=dimension)
             logger.info(
                 "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=precomputed rows=%s duration_ms=%.2f",
                 source,
                 dataset_type,
                 dimension,
                 metric,
-                len(cached),
+                len(normalized_cached),
                 (time.perf_counter() - started) * 1000,
             )
-            return cached
+            return normalized_cached
     if cached == [] and resolved_source.startswith("samsung"):
         logger.warning(
             "Empty precomputed samsung graph detected; recomputing live source=%s dataset=%s dimension=%s metric=%s from=%s to=%s",
@@ -391,6 +1157,7 @@ def analytics_by_dimension(
             metric=metric,
             source=source,
             dataset_type=normalized_dataset,
+            bucket=bucket_key,
             from_date=from_date,
             to_date=to_date,
         )
@@ -421,6 +1188,7 @@ def analytics_by_dimension(
             job_id=job_id,
             dimension=dimension,
             metric=metric,
+            bucket=bucket_key,
             from_date=from_date,
             to_date=to_date,
             rows=out,
@@ -436,6 +1204,562 @@ def analytics_by_dimension(
             metric,
         )
     return out
+
+
+@router.get("/city-breakdown")
+def analytics_city_breakdown(
+    state: str = Query(...),
+    metric: str = Query(...),
+    source: str = Query(...),
+    dataset_type: str = Query(...),
+    job_id: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    limit: int = Query(40, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    from_date, to_date = _sanitize_range(from_date, to_date)
+    normalized_dataset = (dataset_type or "").strip().lower()
+    resolved_source, _ = _normalize_source(source)
+
+    if resolved_source == "godrej" and normalized_dataset == "claims":
+        engine, df = _load_godrej_claims_dataframe(
+            db=db,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        if df is None or df.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": "No rows available for this source.",
+            }
+
+        scoped = engine._apply_date_filter(df, "claims")
+        if scoped is None or scoped.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": "No rows available for the selected date range.",
+            }
+
+        state_series = _godrej_claims_state_series(scoped, engine)
+        if state_series is None:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": "State column is not available in this dataset.",
+            }
+
+        scoped = scoped.copy()
+        scoped["_state"] = state_series
+        scoped = scoped[scoped["_state"].notna()].copy()
+        if scoped.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": "State column is not available in this dataset.",
+            }
+
+        mask = _state_match_mask(scoped["_state"].astype(str), state)
+
+        scoped = scoped[mask].copy()
+        if scoped.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": f"No rows found for state '{state}'.",
+            }
+
+        city_series = _godrej_claims_city_series(scoped, engine)
+        if city_series is None:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": "City column is not available in this dataset.",
+            }
+
+        metric_values = _godrej_claims_metric_series(scoped, metric, engine)
+        if metric_values is None:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": f"Metric '{metric}' is unavailable for city breakdown.",
+            }
+
+        scoped["_city"] = city_series
+        scoped["_value"] = pd.to_numeric(metric_values, errors="coerce").fillna(0.0).clip(lower=0.0)
+        scoped = scoped[scoped["_city"].notna()].copy()
+        if scoped.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": f"No city rows found for state '{state}'.",
+            }
+
+        out = (
+            scoped.groupby("_city", dropna=False)["_value"]
+            .sum()
+            .reset_index()
+            .rename(columns={"_city": "city", "_value": "value"})
+            .sort_values("value", ascending=False)
+            .head(limit)
+        )
+        if out.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": f"No city values found for state '{state}'.",
+            }
+
+        rows = [
+            {"city": str(row["city"]), "value": float(row["value"] or 0.0)}
+            for _, row in out.iterrows()
+        ]
+        total = float(sum(item["value"] for item in rows))
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": rows,
+            "total": total,
+        }
+
+    df = _load_city_breakdown_dataframe(
+        db=db,
+        job_id=job_id,
+        resolved_source=resolved_source,
+        dataset_type=normalized_dataset,
+    )
+    if df is None or df.empty:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": "No rows available for this source.",
+        }
+
+    scoped = filter_by_date_range(df, normalized_dataset, from_date, to_date)
+    if scoped is None or scoped.empty:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": "No rows available for the selected date range.",
+        }
+
+    state_col = _find_column(scoped, _STATE_COLUMN_CANDIDATES)
+    if not state_col:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": "State column is not available in this dataset.",
+        }
+
+    city_col = _find_column(
+        scoped,
+        [
+            "City",
+            "City Name",
+            "City_Name",
+            "Customer City",
+            "Customer_City",
+            "District",
+            "Town",
+            "Store City",
+            "Store_City",
+            "Branch City",
+            "Branch_City",
+            "Location City",
+            "Location_City",
+            "Branch",
+            "Location",
+            "State / City",
+            "State/City",
+        ],
+        skip={state_col},
+    )
+    if not city_col:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": "City column is not available in this dataset.",
+        }
+
+    scoped = _filter_df_by_state(scoped, state)
+    if scoped.empty:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": f"No rows found for state '{state}'.",
+        }
+
+    metric_values = _metric_series_for_city_breakdown(scoped, metric)
+    if metric_values is None:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": f"Metric '{metric}' is unavailable for city breakdown.",
+        }
+
+    city_series = _canonical_geo_series(scoped[city_col], kind="city")
+
+    scoped["_city"] = city_series
+    scoped["_value"] = pd.to_numeric(metric_values, errors="coerce").fillna(0.0)
+    scoped = scoped[scoped["_city"].notna()].copy()
+    if scoped.empty:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": f"No city rows found for state '{state}'.",
+        }
+
+    # Pie charts expect non-negative values for intelligible slices.
+    scoped["_value"] = scoped["_value"].clip(lower=0.0)
+    out = (
+        scoped.groupby("_city", dropna=False)["_value"]
+        .sum()
+        .reset_index()
+        .rename(columns={"_city": "city", "_value": "value"})
+        .sort_values("value", ascending=False)
+        .head(limit)
+    )
+    if out.empty:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": f"No city values found for state '{state}'.",
+        }
+
+    rows = [
+        {"city": str(row["city"]), "value": float(row["value"] or 0.0)}
+        for _, row in out.iterrows()
+    ]
+    total = float(sum(item["value"] for item in rows))
+    return {
+        "state": state,
+        "metric": metric,
+        "rows": rows,
+        "total": total,
+    }
+
+
+@router.get("/category-percentage")
+def analytics_category_percentage(
+    dimension: str = Query(...),
+    source: str = Query(...),
+    dataset_type: str = Query(...),
+    metric: str = Query("quantity"),
+    state: str | None = Query(None),
+    job_id: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    from_date, to_date = _sanitize_range(from_date, to_date)
+    normalized_dataset = (dataset_type or "").strip().lower()
+    resolved_source, _ = _normalize_source(source)
+    dim_key = _to_safe_key(dimension)
+    if dim_key not in {"plan_category", "device_plan_category"}:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": "Only plan_category and device_plan_category are supported.",
+        }
+
+    if resolved_source == "godrej" and normalized_dataset == "claims":
+        engine, df = _load_godrej_claims_dataframe(
+            db=db,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        if df is None or df.empty:
+            return {
+                "dimension": dim_key,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": "No rows available for this source.",
+            }
+
+        scoped = engine._apply_date_filter(df, "claims")
+        if scoped is None or scoped.empty:
+            return {
+                "dimension": dim_key,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": "No rows available for the selected date range.",
+            }
+
+        if state is not None and str(state).strip() != "":
+            state_series = _godrej_claims_state_series(scoped, engine)
+            if state_series is None:
+                return {
+                    "dimension": dim_key,
+                    "metric": metric,
+                    "state": state,
+                    "rows": [],
+                    "message": "State column is not available in this dataset.",
+                }
+            scoped = scoped.copy()
+            scoped["_state"] = state_series
+            scoped = scoped[scoped["_state"].notna()].copy()
+            if scoped.empty:
+                return {
+                    "dimension": dim_key,
+                    "metric": metric,
+                    "state": state,
+                    "rows": [],
+                    "message": f"No rows found for state '{state}'.",
+                }
+
+            mask = _state_match_mask(scoped["_state"].astype(str), state)
+
+            scoped = scoped[mask].copy()
+            if scoped.empty:
+                return {
+                    "dimension": dim_key,
+                    "metric": metric,
+                    "state": state,
+                    "rows": [],
+                    "message": f"No rows found for state '{state}'.",
+                }
+
+        if dim_key == "plan_category":
+            dim_col = _find_column(
+                scoped,
+                [
+                    "Plan Category",
+                    "Plan_Category",
+                    "Product_Category",
+                    "Product Category",
+                    "Category",
+                    "Type",
+                ],
+            )
+        else:
+            dim_col = _find_column(
+                scoped,
+                [
+                    "Device Plan Category",
+                    "Device_Plan_Category",
+                    "Product_Category",
+                    "Product Category",
+                    "Type",
+                    "Item Description",
+                    "Appliance Model Name",
+                    "item",
+                    "Category",
+                ],
+            )
+        if not dim_col:
+            return {
+                "dimension": dim_key,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": f"{dimension} column is not available in this dataset.",
+            }
+
+        metric_values = _godrej_claims_metric_series(scoped, metric, engine)
+        if metric_values is None:
+            return {
+                "dimension": dim_key,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": f"Metric '{metric}' is unavailable for this percentage breakdown.",
+            }
+
+        labels = (
+            scoped[dim_col]
+            .astype(str)
+            .str.strip()
+            .str.replace(r"\s+", " ", regex=True)
+            .replace(
+                {
+                    "": pd.NA,
+                    "nan": pd.NA,
+                    "none": pd.NA,
+                    "null": pd.NA,
+                    "NaN": pd.NA,
+                    "None": pd.NA,
+                    "NULL": pd.NA,
+                }
+            )
+        )
+        labels = labels.where(~labels.fillna("").map(engine._is_identifier_like), pd.NA)
+
+        scoped = scoped.copy()
+        scoped["_label"] = labels
+        scoped["_value"] = pd.to_numeric(metric_values, errors="coerce").fillna(0.0).clip(lower=0.0)
+        scoped = scoped[scoped["_label"].notna()].copy()
+        if scoped.empty:
+            return {
+                "dimension": dim_key,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": f"No valid values found for {dimension}.",
+            }
+
+        out = (
+            scoped.groupby("_label", dropna=False)["_value"]
+            .sum()
+            .reset_index()
+            .rename(columns={"_label": "label", "_value": "value"})
+            .sort_values("value", ascending=False)
+            .head(limit)
+        )
+        total = float(pd.to_numeric(out["value"], errors="coerce").fillna(0).sum()) if not out.empty else 0.0
+        rows = [
+            {
+                "label": str(row["label"]),
+                "value": float(row["value"] or 0.0),
+                "percentage": float((float(row["value"] or 0.0) / total) * 100) if total > 0 else 0.0,
+            }
+            for _, row in out.iterrows()
+        ]
+
+        return {
+            "dimension": dim_key,
+            "metric": metric,
+            "state": state,
+            "total": total,
+            "rows": rows,
+        }
+
+    df = _load_city_breakdown_dataframe(
+        db=db,
+        job_id=job_id,
+        resolved_source=resolved_source,
+        dataset_type=normalized_dataset,
+    )
+    if df is None or df.empty:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": "No rows available for this source.",
+        }
+
+    scoped = filter_by_date_range(df, normalized_dataset, from_date, to_date)
+    if scoped is None or scoped.empty:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": "No rows available for the selected date range.",
+        }
+
+    if state is not None and str(state).strip() != "":
+        scoped = _filter_df_by_state(scoped, str(state))
+        if scoped.empty:
+            return {
+                "dimension": dimension,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": f"No rows found for state '{state}'.",
+            }
+
+    dim_col = _resolve_category_dimension_column(scoped, dim_key)
+    if not dim_col:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": f"{dimension} column is not available in this dataset.",
+        }
+
+    metric_values = _metric_series_for_city_breakdown(scoped, metric)
+    if metric_values is None:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": f"Metric '{metric}' is unavailable for this percentage breakdown.",
+        }
+
+    labels = (
+        scoped[dim_col]
+        .astype(str)
+        .str.strip()
+        .replace(
+            {
+                "": pd.NA,
+                "nan": pd.NA,
+                "none": pd.NA,
+                "null": pd.NA,
+                "NaN": pd.NA,
+                "None": pd.NA,
+                "NULL": pd.NA,
+            }
+        )
+    )
+
+    scoped = scoped.copy()
+    scoped["_label"] = labels
+    scoped["_value"] = pd.to_numeric(metric_values, errors="coerce").fillna(0.0).clip(lower=0.0)
+    scoped = scoped[scoped["_label"].notna()].copy()
+    if scoped.empty:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": f"No valid values found for {dimension}.",
+        }
+
+    out = (
+        scoped.groupby("_label", dropna=False)["_value"]
+        .sum()
+        .reset_index()
+        .rename(columns={"_label": "label", "_value": "value"})
+        .sort_values("value", ascending=False)
+        .head(limit)
+    )
+    total = float(pd.to_numeric(out["value"], errors="coerce").fillna(0).sum()) if not out.empty else 0.0
+    rows = [
+        {
+            "label": str(row["label"]),
+            "value": float(row["value"] or 0.0),
+            "percentage": float((float(row["value"] or 0.0) / total) * 100) if total > 0 else 0.0,
+        }
+        for _, row in out.iterrows()
+    ]
+
+    return {
+        "dimension": dim_key,
+        "metric": metric,
+        "state": state,
+        "total": total,
+        "rows": rows,
+    }
 
 
 def compute_summary_values(
@@ -596,6 +1920,37 @@ def analytics_summary(
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
     force_live_summary = resolved_source == "godrej" and normalized_dataset == "sales"
+
+    if resolved_source == "samsung":
+        partner_rows: list[dict[str, Any]] = []
+        for partner_source in ["samsung_vs", "samsung_croma"]:
+            partner_summary = get_precomputed_summary(
+                db=db,
+                source=partner_source,
+                dataset_type=normalized_dataset,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            if partner_summary is None:
+                partner_rows = []
+                break
+            partner_rows.append(partner_summary)
+
+        if partner_rows:
+            merged = {
+                "gross_premium": float(sum(float(row.get("gross_premium", 0) or 0) for row in partner_rows)),
+                "earned_premium": float(sum(float(row.get("earned_premium", 0) or 0) for row in partner_rows)),
+                "zopper_earned_premium": float(sum(float(row.get("zopper_earned_premium", 0) or 0) for row in partner_rows)),
+                "units_sold": int(sum(int(row.get("units_sold", 0) or 0) for row in partner_rows)),
+            }
+            logger.info(
+                "TIMING analytics.summary source=%s dataset=%s mode=precomputed_partner_merge duration_ms=%.2f",
+                source,
+                dataset_type,
+                (time.perf_counter() - started) * 1000,
+            )
+            return merged
 
     cached = get_precomputed_summary(
         db=db,
@@ -816,15 +2171,25 @@ def analytics_date_bounds(
     db: Session = Depends(get_db),
 ):
     resolved_source, _ = _normalize_source(source)
+    dataset_key = (dataset_type or "").strip().lower()
 
     def _bounds_for_source(src: str):
         df = get_dataframe(
             db=db,
             job_id=job_id,
             source=src,
-            dataset_type=dataset_type,
+            dataset_type=dataset_key,
         )
-        if dataset_type == "sales":
+        src_key = (src or "").strip().lower()
+        if dataset_key == "sales" and src_key.startswith(("godrej", "goodrej", "goddrej")):
+            # Godrej sales uses Warranty Purchase Date as the primary reporting timeline.
+            purchase_min, purchase_max = _bounds_from_columns(df, ["Warranty Purchase Date"])
+            if purchase_min is not None or purchase_max is not None:
+                return purchase_min, purchase_max
+            product_purchase_min, product_purchase_max = _bounds_from_columns(df, ["Product Purchased Date"])
+            if product_purchase_min is not None or product_purchase_max is not None:
+                return product_purchase_min, product_purchase_max
+        if dataset_key == "sales":
             return _bounds_from_columns(
                 df,
                 [
@@ -832,9 +2197,23 @@ def analytics_date_bounds(
                     "Start Date",
                     "Plan Start Date",
                     "Warranty Start Date",
+                    "Warranty Start_Date",
+                    "Warranty Purchase Date",
+                    "Invoice_Date_",
+                    "Invoice Date",
+                    "Bill Created Date",
+                    "Payment_date",
+                    "Payment Date",
+                    "Month",
+                    "Month Name",
+                    "Month_Name",
                     "Date",
                 ],
             )
+        if (src or "").strip().lower().startswith("samsung"):
+            fiscal_min, fiscal_max = _bounds_from_columns(df, ["Fiscal Month"])
+            if fiscal_min is not None and fiscal_max is not None:
+                return fiscal_min, fiscal_max
         return _bounds_from_columns(
             df,
             [

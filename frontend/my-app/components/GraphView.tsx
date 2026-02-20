@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useId, useRef, useState } from "react"
+import { useReducedMotion } from "framer-motion"
 import {
   BarChart,
   Bar,
@@ -188,31 +189,6 @@ const sortTemporalRows = (rows: Row[], dimKey: string) =>
     return String(a[dimKey] ?? "").localeCompare(String(b[dimKey] ?? ""))
   })
 
-const filterByRange = (
-  rows: Row[],
-  dimKey: string,
-  fromDate?: string,
-  toDate?: string,
-  source?: string
-) => {
-  if (!rows.length) return rows
-  if (!fromDate && !toDate) return rows
-  if (!(dimKey.includes("month") || dimKey.includes("date"))) return rows
-
-  const clampFrom = source === "reliance" ? "2025-07-01" : null
-  const fromVal = fromDate || clampFrom
-  const from = fromVal ? new Date(fromVal).getTime() : null
-  const to = toDate ? new Date(toDate).getTime() : null
-
-  return rows.filter(r => {
-    const t = toTimeValue(r[dimKey])
-    if (Number.isNaN(t)) return false
-    if (from !== null && t < from) return false
-    if (to !== null && t > to) return false
-    return true
-  })
-}
-
 /* ---------- DATA FETCH ---------- */
 type FetchParams = {
   source: string
@@ -250,7 +226,8 @@ const normalizeApiBase = (value: string) => {
   const cleaned = value.replace(/\s+/g, "").replace(/^['"]+|['"]+$/g, "")
   const withoutMarker = cleaned.replace(/^-?NoNewline/i, "")
   const match = withoutMarker.match(/https?:\/\/.*/)
-  return match ? match[0] : withoutMarker
+  const normalized = match ? match[0] : withoutMarker
+  return normalized.replace(/\/+$/, "")
 }
 
 const API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE || DEFAULT_API_BASE)
@@ -259,10 +236,28 @@ const runtimeOverride =
     ? normalizeApiBase(new URLSearchParams(window.location.search).get("api") || "")
     : ""
 
+const browserOriginApiBases =
+  typeof window !== "undefined"
+    ? [
+        window.location.origin,
+        `${window.location.origin}/api`,
+      ]
+    : []
+
+const browserHostApiBases =
+  typeof window !== "undefined"
+    ? [
+        `${window.location.protocol}//${window.location.hostname}:8000`,
+        `http://${window.location.hostname}:8000`,
+      ]
+    : []
+
 const API_FALLBACKS = Array.from(
   new Set(
     [
       runtimeOverride,
+      ...browserOriginApiBases,
+      ...browserHostApiBases,
       API_BASE,
       "http://127.0.0.1:8000",
       "http://localhost:8000",
@@ -550,6 +545,7 @@ export default function GraphView({
   deferUntilVisible = false,
   onDataReady,
 }: Props) {
+  const prefersReducedMotion = useReducedMotion()
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [isVisible, setIsVisible] = useState(!deferUntilVisible)
   const [data, setData] = useState<Row[]>([])
@@ -767,6 +763,7 @@ export default function GraphView({
     data.some(row => row.ew_count != null)
 
   const isLossRatio = measure.includes("loss_ratio")
+  const isTemporalDimension = dimKey.includes("month") || dimKey.includes("date")
   const clampToZero = !isLossRatio || source === "reliance"
   const chartData: Row[] = clampToZero
     ? data.map((row) => {
@@ -783,9 +780,11 @@ export default function GraphView({
         return next
       })
     : data
+  const shouldAnimateBars = !prefersReducedMotion && chartData.length <= 36
+  const barAnimationDuration = shouldAnimateBars ? 500 : 0
 
   return (
-    <div ref={containerRef} className="h-72">
+    <div ref={containerRef} className="smooth-surface h-72">
       {compareMode && (
         <div className="flex items-center gap-3 text-[11px] font-semibold text-slate-500 mb-2">
           <span className="flex items-center gap-1.5">
@@ -819,12 +818,10 @@ export default function GraphView({
           <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
           <XAxis
             dataKey={dimKey}
+            interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
+            minTickGap={isTemporalDimension ? 16 : 8}
             tick={{ fontSize: 11 }}
-            tickFormatter={(v) =>
-              dimKey.includes("month") || dimKey.includes("date")
-                ? formatMonth(v)
-                : v
-            }
+            tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : v)}
           />
           <YAxis
             domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
@@ -840,8 +837,8 @@ export default function GraphView({
                 barSize={18}
                 radius={[8, 8, 2, 2]}
                 fill={`url(#${gradientId})`}
-                isAnimationActive
-                animationDuration={700}
+                isAnimationActive={shouldAnimateBars}
+                animationDuration={barAnimationDuration}
                 animationBegin={150}
               />
               <Bar
@@ -850,8 +847,8 @@ export default function GraphView({
                 barSize={18}
                 radius={[8, 8, 2, 2]}
                 fill={`url(#${gradientIdAlt})`}
-                isAnimationActive
-                animationDuration={700}
+                isAnimationActive={shouldAnimateBars}
+                animationDuration={barAnimationDuration}
                 animationBegin={250}
               />
             </>
@@ -863,8 +860,8 @@ export default function GraphView({
                 barSize={18}
                 radius={[8, 8, 2, 2]}
                 fill={`url(#${gradientId})`}
-                isAnimationActive
-                animationDuration={700}
+                isAnimationActive={shouldAnimateBars}
+                animationDuration={barAnimationDuration}
                 animationBegin={120}
               />
               <Bar
@@ -873,8 +870,8 @@ export default function GraphView({
                 barSize={18}
                 radius={[8, 8, 2, 2]}
                 fill={`url(#${gradientIdAlt})`}
-                isAnimationActive
-                animationDuration={700}
+                isAnimationActive={shouldAnimateBars}
+                animationDuration={barAnimationDuration}
                 animationBegin={200}
               />
             </>
@@ -884,8 +881,8 @@ export default function GraphView({
               barSize={28}
               radius={[10, 10, 2, 2]}
               fill={`url(#${gradientId})`}
-              isAnimationActive
-              animationDuration={700}
+              isAnimationActive={shouldAnimateBars}
+              animationDuration={barAnimationDuration}
               animationBegin={120}
             />
           )}

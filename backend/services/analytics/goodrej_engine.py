@@ -46,6 +46,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         "hyderabad": "Telangana",
         "patna": "Bihar",
         "kochi": "Kerala",
+        "guwahati": "Assam",
         "vijayawada": "Andhra Pradesh",
         "bhopal": "Madhya Pradesh",
         "ahmedabad": "Gujarat",
@@ -331,7 +332,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 r"^(q[1-4]\b|(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b)",
                 na=False,
             )
-        if dimension == "state":
+        if dimension in {"state", "region"}:
             channel_labels = {value.lower() for value in self.CLAIM_CHANNEL_MAP.values()}
             compact = labels.str.replace(" ", "", regex=False)
             bad = bad | labels.map(self._is_identifier_like)
@@ -499,13 +500,13 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "State",
                 "Customer_State",
                 "Customer State",
-                "Location",
                 "Branch",
                 "Branch Name",
                 "Store Name",
                 "Customer_City",
                 "Customer City",
                 "City",
+                "Location",
             ],
             default="",
         )
@@ -616,6 +617,47 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     ) -> tuple[pd.DataFrame, str | None]:
         dim_key = dimension.lower().strip()
 
+        month_candidates_sales = [
+            "Warranty Purchase Date",
+            "Product Purchased Date",
+            "Warranty Start Date",
+            "Warranty Start_Date",
+            "Start Date",
+            "Start_Date",
+            "Plan Start Date",
+            "Date",
+            "Month",
+            "Month Name",
+            "Month_Name",
+            "Invoice_Date_",
+            "Invoice Date",
+            "Bill Created Date",
+            "Payment_date",
+            "Payment Date",
+        ]
+        month_candidates_claims = [
+            "Month",
+            "Month Name",
+            "Month_Name",
+            "Payment_date",
+            "Payment Date",
+            "Claim Date",
+            "Claim_Date",
+            "Day of Call_Date",
+            "Call_Date",
+            "Call Date",
+            "Date",
+            "Date of Claim",
+            "Invoice_Date_",
+            "Invoice Date",
+            "Bill Created Date",
+            "Warranty Purchase Date",
+            "Warranty Start Date",
+            "Warranty Start_Date",
+            "Start Date",
+            "Start_Date",
+        ]
+
         dim_map = {
             "channel": [
                 "Channel",
@@ -631,20 +673,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "Category",
             ],
             "month": [
-                "Month",
-                "Payment_date",
-                "Payment Date",
-                "Warranty Start Date",
-                "Warranty Start_Date",
-                "Warranty Start",
-                "Start Date",
-                "Start_Date",
-                "Claim Date",
-                "Claim_Date",
-                "Day of Call_Date",
-                "Call_Date",
-                "Date",
-                "Date of Claim",
+                *(month_candidates_claims if dataset_type == "claims" else month_candidates_sales),
             ],
             "state": [
                 "State",
@@ -660,6 +689,21 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "State/City",
                 "State / City",
                 "Region",
+            ],
+            "region": [
+                "Region",
+                "State",
+                "Customer_State",
+                "Customer State",
+                "Location",
+                "Branch",
+                "Branch Name",
+                "Customer_City",
+                "Customer City",
+                "City",
+                "State Name",
+                "State/City",
+                "State / City",
             ],
             "plan_category": [
                 "Plan Category",
@@ -722,6 +766,8 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         if dataset_type == "claims":
             date_candidates = [
                 "Month",
+                "Month Name",
+                "Month_Name",
                 "Payment_date",
                 "Payment Date",
                 "Claim Date",
@@ -731,6 +777,9 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "Call Date",
                 "Date",
                 "Date of Claim",
+                "Invoice_Date_",
+                "Invoice Date",
+                "Bill Created Date",
                 "Warranty Purchase Date",
                 "Warranty Start Date",
                 "Warranty Start_Date",
@@ -739,11 +788,19 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             ]
         else:
             date_candidates = [
+                "Warranty Purchase Date",
+                "Product Purchased Date",
                 "Warranty Start Date",
                 "Warranty Start_Date",
                 "Start Date",
                 "Start_Date",
+                "Plan Start Date",
+                "Invoice_Date_",
+                "Invoice Date",
+                "Bill Created Date",
                 "Month",
+                "Month Name",
+                "Month_Name",
                 "Payment_date",
                 "Payment Date",
                 "Date",
@@ -751,20 +808,25 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
 
         series = self._coalesce_datetime_series(df, date_candidates)
         if series.isna().all():
-            return df
+            # If a range is explicitly requested but no usable dates exist,
+            # keep behavior strict and return no rows.
+            return df.iloc[0:0]
 
-        mask = pd.Series(True, index=df.index)
-        include_undated = dataset_type == "claims"
-        if self.report_start is not None and self.report_start is not pd.NaT:
-            lower = series >= self.report_start
-            if include_undated:
-                lower = lower | series.isna()
-            mask &= lower
-        if self.report_end is not None and self.report_end is not pd.NaT:
-            upper = series <= self.report_end
-            if include_undated:
-                upper = upper | series.isna()
-            mask &= upper
+        filter_start = self.report_start
+        filter_end = self.report_end
+        if dataset_type == "claims":
+            non_na = series.dropna()
+            if not non_na.empty and float(non_na.dt.is_month_start.mean()) >= 0.9:
+                if filter_start is not None and filter_start is not pd.NaT:
+                    filter_start = pd.Timestamp(filter_start).to_period("M").to_timestamp()
+                if filter_end is not None and filter_end is not pd.NaT:
+                    filter_end = pd.Timestamp(filter_end).to_period("M").to_timestamp(how="end")
+
+        mask = series.notna()
+        if filter_start is not None and filter_start is not pd.NaT:
+            mask &= series >= filter_start
+        if filter_end is not None and filter_end is not pd.NaT:
+            mask &= series <= filter_end
         return df[mask]
 
     # --------------------------------------------------
@@ -817,7 +879,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 return s.fillna("Unknown")
             sales_df[sales_dim] = _clean_dim(sales_df[sales_dim])
             claims_df[claims_dim] = _clean_dim(claims_df[claims_dim])
-        elif dimension == "state":
+        elif dimension in {"state", "region"}:
             sales_df[sales_dim] = self._canonical_state(sales_df[sales_dim])
             claims_df[claims_dim] = self._canonical_state(claims_df[claims_dim])
 
@@ -935,6 +997,8 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 s = s.replace({"": None, "0": None, "nan": None, "none": None, "None": None})
                 return s.fillna("Unknown")
             df[dim_col] = _clean_dim(df[dim_col])
+        elif dimension in {"state", "region"}:
+            df[dim_col] = self._canonical_state(df[dim_col])
 
         out = (
             df.groupby(dim_col, dropna=False)["_value"]

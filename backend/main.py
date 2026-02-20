@@ -6,6 +6,7 @@ import re
 import hashlib
 import time
 import math
+import threading
 from pathlib import Path
 from typing import Any
 from io import BytesIO
@@ -42,6 +43,8 @@ from authentication.router import router as auth_router
 from services.manual_update_service import mark_manual_update
 from services.precompute_service import rebuild_precomputed_analytics
 from services.precomputed_repository import (
+    get_precomputed_graph,
+    get_precomputed_summary,
     get_precomputed_insights,
     upsert_precomputed_insights,
 )
@@ -214,6 +217,15 @@ def _init_db():
     except Exception:
         logger.exception("DB init failed")
 
+    prewarm_enabled = os.getenv("OLLAMA_PREWARM", "1").strip().lower() not in {"0", "false", "no", "off"}
+    chatbot_enabled = os.getenv("ENABLE_CHATBOT", "1").strip().lower() not in {"0", "false", "no", "off"}
+    insights_enabled = os.getenv("ENABLE_GRAPH_INSIGHTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if prewarm_enabled and (chatbot_enabled or insights_enabled):
+        try:
+            threading.Thread(target=_prewarm_ollama_model, name="ollama-prewarm", daemon=True).start()
+        except Exception:
+            logger.exception("Failed to schedule Ollama prewarm")
+
 # --------------------------------------------------
 #  CORS  FIXED (DEV SAFE)
 # --------------------------------------------------
@@ -237,7 +249,7 @@ def preflight(path: str, request: Request):
 # --------------------------------------------------
 # ROUTERS
 # --------------------------------------------------
-from routers.analytics import router as analytics_router
+from routers.analytics import compute_by_dimension_rows, router as analytics_router
 from routers.admin_files import router as admin_files_router
 from services.analytics_repository import invalidate_dataframe_cache
 app.include_router(auth_router)
@@ -374,8 +386,65 @@ class GraphInsightPayload(BaseModel):
     compare_mode: bool = False
     rows: list[dict[str, Any]] = Field(default_factory=list)
 
+
+class ChatbotTurn(BaseModel):
+    role: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+class ChatbotPayload(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+    history: list[ChatbotTurn] = Field(default_factory=list)
+    system_prompt: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=1.5)
+    max_tokens: int | None = Field(default=None, ge=8, le=2048)
+    source: str | None = Field(default=None, max_length=64)
+    dataset_type: str | None = Field(default=None, max_length=16)
+    job_id: str | None = Field(default=None, max_length=128)
+    from_date: str | None = Field(default=None, max_length=32)
+    to_date: str | None = Field(default=None, max_length=32)
+
+
+DEFAULT_GEMMA_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma2:2b").strip() or "gemma2:2b"
+DEFAULT_CHATBOT_SYSTEM_PROMPT = (
+    "You are AI Sahyogi, the Zopper dashboard assistant. "
+    "Answer ONLY from the dashboard context provided in the prompt. "
+    "Do not use outside knowledge and do not invent brands, products, numbers, or events. "
+    "If the context does not contain the requested fact, reply: "
+    "\"I can’t confirm that from the current dashboard data.\" "
+    "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, "
+    "samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma. "
+    "Use precise business language with concrete figures from context, complete sentences, and no filler."
+)
+try:
+    CHATBOT_HISTORY_LIMIT = max(1, int(os.getenv("CHATBOT_HISTORY_LIMIT", "6")))
+except ValueError:
+    CHATBOT_HISTORY_LIMIT = 6
+
+try:
+    CHATBOT_HISTORY_CHAR_LIMIT = max(80, int(os.getenv("CHATBOT_HISTORY_CHAR_LIMIT", "280")))
+except ValueError:
+    CHATBOT_HISTORY_CHAR_LIMIT = 280
+
+try:
+    CHATBOT_MESSAGE_CHAR_LIMIT = max(120, int(os.getenv("CHATBOT_MESSAGE_CHAR_LIMIT", "900")))
+except ValueError:
+    CHATBOT_MESSAGE_CHAR_LIMIT = 900
+
+try:
+    CHATBOT_CACHE_TTL_SECONDS = max(1, int(os.getenv("CHATBOT_CACHE_TTL_SECONDS", "180")))
+except ValueError:
+    CHATBOT_CACHE_TTL_SECONDS = 180
+
+try:
+    CHATBOT_CACHE_MAX_ITEMS = max(8, int(os.getenv("CHATBOT_CACHE_MAX_ITEMS", "256")))
+except ValueError:
+    CHATBOT_CACHE_MAX_ITEMS = 256
+
 GRAPH_INSIGHTS_TTL_SECONDS = int(os.getenv("GRAPH_INSIGHTS_TTL_SECONDS", "300"))
 _graph_insights_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_chatbot_response_cache: dict[str, tuple[float, dict[str, str]]] = {}
+_chatbot_cache_lock = threading.Lock()
 
 
 def _graph_insights_cache_key(payload: GraphInsightPayload) -> str:
@@ -465,6 +534,499 @@ def _normalize_source_key(source: str) -> str:
     if source_key in {"godrej", "goodrej", "goddrej"}:
         return "godrej"
     return source_key
+
+
+_CHATBOT_SOURCE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("reliance", ("reliance resq", "reliance-resq", "reliance_resq", "resq", "reliance")),
+    ("godrej", ("godrej", "goodrej", "goddrej")),
+    ("samsung_vs", ("samsung vijay sales", "samsung_vs", "samsung vs", "vijay sales")),
+    ("samsung_croma", ("samsung croma", "samsung_croma")),
+    ("samsung", ("samsung",)),
+]
+
+_CHATBOT_SOURCE_LABELS: dict[str, str] = {
+    "reliance": "Reliance ResQ",
+    "godrej": "Godrej",
+    "samsung": "Samsung",
+    "samsung_vs": "Samsung Vijay Sales",
+    "samsung_croma": "Samsung Croma",
+}
+
+
+def _source_display_name(source: str) -> str:
+    source_key = _normalize_source_key(source)
+    if source_key in _CHATBOT_SOURCE_LABELS:
+        return _CHATBOT_SOURCE_LABELS[source_key]
+    if source_key:
+        return source_key.replace("_", " ").title()
+    return "Dashboard"
+
+
+def _normalize_dataset_type_for_chatbot(value: str | None) -> str:
+    token = (value or "").strip().lower()
+    return "claims" if token == "claims" else "sales"
+
+
+def _normalize_chatbot_job_id(value: str | None) -> str | None:
+    token = (value or "").strip()
+    if not token:
+        return None
+    if token.lower() in {"all", "null", "undefined"}:
+        return None
+    return token
+
+
+def _normalize_chatbot_date(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    candidate = raw[:10]
+    try:
+        return date.fromisoformat(candidate).isoformat()
+    except ValueError:
+        return None
+
+
+def _normalize_chatbot_date_range(
+    from_date: str | None,
+    to_date: str | None,
+) -> tuple[str | None, str | None]:
+    safe_from = _normalize_chatbot_date(from_date)
+    safe_to = _normalize_chatbot_date(to_date)
+    if safe_from and safe_to and safe_from > safe_to:
+        return safe_to, safe_from
+    return safe_from, safe_to
+
+
+def _detect_source_from_text(text: str) -> str | None:
+    low = (text or "").strip().lower()
+    if not low:
+        return None
+
+    for source_key, aliases in _CHATBOT_SOURCE_PATTERNS:
+        for alias in aliases:
+            pattern = r"\b" + re.escape(alias).replace(r"\ ", r"\s+") + r"\b"
+            if re.search(pattern, low):
+                return source_key
+    return None
+
+
+def _detect_dataset_from_text(text: str) -> str | None:
+    low = (text or "").strip().lower()
+    if not low:
+        return None
+    if any(token in low for token in ("claim", "loss ratio", "settlement", "paid out")):
+        return "claims"
+    if any(token in low for token in ("sale", "premium", "units sold", "earning")):
+        return "sales"
+    return None
+
+
+def _resolve_chatbot_source(payload: ChatbotPayload) -> str:
+    explicit = _normalize_source_key(payload.source or "")
+    if explicit:
+        return explicit
+
+    from_message = _detect_source_from_text(payload.message)
+    if from_message:
+        return from_message
+
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() != "user":
+            continue
+        inferred = _detect_source_from_text(turn.content)
+        if inferred:
+            return inferred
+    return ""
+
+
+def _resolve_chatbot_dataset_type(payload: ChatbotPayload) -> str:
+    explicit = (payload.dataset_type or "").strip().lower()
+    if explicit in {"sales", "claims"}:
+        return explicit
+
+    inferred = _detect_dataset_from_text(payload.message)
+    if inferred:
+        return inferred
+
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() != "user":
+            continue
+        inferred = _detect_dataset_from_text(turn.content)
+        if inferred:
+            return inferred
+    return "sales"
+
+
+def _pick_present_key(rows: list[dict[str, Any]], candidates: list[str]) -> str | None:
+    if not rows:
+        return None
+    safe_to_raw: dict[str, str] = {}
+    for row in rows[:12]:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            safe_to_raw[_to_safe_key(str(key))] = str(key)
+
+    for candidate in candidates:
+        safe_candidate = _to_safe_key(candidate)
+        if safe_candidate in safe_to_raw:
+            return safe_to_raw[safe_candidate]
+    return None
+
+
+def _guess_numeric_key(rows: list[dict[str, Any]], exclude_keys: set[str]) -> str | None:
+    score: dict[str, int] = {}
+    for row in rows[:120]:
+        if not isinstance(row, dict):
+            continue
+        for key, raw in row.items():
+            if key in exclude_keys:
+                continue
+            if _to_number(raw) is not None:
+                score[key] = score.get(key, 0) + 1
+    if not score:
+        return None
+    return max(score, key=lambda k: score[k])
+
+
+def _rank_dimension_rows(
+    rows: list[dict[str, Any]],
+    *,
+    dimension: str,
+    metric: str,
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+
+    dimension_key = _pick_present_key(rows, [dimension])
+    metric_key = _pick_present_key(rows, [metric])
+    if metric_key is None:
+        metric_key = _guess_numeric_key(rows, {dimension_key} if dimension_key else set())
+    if metric_key is None:
+        return None
+
+    totals: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = _to_number(row.get(metric_key))
+        if value is None:
+            continue
+
+        label = ""
+        if dimension_key is not None:
+            label = str(row.get(dimension_key, "")).strip()
+        if not label:
+            for key, raw in row.items():
+                if key == metric_key:
+                    continue
+                if _to_number(raw) is None:
+                    label = str(raw or "").strip()
+                    if label:
+                        break
+        if not label:
+            continue
+
+        if label.lower() in {"nan", "none", "null"}:
+            continue
+        totals[label] = totals.get(label, 0.0) + float(value)
+
+    if not totals:
+        return None
+
+    ordered_desc = sorted(totals.items(), key=lambda pair: pair[1], reverse=True)
+    ordered_asc = sorted(totals.items(), key=lambda pair: pair[1])
+    return {
+        "dimension": dimension,
+        "metric": metric,
+        "top": ordered_desc[:4],
+        "bottom": ordered_asc[:3],
+        "labels": list(totals.keys())[:40],
+    }
+
+
+def _chatbot_dimension_candidates(source: str) -> list[str]:
+    source_key = _normalize_source_key(source)
+    if source_key == "reliance":
+        return ["brand", "device_plan_category", "plan_category", "state", "month"]
+    if source_key == "godrej":
+        return ["product_category", "channel", "state", "month", "plan_category"]
+    return ["brand", "plan_category", "device_plan_category", "state", "month"]
+
+
+def _chatbot_metric_candidates(dataset_type: str) -> list[str]:
+    if dataset_type == "claims":
+        return ["loss_ratio", "claims", "net_claims", "quantity"]
+    return ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity"]
+
+
+def _format_rank_pairs(metric: str, pairs: list[tuple[str, float]]) -> str:
+    return "; ".join(f"{label} ({_format_metric_value(metric, value)})" for label, value in pairs)
+
+
+def _chatbot_graph_rows(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    dimension: str,
+    metric: str,
+    from_date: str | None,
+    to_date: str | None,
+) -> list[dict[str, Any]]:
+    rows = get_precomputed_graph(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        dimension=dimension,
+        metric=metric,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if rows is None and (from_date or to_date):
+        rows = get_precomputed_graph(
+            db=db,
+            source=source,
+            dataset_type=dataset_type,
+            job_id=job_id,
+            dimension=dimension,
+            metric=metric,
+        )
+
+    should_try_live = (
+        rows is None
+        and dimension in {"brand", "device_plan_category", "plan_category", "product_category"}
+    )
+    if should_try_live:
+        try:
+            rows = compute_by_dimension_rows(
+                db=db,
+                job_id=job_id,
+                dimension=dimension,
+                metric=metric,
+                source=source,
+                dataset_type=dataset_type,
+                from_date=from_date,
+                to_date=to_date,
+            )
+        except Exception:
+            logger.exception(
+                "Chatbot live dimension fetch failed source=%s dataset=%s dimension=%s metric=%s",
+                source,
+                dataset_type,
+                dimension,
+                metric,
+            )
+            rows = []
+
+    return rows or []
+
+
+def _build_chatbot_dashboard_context(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+) -> tuple[str, dict[str, Any]]:
+    source = _resolve_chatbot_source(payload)
+    dataset_type = _resolve_chatbot_dataset_type(payload)
+    from_date, to_date = _normalize_chatbot_date_range(payload.from_date, payload.to_date)
+    job_id = _normalize_chatbot_job_id(payload.job_id)
+
+    context_payload: dict[str, Any] = {
+        "source": source,
+        "source_label": _source_display_name(source),
+        "dataset_type": dataset_type,
+        "job_id": job_id,
+        "from_date": from_date,
+        "to_date": to_date,
+        "rankings": [],
+        "allowed_labels": [],
+    }
+
+    if not source:
+        context_lines = [
+            "No source was selected or detected from user input.",
+            "If source is mentioned as reliance/resq, map to Reliance ResQ.",
+            "If source is mentioned as goodrej/goddrej, map to Godrej.",
+        ]
+        return "\n".join(context_lines), context_payload
+
+    summary = get_precomputed_summary(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if summary is None and (from_date or to_date):
+        summary = get_precomputed_summary(
+            db=db,
+            source=source,
+            dataset_type=dataset_type,
+            job_id=job_id,
+        )
+    if not isinstance(summary, dict):
+        summary = {}
+
+    metric_candidates = _chatbot_metric_candidates(dataset_type)
+    dimension_candidates = _chatbot_dimension_candidates(source)
+    rankings: list[dict[str, Any]] = []
+    allowed_labels: set[str] = set()
+
+    for dimension in dimension_candidates:
+        snapshot: dict[str, Any] | None = None
+        for metric in metric_candidates:
+            graph_rows = _chatbot_graph_rows(
+                db=db,
+                source=source,
+                dataset_type=dataset_type,
+                job_id=job_id,
+                dimension=dimension,
+                metric=metric,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            snapshot = _rank_dimension_rows(graph_rows, dimension=dimension, metric=metric)
+            if snapshot:
+                break
+        if snapshot:
+            rankings.append(snapshot)
+            for label in snapshot.get("labels", [])[:12]:
+                if label:
+                    allowed_labels.add(str(label))
+        if len(rankings) >= 3:
+            break
+
+    context_payload["rankings"] = rankings
+    context_payload["allowed_labels"] = sorted(allowed_labels)
+
+    date_label = (
+        f"{from_date or 'n/a'} to {to_date or 'n/a'}"
+        if (from_date or to_date)
+        else "all available data"
+    )
+
+    context_lines = [
+        f"Selected source: {_source_display_name(source)}",
+        f"Selected dataset: {dataset_type}",
+        f"Selected date range: {date_label}",
+    ]
+    if job_id:
+        context_lines.append(f"Selected job tag: {job_id}")
+
+    if dataset_type == "claims":
+        context_lines.append(
+            "Summary metrics: "
+            f"Total Claims Cost={_format_metric_value('claims', float(summary.get('gross_premium', 0) or 0))}; "
+            f"Net Claims Cost Paid={_format_metric_value('net_claims', float(summary.get('earned_premium', 0) or 0))}; "
+            f"No. of Claims={int(float(summary.get('units_sold', 0) or 0)):,}"
+        )
+    else:
+        context_lines.append(
+            "Summary metrics: "
+            f"Gross Premium={_format_metric_value('gross_premium', float(summary.get('gross_premium', 0) or 0))}; "
+            f"Earned Premium={_format_metric_value('earned_premium', float(summary.get('earned_premium', 0) or 0))}; "
+            f"Zopper Earned Premium={_format_metric_value('zopper_earned_premium', float(summary.get('zopper_earned_premium', 0) or 0))}; "
+            f"Units Sold={int(float(summary.get('units_sold', 0) or 0)):,}"
+        )
+
+    if rankings:
+        for snapshot in rankings:
+            top = snapshot.get("top", [])
+            bottom = snapshot.get("bottom", [])
+            if not top and not bottom:
+                continue
+            top_text = _format_rank_pairs(snapshot["metric"], top) if top else "n/a"
+            bottom_text = _format_rank_pairs(snapshot["metric"], bottom) if bottom else "n/a"
+            context_lines.append(
+                f"{_pretty_label(snapshot['dimension'])} by {_pretty_label(snapshot['metric'])}: "
+                f"Top={top_text} | Bottom={bottom_text}"
+            )
+    else:
+        context_lines.append("No ranked dimension rows were available for this slice.")
+
+    if allowed_labels:
+        context_lines.append(f"Allowed entity labels: {', '.join(sorted(allowed_labels)[:16])}")
+
+    return "\n".join(context_lines), context_payload
+
+
+def _is_underperformance_query(message: str) -> bool:
+    low = (message or "").strip().lower()
+    if not low:
+        return False
+    under_tokens = ("underperform", "under performing", "under-performing", "lagging", "weakest", "worst", "lowest")
+    return any(token in low for token in under_tokens)
+
+
+def _build_underperformance_answer(message: str, context_payload: dict[str, Any]) -> str | None:
+    if not _is_underperformance_query(message):
+        return None
+
+    rankings = context_payload.get("rankings") or []
+    if not rankings:
+        return None
+
+    low_message = (message or "").lower()
+    wants_brand = "brand" in low_message
+    if wants_brand:
+        preferred_dimensions = (
+            "brand",
+            "device_plan_category",
+            "product_category",
+            "plan_category",
+        )
+    else:
+        preferred_dimensions = (
+            "device_plan_category",
+            "plan_category",
+            "product_category",
+            "channel",
+            "state",
+            "month",
+        )
+    snapshot: dict[str, Any] | None = None
+    for dim in preferred_dimensions:
+        snapshot = next((row for row in rankings if row.get("dimension") == dim), None)
+        if snapshot:
+            break
+    if snapshot is None and wants_brand:
+        source_label = context_payload.get("source_label") or "the selected source"
+        return f"I can’t confirm brand-level underperformance from the current dashboard data for {source_label}."
+    if snapshot is None:
+        snapshot = rankings[0]
+
+    bottom = snapshot.get("bottom") or []
+    if not bottom:
+        return None
+
+    lowest_label, lowest_value = bottom[0]
+    source_label = context_payload.get("source_label") or "the selected source"
+    dataset_type = context_payload.get("dataset_type") or "sales"
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+    metric = snapshot.get("metric") or "gross_premium"
+    dimension = snapshot.get("dimension") or "category"
+
+    range_suffix = ""
+    if from_date or to_date:
+        range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
+
+    answer = (
+        f"In {source_label} {dataset_type}{range_suffix}, the lowest {_pretty_label(metric).lower()} "
+        f"across {_pretty_label(dimension).lower()} is {lowest_label} at {_format_metric_value(metric, float(lowest_value))}. "
+    )
+    if len(bottom) > 1:
+        next_label, next_value = bottom[1]
+        answer += (
+            f"The next lowest is {next_label} at {_format_metric_value(metric, float(next_value))}. "
+        )
+    answer += "This is the current underperformer in the dashboard slice."
+    return answer
 
 
 def _pretty_label(key: str) -> str:
@@ -666,21 +1228,194 @@ def _build_insight_prompt(payload: GraphInsightPayload) -> str:
     )
 
 
-def _call_ollama(system_prompt: str, prompt: str) -> tuple[str, str]:
-    model = os.getenv("CHATCARDS_MODEL", "chatcards")
-    ollama_url = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
-    timeout_seconds = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "20"))
+def _resolve_ollama_model(*env_keys: str, default: str = DEFAULT_GEMMA_MODEL) -> str:
+    for key in env_keys:
+        if not key:
+            continue
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _trim_chat_text(value: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", value or "").strip()
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit].rstrip()}..."
+
+
+def _resolve_chatbot_num_predict(payload: ChatbotPayload) -> int:
+    hard_cap = max(64, _env_int("CHATBOT_MAX_NUM_PREDICT", 320))
+    if payload.max_tokens is not None:
+        return max(8, min(int(payload.max_tokens), hard_cap))
+
+    message = _trim_chat_text(payload.message, CHATBOT_MESSAGE_CHAR_LIMIT)
+    small_prompt_chars = max(1, _env_int("CHATBOT_SMALL_PROMPT_CHARS", 100))
+    medium_prompt_chars = max(small_prompt_chars + 1, _env_int("CHATBOT_MEDIUM_PROMPT_CHARS", 260))
+    small_tokens = max(48, _env_int("CHATBOT_SMALL_NUM_PREDICT", 120))
+    medium_tokens = max(72, _env_int("CHATBOT_MEDIUM_NUM_PREDICT", 180))
+    large_tokens = max(96, _env_int("CHATBOT_LARGE_NUM_PREDICT", 260))
+
+    if len(message) <= small_prompt_chars:
+        return min(small_tokens, hard_cap)
+    if len(message) <= medium_prompt_chars:
+        return min(medium_tokens, hard_cap)
+    return min(large_tokens, hard_cap)
+
+
+def _chatbot_cache_key(
+    payload: ChatbotPayload,
+    *,
+    model: str,
+    system_prompt: str,
+    temperature: float,
+    num_predict: int,
+    context_fingerprint: str = "",
+) -> str:
+    history_signature: list[dict[str, str]] = []
+    for turn in payload.history[-CHATBOT_HISTORY_LIMIT:]:
+        role = (turn.role or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = _trim_chat_text(turn.content, CHATBOT_HISTORY_CHAR_LIMIT)
+        if not content:
+            continue
+        history_signature.append({"role": role, "content": content})
+
+    signature = {
+        "model": model,
+        "system_prompt": system_prompt.strip(),
+        "context_fingerprint": context_fingerprint.strip(),
+        "message": _trim_chat_text(payload.message, CHATBOT_MESSAGE_CHAR_LIMIT),
+        "history": history_signature,
+        "temperature": round(float(temperature), 3),
+        "num_predict": int(num_predict),
+        "source": _normalize_source_key(payload.source or ""),
+        "dataset_type": _normalize_dataset_type_for_chatbot(payload.dataset_type),
+        "job_id": _normalize_chatbot_job_id(payload.job_id) or "",
+        "from_date": _normalize_chatbot_date(payload.from_date) or "",
+        "to_date": _normalize_chatbot_date(payload.to_date) or "",
+    }
+    raw = json.dumps(signature, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _chatbot_cache_get(cache_key: str) -> dict[str, str] | None:
+    now = time.time()
+    with _chatbot_cache_lock:
+        cached = _chatbot_response_cache.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, payload = cached
+        if expires_at <= now:
+            _chatbot_response_cache.pop(cache_key, None)
+            return None
+        return payload
+
+
+def _chatbot_cache_set(cache_key: str, payload: dict[str, str]) -> None:
+    now = time.time()
+    with _chatbot_cache_lock:
+        if len(_chatbot_response_cache) >= CHATBOT_CACHE_MAX_ITEMS:
+            expired = [key for key, (expires, _) in _chatbot_response_cache.items() if expires <= now]
+            for key in expired:
+                _chatbot_response_cache.pop(key, None)
+            if len(_chatbot_response_cache) >= CHATBOT_CACHE_MAX_ITEMS and _chatbot_response_cache:
+                oldest_key = min(_chatbot_response_cache, key=lambda key: _chatbot_response_cache[key][0])
+                _chatbot_response_cache.pop(oldest_key, None)
+        _chatbot_response_cache[cache_key] = (now + CHATBOT_CACHE_TTL_SECONDS, payload)
+
+
+def _is_timeout_exception(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return True
+        if reason and "timed out" in str(reason).lower():
+            return True
+    return "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
+
+
+def _build_chatbot_prompt(payload: ChatbotPayload, dashboard_context: str) -> str:
+    lines: list[str] = [
+        "Dashboard context (authoritative; use only this data):",
+        dashboard_context.strip(),
+        "",
+        "Conversation:",
+    ]
+    for turn in payload.history[-CHATBOT_HISTORY_LIMIT:]:
+        role = (turn.role or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = _trim_chat_text(turn.content, CHATBOT_HISTORY_CHAR_LIMIT)
+        if not content:
+            continue
+        role_label = "User" if role == "user" else "Assistant"
+        lines.append(f"{role_label}: {content}")
+
+    message = _trim_chat_text(payload.message, CHATBOT_MESSAGE_CHAR_LIMIT)
+    lines.append(f"User: {message}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def _call_ollama(
+    system_prompt: str,
+    prompt: str,
+    *,
+    model: str | None = None,
+    temperature: float = 0.2,
+    num_predict: int = 220,
+    timeout_seconds: int | None = None,
+    keep_alive: str | None = None,
+    num_ctx: int | None = None,
+    num_thread: int | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    resolved_model = (model or "").strip() or _resolve_ollama_model("CHATCARDS_MODEL", "OLLAMA_MODEL")
+    ollama_url = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate").strip() or "http://127.0.0.1:11434/api/generate"
+    resolved_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else _env_int("OLLAMA_TIMEOUT_SECONDS", 20)
+    resolved_keep_alive = (keep_alive or os.getenv("OLLAMA_KEEP_ALIVE", "")).strip()
+    options: dict[str, Any] = {
+        "temperature": temperature,
+        "num_predict": num_predict,
+    }
+    if num_ctx is not None and num_ctx > 0:
+        options["num_ctx"] = int(num_ctx)
+    if num_thread is not None and num_thread > 0:
+        options["num_thread"] = int(num_thread)
 
     body = {
-        "model": model,
+        "model": resolved_model,
         "system": system_prompt,
         "prompt": prompt,
         "stream": False,
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 220,
-        },
+        "options": options,
     }
+    if resolved_keep_alive:
+        body["keep_alive"] = resolved_keep_alive
     raw = json.dumps(body).encode("utf-8")
     req = UrlRequest(
         ollama_url,
@@ -689,12 +1424,128 @@ def _call_ollama(system_prompt: str, prompt: str) -> tuple[str, str]:
         method="POST",
     )
 
-    with urlopen(req, timeout=timeout_seconds) as resp:
+    with urlopen(req, timeout=resolved_timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
         response_text = (payload.get("response") or "").strip()
         if not response_text:
             raise ValueError("Empty LLM response.")
-        return model, response_text
+        return resolved_model, response_text, payload
+
+
+def _looks_truncated_response(
+    response_text: str,
+    payload_meta: dict[str, Any],
+    token_budget: int,
+) -> bool:
+    done_reason = str(payload_meta.get("done_reason") or "").strip().lower()
+    if done_reason == "length":
+        return True
+
+    eval_count_raw = payload_meta.get("eval_count")
+    try:
+        eval_count = int(eval_count_raw) if eval_count_raw is not None else 0
+    except (TypeError, ValueError):
+        eval_count = 0
+
+    likely_token_limited = eval_count >= max(1, token_budget - 1)
+    if not likely_token_limited:
+        return False
+
+    tail = (response_text or "").strip()
+    if not tail:
+        return True
+    if tail.endswith((".", "!", "?", "\"", "'", ".)", "!)", "?)")):
+        return False
+    return True
+
+
+def _looks_incomplete_response(response_text: str) -> bool:
+    text = (response_text or "").strip()
+    if not text:
+        return True
+    if text.endswith((".", "!", "?", "\"", "'", ".)", "!)", "?)", "...")):
+        return False
+
+    if text.endswith((",", ":", ";", "-", "/")):
+        return True
+
+    words = text.split()
+    if not words:
+        return True
+    last_word = words[-1].strip(".,:;!?\"'()[]{}").lower()
+    dangling_words = {
+        "and", "or", "to", "for", "with", "about", "on", "in", "of", "the",
+        "a", "an", "this", "that", "your", "our", "their", "better", "more",
+        "some", "any", "if", "because", "while", "when", "then",
+    }
+    if last_word in dangling_words:
+        return True
+
+    return False
+
+
+def _repair_incomplete_response(
+    *,
+    model_name: str,
+    response_text: str,
+    temperature: float,
+    max_num_predict_cap: int,
+    retry_timeout_seconds: int,
+    keep_alive: str,
+    num_ctx: int,
+    num_thread: int,
+) -> str:
+    if not _looks_incomplete_response(response_text):
+        return response_text
+
+    try:
+        _, repaired_text, _ = _call_ollama(
+            "You rewrite incomplete assistant answers into one complete response.",
+            (
+                "The response below ended mid-thought. Rewrite it as one complete, coherent "
+                "answer with the same intent. Do not add new facts.\n\n"
+                f"Incomplete response:\n{response_text}\n\nComplete response:"
+            ),
+            model=model_name,
+            temperature=min(temperature, 0.12),
+            num_predict=min(max_num_predict_cap, max(24, _env_int("CHATBOT_REPAIR_NUM_PREDICT", 72))),
+            timeout_seconds=max(6, min(retry_timeout_seconds, 14)),
+            keep_alive=keep_alive,
+            num_ctx=num_ctx,
+            num_thread=num_thread if num_thread > 0 else None,
+        )
+        repaired_text = repaired_text.strip()
+        if repaired_text and len(repaired_text) >= max(24, len(response_text.strip()) // 2):
+            return repaired_text
+    except (URLError, TimeoutError, ValueError, OSError):
+        pass
+
+    return response_text
+
+
+def _prewarm_ollama_model() -> None:
+    model_name = _resolve_ollama_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "OLLAMA_MODEL")
+    prewarm_timeout = max(10, _env_int("CHATBOT_PREWARM_TIMEOUT_SECONDS", 45))
+    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip() or os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
+    num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
+    num_thread = _env_int("CHATBOT_NUM_THREAD", 0)
+    try:
+        started_at = time.perf_counter()
+        _call_ollama(
+            "You are a concise assistant.",
+            "User: Reply with OK.\nAssistant:",
+            model=model_name,
+            temperature=0.0,
+            num_predict=4,
+            timeout_seconds=prewarm_timeout,
+            keep_alive=keep_alive,
+            num_ctx=num_ctx,
+            num_thread=num_thread if num_thread > 0 else None,
+        )
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        logger.info("Ollama prewarm complete model=%s duration_ms=%.2f", model_name, duration_ms)
+    except Exception as exc:
+        logger.warning("Ollama prewarm failed: %s", exc)
 
 
 @app.post("/insights/graph")
@@ -746,7 +1597,7 @@ def generate_graph_insights(
     base_insights = _derive_data_driven_insights(payload)
 
     try:
-        model, response_text = _call_ollama(system_prompt, prompt)
+        model, response_text, _ = _call_ollama(system_prompt, prompt)
     except (URLError, TimeoutError, ValueError, OSError) as exc:
         logger.warning("Graph insights generation failed: %s", exc)
         if base_insights:
@@ -780,8 +1631,8 @@ def generate_graph_insights(
         raise HTTPException(
             status_code=503,
             detail=(
-                "Insights service unavailable. Ensure Ollama is running and the "
-                "'chatcards' model is created from chatcards/Modelfile."
+                "Insights service unavailable. Ensure Ollama is running and "
+                "CHATCARDS_MODEL points to an installed Gemma model (example: gemma2:2b)."
             ),
         )
 
@@ -815,6 +1666,173 @@ def generate_graph_insights(
         db.rollback()
         logger.exception("Failed to persist precomputed graph insights")
     return response_payload
+
+
+@app.post("/chatbot/message")
+def chatbot_message(
+    payload: ChatbotPayload,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    chatbot_enabled = os.getenv("ENABLE_CHATBOT", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if not chatbot_enabled:
+        return {
+            "response": "",
+            "model": "disabled",
+            "message": "Chatbot is disabled in this environment.",
+        }
+
+    dashboard_context, context_payload = _build_chatbot_dashboard_context(db=db, payload=payload)
+    rule_based_answer = _build_underperformance_answer(payload.message, context_payload)
+    if rule_based_answer:
+        return {
+            "response": rule_based_answer,
+            "model": "rule-based-dashboard",
+        }
+
+    prompt = _build_chatbot_prompt(payload, dashboard_context)
+    base_system_prompt = (
+        (payload.system_prompt or "").strip()
+        or os.getenv("CHATBOT_SYSTEM_PROMPT", "").strip()
+        or DEFAULT_CHATBOT_SYSTEM_PROMPT
+    )
+    system_prompt = (
+        f"{base_system_prompt}\n\n"
+        "Hard constraints:\n"
+        "1) Use only the Dashboard context block and conversation turns.\n"
+        "2) Never mention entities or numbers absent from Dashboard context.\n"
+        "3) If context is missing, reply exactly: I can’t confirm that from the current dashboard data.\n"
+    )
+    model_name = _resolve_ollama_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "OLLAMA_MODEL")
+    temperature = payload.temperature if payload.temperature is not None else _env_float("CHATBOT_TEMPERATURE", 0.15)
+    max_tokens = _resolve_chatbot_num_predict(payload)
+    timeout_seconds = max(8, _env_int("CHATBOT_TIMEOUT_SECONDS", 30))
+    retry_timeout_seconds = max(6, min(timeout_seconds, _env_int("CHATBOT_RETRY_TIMEOUT_SECONDS", 14)))
+    retry_num_predict = max(12, min(max_tokens, _env_int("CHATBOT_RETRY_NUM_PREDICT", 48)))
+    max_num_predict_cap = max(max_tokens, _env_int("CHATBOT_MAX_NUM_PREDICT", 320))
+    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip() or os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
+    num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
+    num_thread = _env_int("CHATBOT_NUM_THREAD", 0)
+    context_fingerprint = hashlib.sha256(dashboard_context.encode("utf-8")).hexdigest()
+    cache_key = _chatbot_cache_key(
+        payload,
+        model=model_name,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        num_predict=max_tokens,
+        context_fingerprint=context_fingerprint,
+    )
+    cached = _chatbot_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    started_at = time.perf_counter()
+
+    try:
+        model, response_text, response_meta = _call_ollama(
+            system_prompt,
+            prompt,
+            model=model_name,
+            temperature=temperature,
+            num_predict=max_tokens,
+            timeout_seconds=timeout_seconds,
+            keep_alive=keep_alive,
+            num_ctx=num_ctx,
+            num_thread=num_thread if num_thread > 0 else None,
+        )
+        needs_expansion = (
+            _looks_truncated_response(response_text, response_meta, max_tokens)
+            or _looks_incomplete_response(response_text)
+        )
+        elapsed_seconds = time.perf_counter() - started_at
+        remaining_budget = max(0.0, float(timeout_seconds) - elapsed_seconds)
+        allow_expansion = max_tokens > 96 and remaining_budget >= 8.0
+        if needs_expansion and max_tokens < max_num_predict_cap and allow_expansion:
+            expanded_tokens = min(max_num_predict_cap, max_tokens + 16)
+            try:
+                expansion_timeout = max(6, min(retry_timeout_seconds, 8, int(remaining_budget)))
+                model, expanded_text, _ = _call_ollama(
+                    system_prompt,
+                    prompt,
+                    model=model_name,
+                    temperature=temperature,
+                    num_predict=expanded_tokens,
+                    timeout_seconds=expansion_timeout,
+                    keep_alive=keep_alive,
+                    num_ctx=num_ctx,
+                    num_thread=num_thread if num_thread > 0 else None,
+                )
+                if expanded_text and len(expanded_text) > len(response_text):
+                    response_text = expanded_text
+                    max_tokens = expanded_tokens
+            except (URLError, TimeoutError, ValueError, OSError):
+                response_text = _repair_incomplete_response(
+                    model_name=model_name,
+                    response_text=response_text,
+                    temperature=temperature,
+                    max_num_predict_cap=max_num_predict_cap,
+                    retry_timeout_seconds=retry_timeout_seconds,
+                    keep_alive=keep_alive,
+                    num_ctx=num_ctx,
+                    num_thread=num_thread,
+                )
+        else:
+            response_text = _repair_incomplete_response(
+                model_name=model_name,
+                response_text=response_text,
+                temperature=temperature,
+                max_num_predict_cap=max_num_predict_cap,
+                retry_timeout_seconds=retry_timeout_seconds,
+                keep_alive=keep_alive,
+                num_ctx=num_ctx,
+                num_thread=num_thread,
+            )
+    except (URLError, TimeoutError, ValueError, OSError) as exc:
+        if _is_timeout_exception(exc):
+            try:
+                model, response_text, _ = _call_ollama(
+                    system_prompt,
+                    prompt,
+                    model=model_name,
+                    temperature=min(temperature, 0.12),
+                    num_predict=retry_num_predict,
+                    timeout_seconds=retry_timeout_seconds,
+                    keep_alive=keep_alive,
+                    num_ctx=num_ctx,
+                    num_thread=num_thread if num_thread > 0 else None,
+                )
+            except (URLError, TimeoutError, ValueError, OSError) as retry_exc:
+                logger.warning("Chatbot generation failed after timeout retry: %s", retry_exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Chatbot service unavailable. Ensure Ollama is running and "
+                        "CHATBOT_MODEL points to an installed Gemma model (example: gemma2:2b)."
+                    ),
+                )
+        else:
+            logger.warning("Chatbot generation failed: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Chatbot service unavailable. Ensure Ollama is running and "
+                    "CHATBOT_MODEL points to an installed Gemma model (example: gemma2:2b)."
+                ),
+            )
+
+    response_payload = {
+        "response": response_text,
+        "model": model,
+    }
+    _chatbot_cache_set(cache_key, response_payload)
+    duration_ms = (time.perf_counter() - started_at) * 1000
+    logger.info(
+        "TIMING chatbot.message model=%s tokens=%s duration_ms=%.2f",
+        model,
+        max_tokens,
+        duration_ms,
+    )
+    return response_payload
+
 
 # ==================================================
 # PROCESS DISABLED

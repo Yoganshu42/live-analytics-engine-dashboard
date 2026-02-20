@@ -19,7 +19,7 @@ Write-Host "`n[1/4] Uploading source code..." -ForegroundColor Yellow
 Write-Host "  Backend..." -ForegroundColor Gray
 ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" "mkdir -p $remotePath/backend"
 scp -i $sshKey -o StrictHostKeyChecking=no -r backend/*.py backend/requirements.txt backend/Dockerfile "${remoteUser}@${serverIP}:${remotePath}/backend/" 2>$null
-scp -i $sshKey -o StrictHostKeyChecking=no -r backend/authentication backend/core backend/db backend/models backend/routers backend/services "${remoteUser}@${serverIP}:${remotePath}/backend/" 2>$null
+scp -i $sshKey -o StrictHostKeyChecking=no -r backend/authentication backend/chatcards backend/core backend/db backend/models backend/routers backend/services "${remoteUser}@${serverIP}:${remotePath}/backend/" 2>$null
 
 # Create minimal frontend package  
 Write-Host "  Frontend..." -ForegroundColor Gray
@@ -35,7 +35,7 @@ Write-Host "  Upload complete!" -ForegroundColor Green
 
 # Step 2: Stop old containers
 Write-Host "`n[2/4] Stopping old containers..." -ForegroundColor Yellow
-ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" "cd $remotePath && docker-compose down 2>/dev/null || true"
+ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" "cd $remotePath && docker compose down 2>/dev/null || true"
 
 # Step 3: Build in PARALLEL (this is the key optimization!)
 Write-Host "`n[3/4] Building containers IN PARALLEL..." -ForegroundColor Yellow
@@ -44,13 +44,13 @@ Write-Host "  This will save 5-8 minutes!" -ForegroundColor Cyan
 # Start backend build in background
 $backendBuild = Start-Job -ScriptBlock {
     param($key, $user, $ip, $path)
-    ssh -i $key -o StrictHostKeyChecking=no "${user}@${ip}" "cd $path && docker-compose build backend"
+    ssh -i $key -o StrictHostKeyChecking=no "${user}@${ip}" "cd $path && docker compose build backend"
 } -ArgumentList $sshKey, $remoteUser, $serverIP, $remotePath
 
 # Start frontend build in background
 $frontendBuild = Start-Job -ScriptBlock {
     param($key, $user, $ip, $path)
-    ssh -i $key -o StrictHostKeyChecking=no "${user}@${ip}" "cd $path && docker-compose build frontend"
+    ssh -i $key -o StrictHostKeyChecking=no "${user}@${ip}" "cd $path && docker compose build frontend"
 } -ArgumentList $sshKey, $remoteUser, $serverIP, $remotePath
 
 Write-Host "  Backend build: STARTED" -ForegroundColor Yellow
@@ -78,7 +78,9 @@ $backendBuild, $frontendBuild | Remove-Job
 
 # Step 4: Start services
 Write-Host "`n[4/4] Starting services..." -ForegroundColor Yellow
-ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" "cd $remotePath && docker-compose up -d && sleep 10 && docker-compose ps"
+ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" "cd $remotePath && docker compose up -d && sleep 10 && docker compose ps"
+Write-Host "  Ensuring Gemma model is available..." -ForegroundColor Gray
+ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" "cd $remotePath && (docker compose exec -T ollama ollama list | grep -q 'gemma2:2b' || docker compose exec -T ollama ollama pull gemma2:2b)"
 
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "DEPLOYMENT COMPLETE!" -ForegroundColor Green

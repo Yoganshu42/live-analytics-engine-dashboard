@@ -32,6 +32,43 @@ _samsung_load_inflight: dict[
 ] = {}
 
 
+def invalidate_samsung_load_cache(
+    source: str | None = None,
+    dataset_type: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    source_scope: set[str] | None = None
+    if source is not None:
+        source_key = (source or "").strip().lower()
+        if source_key.startswith("samsung") or source_key in SAMSUNG_SOURCE_VARIANTS:
+            source_scope = set(SAMSUNG_SOURCE_VARIANTS)
+        else:
+            source_scope = {source_key}
+
+    dataset_scope = (dataset_type or "").strip().lower() if dataset_type is not None else None
+    job_scope = (job_id or "").strip() if job_id is not None else None
+
+    with _samsung_load_cache_lock:
+        if source_scope is None and dataset_scope is None and job_scope is None:
+            _samsung_load_cache.clear()
+            return None
+
+        keys_to_delete: list[tuple[str, str, str, str, str, bool, bool]] = []
+        for key in _samsung_load_cache.keys():
+            key_source, key_dataset, key_job, _from_key, _to_key, _sales, _claims = key
+            if source_scope is not None and key_source not in source_scope:
+                continue
+            if dataset_scope is not None and key_dataset != dataset_scope:
+                continue
+            if job_scope is not None and key_job != job_scope:
+                continue
+            keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            _samsung_load_cache.pop(key, None)
+    return None
+
+
 class SamsungAnalyticsEngine(BaseAnalyticsEngine):
     def __init__(
         self,
@@ -54,8 +91,12 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             self.report_end = REPORT_END
 
     def _shared_load_cache_key(self, include_sales: bool, include_claims: bool) -> tuple[str, str, str, str, str, bool, bool]:
-        from_key = self.report_start.date().isoformat() if self.apply_date_filter and self.report_start is not None else ""
-        to_key = self.report_end.date().isoformat() if self.apply_date_filter and self.report_end is not None else ""
+        # Sales data loading is range-agnostic (date slicing happens in compute stage),
+        # so keep one shared cache across date-range switches for much faster reuse.
+        # Claims loading applies date filters inside load_data, so keep range in key.
+        needs_range_key = include_claims and self.apply_date_filter
+        from_key = self.report_start.date().isoformat() if needs_range_key and self.report_start is not None else ""
+        to_key = self.report_end.date().isoformat() if needs_range_key and self.report_end is not None else ""
         return (
             (self.source or "").strip().lower(),
             (self.dataset_type or "").strip().lower(),
@@ -548,28 +589,63 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                         .str.strip()
                     )
 
-                # Apply date filter to claims (prefer Day of Call_Date, Call_Date, then Month/Fiscal Month)
-                date_series = None
-                for col in ["Day of Call_Date", "Call_Date", "Month", "Month-Year", "Fiscal Month"]:
-                    if col in claims_df.columns:
-                        if col == "Fiscal Month":
-                            fm = claims_df[col].astype(str).str.strip()
-                            series = pd.to_datetime(
-                                fm.where(~fm.str.fullmatch(r"\d{6}"), fm.str.slice(0, 4) + "-" + fm.str.slice(4, 6) + "-01"),
-                                errors="coerce",
-                            )
-                        else:
-                            series = pd.to_datetime(claims_df[col], errors="coerce")
-                        if not series.isna().all():
-                            date_series = series
-                            break
+                # Samsung claims uploads can carry a shifted "Month-Year" while
+                # "Fiscal Month" remains correct (e.g. 2026-07 vs 202507).
+                # Prefer Fiscal Month as canonical month whenever it is present.
+                if "Fiscal Month" in claims_df.columns:
+                    fiscal_month = self._parse_month_series(claims_df["Fiscal Month"])
+                    if fiscal_month is not None and fiscal_month.notna().any():
+                        claims_df["Month"] = fiscal_month
 
-                if self.apply_date_filter and date_series is not None:
+                # Apply date filter to claims using a coalesced date series.
+                # Some files provide partial values across multiple date columns
+                # (e.g. Call_Date for some rows, Month/Fiscal Month for others).
+                date_series = pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
+
+                def _parse_claim_date_column(column: str) -> pd.Series:
+                    raw = claims_df[column]
+                    if column in {"Month", "Month-Year", "Fiscal Month"}:
+                        parsed_month = self._parse_month_series(raw)
+                        if parsed_month is not None:
+                            return parsed_month
+                        return pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
+                    try:
+                        return pd.to_datetime(raw, format="mixed", errors="coerce")
+                    except TypeError:
+                        return pd.to_datetime(raw, errors="coerce")
+
+                for col in [
+                    "Day of Call_Date",
+                    "Call_Date",
+                    "Call Date",
+                    "Fiscal Month",
+                    "Month",
+                    "Month-Year",
+                    "Payment_date",
+                    "Payment Date",
+                    "Date",
+                ]:
+                    if col not in claims_df.columns:
+                        continue
+                    parsed = _parse_claim_date_column(col)
+                    if parsed.isna().all():
+                        continue
+                    date_series = date_series.where(date_series.notna(), parsed)
+
+                if self.apply_date_filter and date_series.notna().any():
+                    filter_start = self.report_start
+                    filter_end = self.report_end
+                    non_na = date_series.dropna()
+                    if not non_na.empty and float(non_na.dt.is_month_start.mean()) >= 0.9:
+                        if filter_start is not None:
+                            filter_start = pd.Timestamp(filter_start).to_period("M").to_timestamp()
+                        if filter_end is not None:
+                            filter_end = pd.Timestamp(filter_end).to_period("M").to_timestamp(how="end")
                     mask = pd.Series(True, index=claims_df.index)
-                    if self.report_start is not None:
-                        mask &= date_series >= self.report_start
-                    if self.report_end is not None:
-                        mask &= date_series <= self.report_end
+                    if filter_start is not None:
+                        mask &= date_series >= filter_start
+                    if filter_end is not None:
+                        mask &= date_series <= filter_end
                     claims_df = claims_df[mask]
             logger.info(
                 "TIMING samsung.load_data.claims_normalization source=%s dataset=%s duration_ms=%.2f",

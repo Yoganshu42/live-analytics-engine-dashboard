@@ -10,6 +10,9 @@ type Props = {
   secondaryColor?: string
   fromDate?: string
   toDate?: string
+  resetFromDate?: string
+  resetToDate?: string
+  onDateRangeApply?: (fromDate: string, toDate: string) => void
 }
 
 export default function GraphSection({
@@ -18,6 +21,9 @@ export default function GraphSection({
   jobId,
   fromDate,
   toDate,
+  resetFromDate,
+  resetToDate,
+  onDateRangeApply,
 }: Props) {
   return (
     <MultiGraphView
@@ -26,6 +32,9 @@ export default function GraphSection({
       jobId={jobId}
       fromDate={fromDate}
       toDate={toDate}
+      resetFromDate={resetFromDate}
+      resetToDate={resetToDate}
+      onDateRangeApply={onDateRangeApply}
     />
   )
 }

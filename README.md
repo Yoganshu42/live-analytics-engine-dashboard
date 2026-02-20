@@ -86,6 +86,61 @@ The backend loads `.env` automatically and creates required tables (`users`, `da
 
 ---
 
+## Free AI Setup (Gemma + Ollama)
+
+This project now defaults to self-hosted Gemma for both:
+- `POST /insights/graph` (chatcards insights)
+- `POST /chatbot/message` (chatbot backend API)
+
+No paid API key is required.
+
+### Local (without Docker)
+
+1. Start Ollama:
+```powershell
+ollama serve
+```
+
+2. Pull Gemma once:
+```powershell
+ollama pull gemma2:2b
+```
+
+3. Run backend with Gemma:
+```powershell
+cd backend
+$env:OLLAMA_API_URL="http://127.0.0.1:11434/api/generate"
+$env:CHATCARDS_MODEL="gemma2:2b"
+$env:CHATBOT_MODEL="gemma2:2b"
+uvicorn main:app --reload
+```
+
+### Docker Compose
+
+`docker-compose.yml` now includes an `ollama` service.
+
+After first startup, pull model into container:
+```powershell
+docker compose up -d ollama
+docker compose exec ollama ollama pull gemma2:2b
+docker compose up -d
+```
+
+### Chatbot API Example
+
+`POST /chatbot/message`
+
+```json
+{
+  "message": "Summarize top risk in this month's claims trend",
+  "history": [
+    {"role": "user", "content": "Can you review the dashboard trend?"}
+  ]
+}
+```
+
+---
+
 ## Data Ingestion (Swagger)
 
 1. Open: `http://127.0.0.1:8000/docs`

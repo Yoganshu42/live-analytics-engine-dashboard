@@ -283,6 +283,14 @@ def get_date_bounds(
         "Start_Date",
         "Start Date",
         "Plan Start Date",
+        "Warranty Start Date",
+        "Warranty Start_Date",
+        "Warranty Purchase Date",
+        "Invoice_Date_",
+        "Invoice Date",
+        "Bill Created Date",
+        "Payment_date",
+        "Payment Date",
         "Month",
         "Month Name",
         "Month_Name",
@@ -300,15 +308,80 @@ def get_date_bounds(
     ]
 
     candidates = sales_candidates if dataset_type == "sales" else claims_candidates
-    date_col = next((c for c in candidates if c in df.columns), None)
-    if date_col is None:
+    parsed = _coalesce_datetime_candidates(df, candidates)
+    if parsed.isna().all():
         return None, None
 
-    series = pd.to_datetime(df[date_col], errors="coerce")
-    if series.isna().all():
-        return None, None
+    return parsed.min(), parsed.max()
 
-    return series.min(), series.max()
+
+def _parse_datetime_series(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+    cleaned = raw.str.replace(r"\.0$", "", regex=True)
+
+    yyyymm_mask = cleaned.str.fullmatch(r"\d{6}")
+    yyyymm_normalized = cleaned.where(
+        ~yyyymm_mask,
+        cleaned.str.slice(0, 4) + "-" + cleaned.str.slice(4, 6) + "-01",
+    )
+
+    try:
+        parsed = pd.to_datetime(yyyymm_normalized, format="mixed", errors="coerce")
+    except TypeError:
+        parsed = pd.to_datetime(yyyymm_normalized, errors="coerce")
+
+    if parsed.isna().any():
+        try:
+            parsed_try = pd.to_datetime(cleaned, format="mixed", errors="coerce")
+        except TypeError:
+            parsed_try = pd.to_datetime(cleaned, errors="coerce")
+        parsed = parsed.fillna(parsed_try)
+
+    if parsed.isna().all():
+        for fmt in ["%b-%y", "%b-%Y", "%m-%Y", "%Y-%m", "%Y-%m-%d", "%d-%b-%Y", "%d-%b-%y"]:
+            parsed_try = pd.to_datetime(cleaned, format=fmt, errors="coerce")
+            if parsed_try.notna().any():
+                parsed = parsed_try
+                break
+
+    return parsed
+
+
+def _coalesce_datetime_candidates(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    out = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        parsed = _parse_datetime_series(df[col])
+        out = out.where(out.notna(), parsed)
+    return out
+
+
+def _is_month_granular_series(series: pd.Series) -> bool:
+    non_na = series.dropna()
+    if non_na.empty:
+        return False
+    try:
+        return float(non_na.dt.is_month_start.mean()) >= 0.9
+    except Exception:
+        return False
+
+
+def _align_claims_range_to_month_bounds(
+    series: pd.Series,
+    from_dt: pd.Timestamp | None,
+    to_dt: pd.Timestamp | None,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if not _is_month_granular_series(series):
+        return from_dt, to_dt
+
+    aligned_from = from_dt
+    aligned_to = to_dt
+    if aligned_from is not None and not pd.isna(aligned_from):
+        aligned_from = pd.Timestamp(aligned_from).to_period("M").to_timestamp()
+    if aligned_to is not None and not pd.isna(aligned_to):
+        aligned_to = pd.Timestamp(aligned_to).to_period("M").to_timestamp(how="end")
+    return aligned_from, aligned_to
 
 
 def filter_by_date_range(
@@ -334,6 +407,14 @@ def filter_by_date_range(
         "Start_Date",
         "Start Date",
         "Plan Start Date",
+        "Warranty Start Date",
+        "Warranty Start_Date",
+        "Warranty Purchase Date",
+        "Invoice_Date_",
+        "Invoice Date",
+        "Bill Created Date",
+        "Payment_date",
+        "Payment Date",
         "Month",
         "Month Name",
         "Month_Name",
@@ -345,22 +426,40 @@ def filter_by_date_range(
         "Day of Call_Date",
         "Call_Date",
         "Call Date",
+        "Call_Registered_Date",
+        "Call Registered Date",
+        "Call_Initiated_Date",
+        "Call Initiated Date",
         "Month",
         "Month Name",
         "Month_Name",
+        "Month-Year",
+        "Month Year",
+        "Month_Year",
+        "Fiscal Month",
+        "Invoice_Date_",
+        "Invoice Date",
+        "Payment_date",
+        "Payment Date",
+        "Posting Date",
+        "Complete Date",
+        "Bill Created Date",
+        "Warranty_start_date_",
+        "Warranty Start Date",
+        "Date",
     ]
 
     candidates = sales_candidates if dataset_type == "sales" else claims_candidates
-    date_col = next((c for c in candidates if c in df.columns), None)
-
-    if date_col is None:
-        return df
-
-    series = pd.to_datetime(df[date_col], errors="coerce")
+    series = _coalesce_datetime_candidates(df, candidates)
     if series.isna().all():
-        return df
+        # Date filters are explicit. If no parseable date columns exist, return no rows
+        # to avoid silently showing unfiltered data.
+        return df.iloc[0:0]
 
-    mask = pd.Series(True, index=df.index)
+    if dataset_type == "claims":
+        from_dt, to_dt = _align_claims_range_to_month_bounds(series, from_dt, to_dt)
+
+    mask = series.notna()
     if from_dt is not None and from_dt is not pd.NaT:
         mask &= series >= from_dt
     if to_dt is not None and to_dt is not pd.NaT:

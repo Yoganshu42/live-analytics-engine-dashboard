@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import Image from "next/image"
 import { useRouter } from "next/navigation"
-import { motion, AnimatePresence, Variants } from "framer-motion"
+import { motion, AnimatePresence, Variants, useReducedMotion } from "framer-motion"
 import { login } from "../lib/api"
 
 type Role = "admin" | "employee"
@@ -43,6 +43,7 @@ const floatingModule: Variants = {
 }
 
 export default function LoginPage() {
+  const prefersReducedMotion = useReducedMotion()
   const normalizeToken = (value: string | null) => {
     if (!value) return null
     let token = value.trim()
@@ -136,8 +137,8 @@ export default function LoginPage() {
         <div className="relative p-12 bg-indigo-600 text-white flex flex-col justify-between overflow-hidden">
           
           <motion.div 
-            animate={{ rotate: 360 }}
-            transition={{ duration: 50, repeat: Infinity, ease: "linear" }}
+            animate={prefersReducedMotion ? undefined : { rotate: 360 }}
+            transition={prefersReducedMotion ? undefined : { duration: 50, repeat: Infinity, ease: "linear" }}
             className="absolute -top-20 -left-20 w-80 h-80 border border-white/10 rounded-full"
           />
           
@@ -162,8 +163,8 @@ export default function LoginPage() {
           {/* Animated Business Graphic */}
           <motion.div 
             variants={floatingModule}
-            animate="animate"
-            className="relative z-10 bg-white/10 backdrop-blur-md border border-white/20 p-6 rounded-3xl mt-8 shadow-2xl"
+            animate={prefersReducedMotion ? undefined : "animate"}
+            className="smooth-surface relative z-10 bg-white/10 backdrop-blur-md border border-white/20 p-6 rounded-3xl mt-8 shadow-2xl"
           >
             <div className="flex items-center justify-between mb-4">
                <div className="h-2 w-12 bg-white/30 rounded-full" />
@@ -174,7 +175,7 @@ export default function LoginPage() {
                 <motion.div 
                     initial={{ x: "-100%" }}
                     animate={{ x: "0%" }}
-                    transition={{ duration: 2, repeat: Infinity, repeatDelay: 1 }}
+                    transition={prefersReducedMotion ? { duration: 0 } : { duration: 2, repeat: Infinity, repeatDelay: 1 }}
                     className="h-full w-1/2 bg-white/60" 
                 />
               </div>

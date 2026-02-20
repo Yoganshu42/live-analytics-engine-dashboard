@@ -16,6 +16,7 @@ from authentication.deps import require_admin
 from db.deps import get_db
 from models.data_rows import DataRow
 from services.analytics_repository import invalidate_dataframe_cache
+from services.analytics.samsung_engine import invalidate_samsung_load_cache
 from services.manual_update_service import mark_manual_update
 from services.precompute_service import rebuild_precomputed_analytics, rebuild_precomputed_for_all_tags
 
@@ -155,6 +156,12 @@ def _post_file_update(
     for refresh_source in refresh_sources:
         for refresh_job in refresh_jobs:
             invalidate_dataframe_cache(source=refresh_source, dataset_type=dataset_norm, job_id=refresh_job)
+            if refresh_source.startswith("samsung"):
+                invalidate_samsung_load_cache(
+                    source=refresh_source,
+                    dataset_type=dataset_norm,
+                    job_id=refresh_job,
+                )
 
     for refresh_source in refresh_sources:
         for refresh_job in refresh_jobs:
@@ -174,6 +181,18 @@ def _post_file_update(
                     dataset_norm,
                     refresh_job,
                 )
+
+    # A concurrent read can repopulate samsung's shared in-memory load cache while
+    # precompute is rebuilding. Clear once more so subsequent reads are guaranteed fresh.
+    for refresh_source in refresh_sources:
+        if not refresh_source.startswith("samsung"):
+            continue
+        for refresh_job in refresh_jobs:
+            invalidate_samsung_load_cache(
+                source=refresh_source,
+                dataset_type=dataset_norm,
+                job_id=refresh_job,
+            )
 
 
 @router.get("")

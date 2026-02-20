@@ -23,6 +23,11 @@ def _cache_key(source: str, dataset_type: str, job_id: str | None) -> tuple[str,
 
 def _source_variants(source: str | None) -> list[str]:
     source_key = (source or "").strip().lower()
+    if source_key in {"godrej", "goodrej", "goddrej"}:
+        # Legacy uploads contain mixed spellings for Godrej.
+        return ["godrej", "goodrej", "goddrej"]
+    if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+        return ["reliance"]
     if source_key in {"samsung_vs", "samsung_vijay_sales"}:
         # Keep both aliases readable without requiring a data migration first.
         return ["samsung_vs", "samsung_vijay_sales"]
