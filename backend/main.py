@@ -26,7 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
@@ -48,6 +48,7 @@ from services.precomputed_repository import (
     get_precomputed_insights,
     upsert_precomputed_insights,
 )
+from services.analytics_engine import filter_by_date_range
 
 # --------------------------------------------------
 # LOGGING
@@ -217,14 +218,15 @@ def _init_db():
     except Exception:
         logger.exception("DB init failed")
 
-    prewarm_enabled = os.getenv("OLLAMA_PREWARM", "1").strip().lower() not in {"0", "false", "no", "off"}
+    prewarm_raw = os.getenv("LLM_PREWARM", "1").strip()
+    prewarm_enabled = prewarm_raw.lower() not in {"0", "false", "no", "off"}
     chatbot_enabled = os.getenv("ENABLE_CHATBOT", "1").strip().lower() not in {"0", "false", "no", "off"}
     insights_enabled = os.getenv("ENABLE_GRAPH_INSIGHTS", "1").strip().lower() not in {"0", "false", "no", "off"}
     if prewarm_enabled and (chatbot_enabled or insights_enabled):
         try:
-            threading.Thread(target=_prewarm_ollama_model, name="ollama-prewarm", daemon=True).start()
+            threading.Thread(target=_prewarm_llm_model, name="llm-prewarm", daemon=True).start()
         except Exception:
-            logger.exception("Failed to schedule Ollama prewarm")
+            logger.exception("Failed to schedule LLM prewarm")
 
 # --------------------------------------------------
 #  CORS  FIXED (DEV SAFE)
@@ -251,7 +253,7 @@ def preflight(path: str, request: Request):
 # --------------------------------------------------
 from routers.analytics import compute_by_dimension_rows, router as analytics_router
 from routers.admin_files import router as admin_files_router
-from services.analytics_repository import invalidate_dataframe_cache
+from services.analytics_repository import invalidate_dataframe_cache, get_dataframe
 app.include_router(auth_router)
 app.include_router(analytics_router, dependencies=[Depends(get_current_user)])
 app.include_router(admin_files_router)
@@ -397,7 +399,7 @@ class ChatbotPayload(BaseModel):
     history: list[ChatbotTurn] = Field(default_factory=list)
     system_prompt: str | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=1.5)
-    max_tokens: int | None = Field(default=None, ge=8, le=2048)
+    max_tokens: int | None = Field(default=None, ge=8, le=4096)
     source: str | None = Field(default=None, max_length=64)
     dataset_type: str | None = Field(default=None, max_length=16)
     job_id: str | None = Field(default=None, max_length=128)
@@ -405,31 +407,39 @@ class ChatbotPayload(BaseModel):
     to_date: str | None = Field(default=None, max_length=32)
 
 
-DEFAULT_GEMMA_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma2:2b").strip() or "gemma2:2b"
+DEFAULT_LLM_MODEL = (
+    os.getenv("SARVAM_MODEL", "").strip()
+    or os.getenv("CHATBOT_MODEL", "").strip()
+    or os.getenv("CHATCARDS_MODEL", "").strip()
+    or "sarvam-m"
+)
 DEFAULT_CHATBOT_SYSTEM_PROMPT = (
-    "You are AI Sahyogi, the Zopper dashboard assistant. "
-    "Answer ONLY from the dashboard context provided in the prompt. "
-    "Do not use outside knowledge and do not invent brands, products, numbers, or events. "
-    "If the context does not contain the requested fact, reply: "
+    "You are AI Sahyogi, Senior Analytics Advisor for Zopper leadership reviews. "
+    "Answer only from dashboard context and never use outside assumptions. "
+    "Do not invent brands, products, numbers, dates, or events. "
+    "If the context is insufficient for a data question, respond exactly: "
     "\"I can’t confirm that from the current dashboard data.\" "
+    "For greetings, acknowledgements, or short conversational messages, respond naturally and invite a data question. "
     "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, "
     "samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma. "
-    "Use precise business language with concrete figures from context, complete sentences, and no filler."
+    "Write in a clear executive tone with concise, evidence-backed reasoning. "
+    "Lead with the direct answer, then support it with key metrics, trend direction, and business impact. "
+    "Do not re-introduce yourself unless the user explicitly asks who you are."
 )
 try:
-    CHATBOT_HISTORY_LIMIT = max(1, int(os.getenv("CHATBOT_HISTORY_LIMIT", "6")))
+    CHATBOT_HISTORY_LIMIT = max(1, int(os.getenv("CHATBOT_HISTORY_LIMIT", "10")))
 except ValueError:
-    CHATBOT_HISTORY_LIMIT = 6
+    CHATBOT_HISTORY_LIMIT = 10
 
 try:
-    CHATBOT_HISTORY_CHAR_LIMIT = max(80, int(os.getenv("CHATBOT_HISTORY_CHAR_LIMIT", "280")))
+    CHATBOT_HISTORY_CHAR_LIMIT = max(120, int(os.getenv("CHATBOT_HISTORY_CHAR_LIMIT", "650")))
 except ValueError:
-    CHATBOT_HISTORY_CHAR_LIMIT = 280
+    CHATBOT_HISTORY_CHAR_LIMIT = 650
 
 try:
-    CHATBOT_MESSAGE_CHAR_LIMIT = max(120, int(os.getenv("CHATBOT_MESSAGE_CHAR_LIMIT", "900")))
+    CHATBOT_MESSAGE_CHAR_LIMIT = max(200, int(os.getenv("CHATBOT_MESSAGE_CHAR_LIMIT", "2600")))
 except ValueError:
-    CHATBOT_MESSAGE_CHAR_LIMIT = 900
+    CHATBOT_MESSAGE_CHAR_LIMIT = 2600
 
 try:
     CHATBOT_CACHE_TTL_SECONDS = max(1, int(os.getenv("CHATBOT_CACHE_TTL_SECONDS", "180")))
@@ -527,8 +537,10 @@ def _to_safe_key(key: str) -> str:
 
 def _normalize_source_key(source: str) -> str:
     source_key = (source or "").strip().lower()
-    if source_key in {"samsung_vs", "samsung_vijay_sales"}:
+    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung vs", "samsung vijay sales", "vijay sales"}:
         return "samsung_vs"
+    if source_key in {"samsung_croma", "samsung croma", "croma"}:
+        return "samsung_croma"
     if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         return "reliance"
     if source_key in {"godrej", "goodrej", "goddrej"}:
@@ -656,6 +668,589 @@ def _resolve_chatbot_dataset_type(payload: ChatbotPayload) -> str:
         if inferred:
             return inferred
     return "sales"
+
+
+def _chatbot_message_tokens(text: str) -> list[str]:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").strip().lower())
+    return [token for token in cleaned.split() if token]
+
+
+def _chatbot_requested_dimensions_from_text(text: str) -> list[str]:
+    low = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not low:
+        return []
+
+    hints: list[tuple[str, tuple[str, ...]]] = [
+        (
+            "state",
+            (
+                "statewise",
+                "state wise",
+                "by state",
+                "state level",
+                "state breakup",
+                "state stats",
+            ),
+        ),
+        (
+            "month",
+            (
+                "monthwise",
+                "month wise",
+                "by month",
+                "monthly",
+                "which month",
+                "month level",
+                "month stats",
+            ),
+        ),
+        ("city", ("citywise", "city wise", "by city", "city level", "city stats")),
+        ("channel", ("channel wise", "channelwise", "by channel", "channel level", "channel stats")),
+        (
+            "device_plan_category",
+            (
+                "device plan category",
+                "device category",
+                "device wise",
+                "device-wise",
+            ),
+        ),
+        (
+            "plan_category",
+            (
+                "plan category",
+                "plan wise",
+                "plan-wise",
+            ),
+        ),
+        (
+            "product_category",
+            (
+                "product category",
+                "product wise",
+                "product-wise",
+            ),
+        ),
+        ("brand", ("brand wise", "brand-wise", "by brand", "brand level", "brand stats")),
+    ]
+
+    requested: list[str] = []
+    for dimension, patterns in hints:
+        if any(pattern in low for pattern in patterns):
+            requested.append(dimension)
+
+    # Keep single-word fallbacks last to avoid false positives.
+    single_word_hints: list[tuple[str, str]] = [
+        ("state", "state"),
+        ("month", "month"),
+        ("city", "city"),
+        ("channel", "channel"),
+        ("brand", "brand"),
+    ]
+    for dimension, token in single_word_hints:
+        if token in low and dimension not in requested:
+            requested.append(dimension)
+
+    return requested
+
+
+def _chatbot_requested_dimensions(payload: ChatbotPayload) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    text_candidates = [payload.message]
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() != "user":
+            continue
+        text_candidates.append(turn.content)
+
+    for text in text_candidates:
+        for dimension in _chatbot_requested_dimensions_from_text(text):
+            if dimension in seen:
+                continue
+            seen.add(dimension)
+            ordered.append(dimension)
+    return ordered
+
+
+def _prioritize_dimensions(base_dimensions: list[str], requested_dimensions: list[str]) -> list[str]:
+    ordered: list[str] = []
+    for dimension in requested_dimensions + base_dimensions:
+        if dimension and dimension not in ordered:
+            ordered.append(dimension)
+    return ordered
+
+
+def _is_chatbot_greeting(text: str) -> bool:
+    tokens = _chatbot_message_tokens(text)
+    if not tokens:
+        return False
+
+    greeting_words = {
+        "hi",
+        "hii",
+        "hello",
+        "hey",
+        "yo",
+        "hola",
+        "namaste",
+        "thanks",
+        "thank",
+        "ok",
+        "okay",
+    }
+    if len(tokens) <= 3 and all(token in greeting_words for token in tokens):
+        return True
+
+    joined = " ".join(tokens)
+    greeting_phrases = (
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "how are you",
+        "who are you",
+    )
+    return any(phrase in joined for phrase in greeting_phrases)
+
+
+def _requests_global_scope(text: str) -> bool:
+    low = " ".join(_chatbot_message_tokens(text))
+    if not low:
+        return False
+    scope_phrases = (
+        "all sources",
+        "across all sources",
+        "across sources",
+        "overall",
+        "entire database",
+        "full database",
+        "all datasets",
+        "all data",
+        "complete database",
+        "whole database",
+    )
+    return any(phrase in low for phrase in scope_phrases)
+
+
+def _chatbot_available_scopes(
+    *,
+    db: Session,
+    job_id: str | None,
+) -> list[dict[str, Any]]:
+    try:
+        query = db.query(
+            DataRow.source,
+            DataRow.dataset_type,
+            func.count(DataRow.id),
+        )
+        if job_id:
+            query = query.filter(DataRow.job_id == job_id)
+        rows = query.group_by(DataRow.source, DataRow.dataset_type).all()
+    except Exception:
+        logger.exception("Failed to load chatbot source coverage from data_rows.")
+        return []
+
+    grouped_counts: dict[tuple[str, str], int] = {}
+    for source_raw, dataset_raw, row_count_raw in rows:
+        source = _normalize_source_key(str(source_raw or ""))
+        dataset_type = (str(dataset_raw or "").strip().lower())
+        if not source or dataset_type not in {"sales", "claims"}:
+            continue
+        key = (source, dataset_type)
+        grouped_counts[key] = grouped_counts.get(key, 0) + int(row_count_raw or 0)
+
+    scopes = [
+        {
+            "source": source,
+            "dataset_type": dataset_type,
+            "row_count": row_count,
+        }
+        for (source, dataset_type), row_count in grouped_counts.items()
+    ]
+    scopes.sort(
+        key=lambda item: (
+            -int(item.get("row_count", 0) or 0),
+            _source_display_name(str(item.get("source", ""))),
+            str(item.get("dataset_type", "")),
+        )
+    )
+    return scopes
+
+
+def _sum_metric_from_dataframe(
+    frame: Any,
+    candidates: list[str],
+) -> float:
+    if frame is None or getattr(frame, "empty", True):
+        return 0.0
+
+    safe_to_columns: dict[str, list[str]] = {}
+    try:
+        columns = list(frame.columns)
+    except Exception:
+        columns = []
+    for col in columns:
+        safe_col = _to_safe_key(str(col))
+        safe_to_columns.setdefault(safe_col, []).append(str(col))
+
+    for candidate in candidates:
+        for col in safe_to_columns.get(_to_safe_key(candidate), []):
+            total = 0.0
+            found_numeric = False
+            try:
+                values = frame[col].tolist()
+            except Exception:
+                values = []
+            for raw in values:
+                num = _to_number(raw)
+                if num is None:
+                    continue
+                total += float(num)
+                found_numeric = True
+            if found_numeric:
+                return total
+
+    return 0.0
+
+
+def _build_live_summary_for_scope(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> dict[str, Any]:
+    try:
+        frame = get_dataframe(
+            db=db,
+            job_id=job_id,
+            source=source,
+            dataset_type=dataset_type,
+        )
+    except Exception:
+        logger.exception(
+            "Chatbot live summary fetch failed source=%s dataset=%s job_id=%s",
+            source,
+            dataset_type,
+            job_id,
+        )
+        return {}
+
+    if frame is None or getattr(frame, "empty", True):
+        return {}
+
+    if from_date or to_date:
+        try:
+            frame = filter_by_date_range(
+                frame,
+                dataset_type,
+                from_date,
+                to_date,
+            )
+        except Exception:
+            logger.exception(
+                "Chatbot live date filtering failed source=%s dataset=%s from=%s to=%s",
+                source,
+                dataset_type,
+                from_date,
+                to_date,
+            )
+            return {}
+
+    if frame is None or getattr(frame, "empty", True):
+        return {}
+
+    row_count = 0
+    try:
+        row_count = int(len(frame.index))
+    except Exception:
+        row_count = 0
+
+    if dataset_type == "claims":
+        total_claims_cost = _sum_metric_from_dataframe(
+            frame,
+            [
+                "claims",
+                "net_amount",
+                "claim_amount",
+                "zoppers_cost",
+                "gross_premium",
+                "amount",
+            ],
+        )
+        net_claims_cost = _sum_metric_from_dataframe(
+            frame,
+            [
+                "net_claims",
+                "net_claim",
+                "net_amount",
+                "earned_premium",
+            ],
+        )
+        claims_count = _sum_metric_from_dataframe(
+            frame,
+            [
+                "quantity",
+                "units_sold",
+                "claims_count",
+                "count",
+            ],
+        )
+        if claims_count <= 0:
+            claims_count = float(row_count)
+        if net_claims_cost <= 0 and total_claims_cost > 0:
+            net_claims_cost = total_claims_cost
+        return {
+            "gross_premium": float(total_claims_cost),
+            "earned_premium": float(net_claims_cost),
+            "units_sold": float(claims_count),
+        }
+
+    gross_premium = _sum_metric_from_dataframe(
+        frame,
+        [
+            "gross_premium",
+            "amount",
+            "plan_selling_price",
+            "plan_price",
+        ],
+    )
+    earned_premium = _sum_metric_from_dataframe(
+        frame,
+        [
+            "earned_premium",
+            "written_premium",
+            "earnedpremium",
+        ],
+    )
+    zopper_earned_premium = _sum_metric_from_dataframe(
+        frame,
+        [
+            "zopper_earned_premium",
+            "earned_zopper",
+            "zopper_shared_transfer_price",
+        ],
+    )
+    units_sold = _sum_metric_from_dataframe(
+        frame,
+        [
+            "quantity",
+            "units_sold",
+            "units",
+            "count",
+        ],
+    )
+
+    if units_sold <= 0:
+        units_sold = float(row_count)
+    if earned_premium <= 0 and gross_premium > 0:
+        earned_premium = gross_premium
+
+    return {
+        "gross_premium": float(gross_premium),
+        "earned_premium": float(earned_premium),
+        "zopper_earned_premium": float(zopper_earned_premium),
+        "units_sold": float(units_sold),
+    }
+
+
+def _resolve_summary_for_scope(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> dict[str, Any]:
+    summary = get_precomputed_summary(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if summary is None and (from_date or to_date):
+        summary = get_precomputed_summary(
+            db=db,
+            source=source,
+            dataset_type=dataset_type,
+            job_id=job_id,
+        )
+    if isinstance(summary, dict) and summary:
+        return summary
+    return _build_live_summary_for_scope(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+
+
+def _build_chatbot_global_context(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    from_date: str | None,
+    to_date: str | None,
+    job_id: str | None,
+) -> tuple[str, dict[str, Any]]:
+    scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+    date_label = (
+        f"{from_date or 'n/a'} to {to_date or 'n/a'}"
+        if (from_date or to_date)
+        else "all available data"
+    )
+
+    context_payload: dict[str, Any] = {
+        "source": "",
+        "source_label": "All Sources",
+        "dataset_type": "all",
+        "job_id": job_id,
+        "from_date": from_date,
+        "to_date": to_date,
+        "rankings": [],
+        "allowed_labels": sorted({_source_display_name(str(scope.get("source", ""))) for scope in scopes}),
+        "global_scope": True,
+    }
+
+    context_lines = [
+        "Scope mode: full database access across all sources and datasets.",
+        f"Selected date range: {date_label}",
+    ]
+    if job_id:
+        context_lines.append(f"Selected job tag: {job_id}")
+
+    if not scopes:
+        context_lines.append("No rows are available in data_rows for the current filters.")
+        return "\n".join(context_lines), context_payload
+
+    total_rows = sum(int(scope.get("row_count", 0) or 0) for scope in scopes)
+    context_lines.append(
+        f"Available source/dataset slices: {len(scopes)} (total rows: {total_rows:,})."
+    )
+    context_lines.append(
+        "Slices: "
+        + "; ".join(
+            f"{_source_display_name(str(scope.get('source', '')))} {scope.get('dataset_type')} ({int(scope.get('row_count', 0) or 0):,} rows)"
+            for scope in scopes[:12]
+        )
+    )
+
+    sales_totals = {
+        "gross_premium": 0.0,
+        "earned_premium": 0.0,
+        "zopper_earned_premium": 0.0,
+        "units_sold": 0.0,
+    }
+    claims_totals = {
+        "gross_premium": 0.0,
+        "earned_premium": 0.0,
+        "units_sold": 0.0,
+    }
+    summary_lines: list[str] = []
+    for scope in scopes[:12]:
+        source = str(scope.get("source", ""))
+        dataset_type = str(scope.get("dataset_type", ""))
+        if dataset_type not in {"sales", "claims"}:
+            continue
+
+        summary = _resolve_summary_for_scope(
+            db=db,
+            source=source,
+            dataset_type=dataset_type,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        if not summary:
+            continue
+
+        if dataset_type == "claims":
+            total_claims_cost = float(summary.get("gross_premium", 0) or 0)
+            net_claims_cost = float(summary.get("earned_premium", 0) or 0)
+            claims_count = float(summary.get("units_sold", 0) or 0)
+            claims_totals["gross_premium"] += total_claims_cost
+            claims_totals["earned_premium"] += net_claims_cost
+            claims_totals["units_sold"] += claims_count
+            summary_lines.append(
+                f"{_source_display_name(source)} claims summary: "
+                f"Total Claims Cost={_format_metric_value('claims', total_claims_cost)}; "
+                f"Net Claims Cost Paid={_format_metric_value('net_claims', net_claims_cost)}; "
+                f"No. of Claims={int(claims_count):,}"
+            )
+        else:
+            gross_premium = float(summary.get("gross_premium", 0) or 0)
+            earned_premium = float(summary.get("earned_premium", 0) or 0)
+            zopper_earned_premium = float(summary.get("zopper_earned_premium", 0) or 0)
+            units_sold = float(summary.get("units_sold", 0) or 0)
+            sales_totals["gross_premium"] += gross_premium
+            sales_totals["earned_premium"] += earned_premium
+            sales_totals["zopper_earned_premium"] += zopper_earned_premium
+            sales_totals["units_sold"] += units_sold
+            summary_lines.append(
+                f"{_source_display_name(source)} sales summary: "
+                f"Gross Premium={_format_metric_value('gross_premium', gross_premium)}; "
+                f"Earned Premium={_format_metric_value('earned_premium', earned_premium)}; "
+                f"Zopper Earned Premium={_format_metric_value('zopper_earned_premium', zopper_earned_premium)}; "
+                f"Units Sold={int(units_sold):,}"
+            )
+
+    if summary_lines:
+        context_lines.extend(summary_lines)
+    else:
+        context_lines.append(
+            "Summary metrics were not precomputed for these slices, but full row-level data exists in data_rows."
+        )
+
+    if any(value > 0 for value in sales_totals.values()):
+        context_lines.append(
+            "All-sources sales total: "
+            f"Gross Premium={_format_metric_value('gross_premium', sales_totals['gross_premium'])}; "
+            f"Earned Premium={_format_metric_value('earned_premium', sales_totals['earned_premium'])}; "
+            f"Zopper Earned Premium={_format_metric_value('zopper_earned_premium', sales_totals['zopper_earned_premium'])}; "
+            f"Units Sold={int(sales_totals['units_sold']):,}"
+        )
+    if any(value > 0 for value in claims_totals.values()):
+        context_lines.append(
+            "All-sources claims total: "
+            f"Total Claims Cost={_format_metric_value('claims', claims_totals['gross_premium'])}; "
+            f"Net Claims Cost Paid={_format_metric_value('net_claims', claims_totals['earned_premium'])}; "
+            f"No. of Claims={int(claims_totals['units_sold']):,}"
+        )
+
+    return "\n".join(context_lines), context_payload
+
+
+def _build_chatbot_greeting_response(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+) -> str:
+    job_id = _normalize_chatbot_job_id(payload.job_id)
+    scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+    if not scopes:
+        return (
+            "Hi. I'm AI Sahyogi and I can analyze dashboard data, but I don't see any rows in the database right now. "
+            "Upload or sync data, then ask about trends, anomalies, or actions."
+        )
+
+    total_rows = sum(int(scope.get("row_count", 0) or 0) for scope in scopes)
+    preview = "; ".join(
+        f"{_source_display_name(str(scope.get('source', '')))} {scope.get('dataset_type')} ({int(scope.get('row_count', 0) or 0):,} rows)"
+        for scope in scopes[:5]
+    )
+    return (
+        "Hi. I'm AI Sahyogi and I now have full access to all dashboard rows in the database. "
+        f"Current coverage: {len(scopes)} source/dataset slices, {total_rows:,} rows total. "
+        f"Examples: {preview}. "
+        "Ask any business question and I will answer from this data."
+    )
 
 
 def _pick_present_key(rows: list[dict[str, Any]], candidates: list[str]) -> str | None:
@@ -796,10 +1391,7 @@ def _chatbot_graph_rows(
             metric=metric,
         )
 
-    should_try_live = (
-        rows is None
-        and dimension in {"brand", "device_plan_category", "plan_category", "product_category"}
-    )
+    should_try_live = not rows
     if should_try_live:
         try:
             rows = compute_by_dimension_rows(
@@ -844,15 +1436,17 @@ def _build_chatbot_dashboard_context(
         "to_date": to_date,
         "rankings": [],
         "allowed_labels": [],
+        "requested_dimensions": [],
     }
 
-    if not source:
-        context_lines = [
-            "No source was selected or detected from user input.",
-            "If source is mentioned as reliance/resq, map to Reliance ResQ.",
-            "If source is mentioned as goodrej/goddrej, map to Godrej.",
-        ]
-        return "\n".join(context_lines), context_payload
+    if not source or _requests_global_scope(payload.message):
+        return _build_chatbot_global_context(
+            db=db,
+            payload=payload,
+            from_date=from_date,
+            to_date=to_date,
+            job_id=job_id,
+        )
 
     summary = get_precomputed_summary(
         db=db,
@@ -873,10 +1467,17 @@ def _build_chatbot_dashboard_context(
         summary = {}
 
     metric_candidates = _chatbot_metric_candidates(dataset_type)
-    dimension_candidates = _chatbot_dimension_candidates(source)
+    requested_dimensions = _chatbot_requested_dimensions(payload)
+    dimension_candidates = _prioritize_dimensions(
+        _chatbot_dimension_candidates(source),
+        requested_dimensions,
+    )
     rankings: list[dict[str, Any]] = []
     allowed_labels: set[str] = set()
+    context_payload["requested_dimensions"] = requested_dimensions
 
+    max_rankings = 5
+    required_dimensions = set(requested_dimensions)
     for dimension in dimension_candidates:
         snapshot: dict[str, Any] | None = None
         for metric in metric_candidates:
@@ -898,8 +1499,10 @@ def _build_chatbot_dashboard_context(
             for label in snapshot.get("labels", [])[:12]:
                 if label:
                     allowed_labels.add(str(label))
-        if len(rankings) >= 3:
-            break
+        if len(rankings) >= max_rankings:
+            ranking_dims = {str(item.get("dimension") or "") for item in rankings}
+            if required_dimensions.issubset(ranking_dims):
+                break
 
     context_payload["rankings"] = rankings
     context_payload["allowed_labels"] = sorted(allowed_labels)
@@ -963,6 +1566,81 @@ def _is_underperformance_query(message: str) -> bool:
     return any(token in low for token in under_tokens)
 
 
+def _is_dimension_stats_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    stat_tokens = (
+        "stats",
+        "statistics",
+        "breakdown",
+        "distribution",
+        "wise",
+        "statewise",
+        "monthwise",
+        "citywise",
+        "by state",
+        "by month",
+        "by city",
+        "by channel",
+    )
+    return any(token in low for token in stat_tokens)
+
+
+def _build_dimension_stats_answer(message: str, context_payload: dict[str, Any]) -> str | None:
+    if not _is_dimension_stats_query(message):
+        return None
+
+    rankings = context_payload.get("rankings") or []
+    if not rankings:
+        return None
+
+    requested_dimensions = _chatbot_requested_dimensions_from_text(message)
+    if not requested_dimensions:
+        return None
+
+    snapshot: dict[str, Any] | None = None
+    requested_dimension = requested_dimensions[0]
+    for dimension in requested_dimensions:
+        snapshot = next((row for row in rankings if row.get("dimension") == dimension), None)
+        if snapshot:
+            requested_dimension = dimension
+            break
+
+    source_label = context_payload.get("source_label") or "the selected source"
+    dataset_type = context_payload.get("dataset_type") or "sales"
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+
+    if snapshot is None:
+        return (
+            f"I can’t confirm {_pretty_label(requested_dimension).lower()}-wise statistics from the current dashboard data "
+            f"for {source_label}."
+        )
+
+    top = snapshot.get("top") or []
+    bottom = snapshot.get("bottom") or []
+    if not top and not bottom:
+        return (
+            f"I can’t confirm {_pretty_label(requested_dimension).lower()}-wise statistics from the current dashboard data "
+            f"for {source_label}."
+        )
+
+    metric = snapshot.get("metric") or "gross_premium"
+    dimension = snapshot.get("dimension") or requested_dimension
+    range_suffix = ""
+    if from_date or to_date:
+        range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
+
+    top_text = _format_rank_pairs(metric, top[:4]) if top else "n/a"
+    low_text = _format_rank_pairs(metric, bottom[:3]) if bottom else "n/a"
+    return (
+        f"In {source_label} {dataset_type}{range_suffix}, {_pretty_label(dimension).lower()}-wise "
+        f"{_pretty_label(metric).lower()} snapshot: Top segments are {top_text}. "
+        f"Lowest segments are {low_text}."
+    )
+
+
 def _build_underperformance_answer(message: str, context_payload: dict[str, Any]) -> str | None:
     if not _is_underperformance_query(message):
         return None
@@ -972,28 +1650,40 @@ def _build_underperformance_answer(message: str, context_payload: dict[str, Any]
         return None
 
     low_message = (message or "").lower()
-    wants_brand = "brand" in low_message
+    requested_dimensions = _chatbot_requested_dimensions_from_text(message)
+    strict_dimension: str | None = requested_dimensions[0] if requested_dimensions else None
+    wants_brand = "brand" in low_message or strict_dimension == "brand"
+
+    default_dimensions = (
+        "device_plan_category",
+        "plan_category",
+        "product_category",
+        "channel",
+        "state",
+        "month",
+    )
     if wants_brand:
-        preferred_dimensions = (
-            "brand",
-            "device_plan_category",
-            "product_category",
-            "plan_category",
+        default_dimensions = ("brand",) + default_dimensions
+
+    preferred_dimensions = tuple(
+        _prioritize_dimensions(
+            list(default_dimensions),
+            requested_dimensions,
         )
-    else:
-        preferred_dimensions = (
-            "device_plan_category",
-            "plan_category",
-            "product_category",
-            "channel",
-            "state",
-            "month",
-        )
+    )
+
     snapshot: dict[str, Any] | None = None
     for dim in preferred_dimensions:
         snapshot = next((row for row in rankings if row.get("dimension") == dim), None)
         if snapshot:
             break
+
+    if snapshot is None and strict_dimension:
+        source_label = context_payload.get("source_label") or "the selected source"
+        return (
+            f"I can’t confirm {_pretty_label(strict_dimension).lower()}-level underperformance from the current dashboard data "
+            f"for {source_label}."
+        )
     if snapshot is None and wants_brand:
         source_label = context_payload.get("source_label") or "the selected source"
         return f"I can’t confirm brand-level underperformance from the current dashboard data for {source_label}."
@@ -1202,7 +1892,7 @@ def _derive_data_driven_insights(payload: GraphInsightPayload) -> list[str]:
     return _dedupe_insights(insights)
 
 def _build_insight_prompt(payload: GraphInsightPayload) -> str:
-    rows = payload.rows[:80]
+    rows = payload.rows[:120]
     serialized_rows = json.dumps(rows, ensure_ascii=True, default=str)
     return (
         "Generate executive-ready insights for the graph below.\n"
@@ -1218,17 +1908,18 @@ def _build_insight_prompt(payload: GraphInsightPayload) -> str:
         "Data rows (JSON):\n"
         f"{serialized_rows}\n"
         "Output requirements:\n"
-        "- 3 to 5 bullets.\n"
+        "- 4 to 6 bullets.\n"
         "- Each bullet must include at least one concrete number from the data.\n"
-        "- Prioritize: latest status, strongest change, top/low contributor, and concentration/risk signal.\n"
-        "- Use professional business vocabulary (momentum, contribution, concentration, volatility, efficiency).\n"
-        "- Mention direction and scale (absolute and percent) when possible.\n"
+        "- Prioritize: current performance, strongest change, top/low contributors, and concentration/risk signal.\n"
+        "- Use professional business language (momentum, contribution, concentration, variance, efficiency, risk).\n"
+        "- Mention direction and scale (absolute and percent) wherever possible.\n"
+        "- Include one implication or action-oriented observation when supported by data.\n"
         "- Do not mention missing data, AI limitations, or generic disclaimers.\n"
-        "- Keep each bullet under 24 words.\n"
+        "- Keep each bullet under 34 words.\n"
     )
 
 
-def _resolve_ollama_model(*env_keys: str, default: str = DEFAULT_GEMMA_MODEL) -> str:
+def _resolve_llm_model(*env_keys: str, default: str = DEFAULT_LLM_MODEL) -> str:
     for key in env_keys:
         if not key:
             continue
@@ -1266,16 +1957,16 @@ def _trim_chat_text(value: str, limit: int) -> str:
 
 
 def _resolve_chatbot_num_predict(payload: ChatbotPayload) -> int:
-    hard_cap = max(64, _env_int("CHATBOT_MAX_NUM_PREDICT", 320))
+    hard_cap = max(256, _env_int("CHATBOT_MAX_NUM_PREDICT", 4096))
     if payload.max_tokens is not None:
         return max(8, min(int(payload.max_tokens), hard_cap))
 
     message = _trim_chat_text(payload.message, CHATBOT_MESSAGE_CHAR_LIMIT)
-    small_prompt_chars = max(1, _env_int("CHATBOT_SMALL_PROMPT_CHARS", 100))
-    medium_prompt_chars = max(small_prompt_chars + 1, _env_int("CHATBOT_MEDIUM_PROMPT_CHARS", 260))
-    small_tokens = max(48, _env_int("CHATBOT_SMALL_NUM_PREDICT", 120))
-    medium_tokens = max(72, _env_int("CHATBOT_MEDIUM_NUM_PREDICT", 180))
-    large_tokens = max(96, _env_int("CHATBOT_LARGE_NUM_PREDICT", 260))
+    small_prompt_chars = max(1, _env_int("CHATBOT_SMALL_PROMPT_CHARS", 180))
+    medium_prompt_chars = max(small_prompt_chars + 1, _env_int("CHATBOT_MEDIUM_PROMPT_CHARS", 520))
+    small_tokens = max(220, _env_int("CHATBOT_SMALL_NUM_PREDICT", 420))
+    medium_tokens = max(420, _env_int("CHATBOT_MEDIUM_NUM_PREDICT", 900))
+    large_tokens = max(760, _env_int("CHATBOT_LARGE_NUM_PREDICT", 1800))
 
     if len(message) <= small_prompt_chars:
         return min(small_tokens, hard_cap)
@@ -1377,59 +2068,85 @@ def _build_chatbot_prompt(payload: ChatbotPayload, dashboard_context: str) -> st
         lines.append(f"{role_label}: {content}")
 
     message = _trim_chat_text(payload.message, CHATBOT_MESSAGE_CHAR_LIMIT)
+    lines.append("")
+    lines.append("Response quality bar:")
+    lines.append("1) Answer the user's question directly in the first sentence.")
+    lines.append("2) Use concrete metrics, dates, and comparisons from context when available.")
+    lines.append("3) Keep the answer structured, professional, and decision-oriented.")
+    lines.append("4) If recommending actions, provide up to 3 prioritized next steps.")
     lines.append(f"User: {message}")
     lines.append("Assistant:")
     return "\n".join(lines)
 
 
-def _call_ollama(
+def _call_llm(
     system_prompt: str,
     prompt: str,
     *,
     model: str | None = None,
     temperature: float = 0.2,
-    num_predict: int = 220,
+    num_predict: int = 480,
     timeout_seconds: int | None = None,
     keep_alive: str | None = None,
     num_ctx: int | None = None,
     num_thread: int | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
-    resolved_model = (model or "").strip() or _resolve_ollama_model("CHATCARDS_MODEL", "OLLAMA_MODEL")
-    ollama_url = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate").strip() or "http://127.0.0.1:11434/api/generate"
-    resolved_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else _env_int("OLLAMA_TIMEOUT_SECONDS", 20)
-    resolved_keep_alive = (keep_alive or os.getenv("OLLAMA_KEEP_ALIVE", "")).strip()
-    options: dict[str, Any] = {
-        "temperature": temperature,
-        "num_predict": num_predict,
-    }
-    if num_ctx is not None and num_ctx > 0:
-        options["num_ctx"] = int(num_ctx)
-    if num_thread is not None and num_thread > 0:
-        options["num_thread"] = int(num_thread)
+    resolved_model = (model or "").strip() or _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
+    sarvam_url = os.getenv("SARVAM_API_URL", "https://api.sarvam.ai/v1/chat/completions").strip() or "https://api.sarvam.ai/v1/chat/completions"
+    sarvam_api_key = os.getenv("SARVAM_API_KEY", "").strip()
+    if not sarvam_api_key:
+        raise ValueError("SARVAM_API_KEY is not configured.")
+
+    resolved_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else _env_int("SARVAM_TIMEOUT_SECONDS", 70)
+    resolved_max_tokens = max(8, int(num_predict))
+    resolved_temperature = max(0.0, min(1.5, float(temperature)))
+    _ = keep_alive, num_ctx, num_thread  # kept for backward-compatible call signatures
 
     body = {
         "model": resolved_model,
-        "system": system_prompt,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": prompt.strip()},
+        ],
+        "temperature": resolved_temperature,
+        "max_tokens": resolved_max_tokens,
         "stream": False,
-        "options": options,
     }
-    if resolved_keep_alive:
-        body["keep_alive"] = resolved_keep_alive
     raw = json.dumps(body).encode("utf-8")
     req = UrlRequest(
-        ollama_url,
+        sarvam_url,
         data=raw,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "api-subscription-key": sarvam_api_key,
+        },
         method="POST",
     )
 
     with urlopen(req, timeout=resolved_timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
-        response_text = (payload.get("response") or "").strip()
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("Sarvam response missing choices.")
+
+        first_choice = choices[0] if isinstance(choices[0], dict) else {}
+        message_obj = first_choice.get("message")
+        if isinstance(message_obj, dict):
+            response_text = str(message_obj.get("content") or "").strip()
+        else:
+            response_text = str(first_choice.get("text") or "").strip()
+
         if not response_text:
             raise ValueError("Empty LLM response.")
-        return resolved_model, response_text, payload
+
+        usage_obj = payload.get("usage")
+        completion_tokens = usage_obj.get("completion_tokens") if isinstance(usage_obj, dict) else None
+        response_meta = {
+            "done_reason": str(first_choice.get("finish_reason") or "").strip().lower(),
+            "eval_count": completion_tokens,
+            "provider": "sarvam",
+        }
+        return resolved_model, response_text, response_meta
 
 
 def _looks_truncated_response(
@@ -1468,6 +2185,20 @@ def _looks_incomplete_response(response_text: str) -> bool:
 
     if text.endswith((",", ":", ";", "-", "/")):
         return True
+    if text.endswith(("(", "[", "{")):
+        return True
+    if re.search(r"\([^\)]*$", text):
+        return True
+    if re.search(r"\[[^\]]*$", text):
+        return True
+    if re.search(r"\{[^}]*$", text):
+        return True
+    if text.count("(") > text.count(")"):
+        return True
+    if text.count("[") > text.count("]"):
+        return True
+    if text.count("{") > text.count("}"):
+        return True
 
     words = text.split()
     if not words:
@@ -1499,7 +2230,7 @@ def _repair_incomplete_response(
         return response_text
 
     try:
-        _, repaired_text, _ = _call_ollama(
+        _, repaired_text, _ = _call_llm(
             "You rewrite incomplete assistant answers into one complete response.",
             (
                 "The response below ended mid-thought. Rewrite it as one complete, coherent "
@@ -1508,8 +2239,8 @@ def _repair_incomplete_response(
             ),
             model=model_name,
             temperature=min(temperature, 0.12),
-            num_predict=min(max_num_predict_cap, max(24, _env_int("CHATBOT_REPAIR_NUM_PREDICT", 72))),
-            timeout_seconds=max(6, min(retry_timeout_seconds, 14)),
+            num_predict=min(max_num_predict_cap, max(128, _env_int("CHATBOT_REPAIR_NUM_PREDICT", 640))),
+            timeout_seconds=max(8, min(retry_timeout_seconds, 24)),
             keep_alive=keep_alive,
             num_ctx=num_ctx,
             num_thread=num_thread if num_thread > 0 else None,
@@ -1523,15 +2254,15 @@ def _repair_incomplete_response(
     return response_text
 
 
-def _prewarm_ollama_model() -> None:
-    model_name = _resolve_ollama_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "OLLAMA_MODEL")
+def _prewarm_llm_model() -> None:
+    model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
     prewarm_timeout = max(10, _env_int("CHATBOT_PREWARM_TIMEOUT_SECONDS", 45))
-    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip() or os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
+    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip()
     num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
     num_thread = _env_int("CHATBOT_NUM_THREAD", 0)
     try:
         started_at = time.perf_counter()
-        _call_ollama(
+        _call_llm(
             "You are a concise assistant.",
             "User: Reply with OK.\nAssistant:",
             model=model_name,
@@ -1543,9 +2274,9 @@ def _prewarm_ollama_model() -> None:
             num_thread=num_thread if num_thread > 0 else None,
         )
         duration_ms = (time.perf_counter() - started_at) * 1000
-        logger.info("Ollama prewarm complete model=%s duration_ms=%.2f", model_name, duration_ms)
+        logger.info("LLM prewarm complete model=%s duration_ms=%.2f", model_name, duration_ms)
     except Exception as exc:
-        logger.warning("Ollama prewarm failed: %s", exc)
+        logger.warning("LLM prewarm failed: %s", exc)
 
 
 @app.post("/insights/graph")
@@ -1595,9 +2326,19 @@ def generate_graph_insights(
     system_prompt = _read_chatcards_system_prompt()
     prompt = _build_insight_prompt(payload)
     base_insights = _derive_data_driven_insights(payload)
+    insight_tokens = max(220, _env_int("CHATCARDS_NUM_PREDICT", 560))
+    insight_timeout = max(12, _env_int("CHATCARDS_TIMEOUT_SECONDS", 55))
+    insight_temperature = _env_float("CHATCARDS_TEMPERATURE", 0.2)
 
     try:
-        model, response_text, _ = _call_ollama(system_prompt, prompt)
+        model, response_text, _ = _call_llm(
+            system_prompt,
+            prompt,
+            model=_resolve_llm_model("CHATCARDS_MODEL", "CHATBOT_MODEL", "SARVAM_MODEL"),
+            temperature=insight_temperature,
+            num_predict=insight_tokens,
+            timeout_seconds=insight_timeout,
+        )
     except (URLError, TimeoutError, ValueError, OSError) as exc:
         logger.warning("Graph insights generation failed: %s", exc)
         if base_insights:
@@ -1631,8 +2372,7 @@ def generate_graph_insights(
         raise HTTPException(
             status_code=503,
             detail=(
-                "Insights service unavailable. Ensure Ollama is running and "
-                "CHATCARDS_MODEL points to an installed Gemma model (example: gemma2:2b)."
+                "Insights service unavailable. Ensure SARVAM_API_KEY is configured and SARVAM_MODEL is valid."
             ),
         )
 
@@ -1682,11 +2422,26 @@ def chatbot_message(
             "message": "Chatbot is disabled in this environment.",
         }
 
+    if _is_chatbot_greeting(payload.message):
+        return {
+            "response": _build_chatbot_greeting_response(
+                db=db,
+                payload=payload,
+            ),
+            "model": "rule-based-greeting",
+        }
+
     dashboard_context, context_payload = _build_chatbot_dashboard_context(db=db, payload=payload)
     rule_based_answer = _build_underperformance_answer(payload.message, context_payload)
     if rule_based_answer:
         return {
             "response": rule_based_answer,
+            "model": "rule-based-dashboard",
+        }
+    dimension_stats_answer = _build_dimension_stats_answer(payload.message, context_payload)
+    if dimension_stats_answer:
+        return {
+            "response": dimension_stats_answer,
             "model": "rule-based-dashboard",
         }
 
@@ -1701,16 +2456,20 @@ def chatbot_message(
         "Hard constraints:\n"
         "1) Use only the Dashboard context block and conversation turns.\n"
         "2) Never mention entities or numbers absent from Dashboard context.\n"
-        "3) If context is missing, reply exactly: I can’t confirm that from the current dashboard data.\n"
+        "3) If context is missing for a data question, reply exactly: I can’t confirm that from the current dashboard data.\n"
+        "4) Give a direct answer first, then supporting evidence and implications.\n"
+        "5) Prefer precise metrics and avoid generic statements.\n"
+        "6) Do not re-introduce AI Sahyogi unless the user explicitly asks.\n"
+        "7) End with a complete final sentence and close any opened bracket.\n"
     )
-    model_name = _resolve_ollama_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "OLLAMA_MODEL")
+    model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
     temperature = payload.temperature if payload.temperature is not None else _env_float("CHATBOT_TEMPERATURE", 0.15)
     max_tokens = _resolve_chatbot_num_predict(payload)
-    timeout_seconds = max(8, _env_int("CHATBOT_TIMEOUT_SECONDS", 30))
-    retry_timeout_seconds = max(6, min(timeout_seconds, _env_int("CHATBOT_RETRY_TIMEOUT_SECONDS", 14)))
-    retry_num_predict = max(12, min(max_tokens, _env_int("CHATBOT_RETRY_NUM_PREDICT", 48)))
-    max_num_predict_cap = max(max_tokens, _env_int("CHATBOT_MAX_NUM_PREDICT", 320))
-    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip() or os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip()
+    timeout_seconds = max(12, _env_int("CHATBOT_TIMEOUT_SECONDS", 65))
+    retry_timeout_seconds = max(8, min(timeout_seconds, _env_int("CHATBOT_RETRY_TIMEOUT_SECONDS", 30)))
+    retry_num_predict = max(128, min(max_tokens, _env_int("CHATBOT_RETRY_NUM_PREDICT", 640)))
+    max_num_predict_cap = max(max_tokens, _env_int("CHATBOT_MAX_NUM_PREDICT", 4096))
+    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip()
     num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
     num_thread = _env_int("CHATBOT_NUM_THREAD", 0)
     context_fingerprint = hashlib.sha256(dashboard_context.encode("utf-8")).hexdigest()
@@ -1728,7 +2487,7 @@ def chatbot_message(
     started_at = time.perf_counter()
 
     try:
-        model, response_text, response_meta = _call_ollama(
+        model, response_text, response_meta = _call_llm(
             system_prompt,
             prompt,
             model=model_name,
@@ -1745,12 +2504,12 @@ def chatbot_message(
         )
         elapsed_seconds = time.perf_counter() - started_at
         remaining_budget = max(0.0, float(timeout_seconds) - elapsed_seconds)
-        allow_expansion = max_tokens > 96 and remaining_budget >= 8.0
+        allow_expansion = max_tokens > 160 and remaining_budget >= 10.0
         if needs_expansion and max_tokens < max_num_predict_cap and allow_expansion:
-            expanded_tokens = min(max_num_predict_cap, max_tokens + 16)
+            expanded_tokens = min(max_num_predict_cap, max_tokens + max(256, max_tokens // 2))
             try:
-                expansion_timeout = max(6, min(retry_timeout_seconds, 8, int(remaining_budget)))
-                model, expanded_text, _ = _call_ollama(
+                expansion_timeout = max(8, min(retry_timeout_seconds, max(10, int(remaining_budget))))
+                model, expanded_text, _ = _call_llm(
                     system_prompt,
                     prompt,
                     model=model_name,
@@ -1761,9 +2520,20 @@ def chatbot_message(
                     num_ctx=num_ctx,
                     num_thread=num_thread if num_thread > 0 else None,
                 )
-                if expanded_text and len(expanded_text) > len(response_text):
+                if expanded_text and len(expanded_text) >= len(response_text):
                     response_text = expanded_text
                     max_tokens = expanded_tokens
+                if _looks_incomplete_response(response_text):
+                    response_text = _repair_incomplete_response(
+                        model_name=model_name,
+                        response_text=response_text,
+                        temperature=temperature,
+                        max_num_predict_cap=max_num_predict_cap,
+                        retry_timeout_seconds=retry_timeout_seconds,
+                        keep_alive=keep_alive,
+                        num_ctx=num_ctx,
+                        num_thread=num_thread,
+                    )
             except (URLError, TimeoutError, ValueError, OSError):
                 response_text = _repair_incomplete_response(
                     model_name=model_name,
@@ -1789,7 +2559,7 @@ def chatbot_message(
     except (URLError, TimeoutError, ValueError, OSError) as exc:
         if _is_timeout_exception(exc):
             try:
-                model, response_text, _ = _call_ollama(
+                model, response_text, _ = _call_llm(
                     system_prompt,
                     prompt,
                     model=model_name,
@@ -1805,8 +2575,7 @@ def chatbot_message(
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Chatbot service unavailable. Ensure Ollama is running and "
-                        "CHATBOT_MODEL points to an installed Gemma model (example: gemma2:2b)."
+                        "Chatbot service unavailable. Ensure SARVAM_API_KEY is configured and SARVAM_MODEL is valid."
                     ),
                 )
         else:
@@ -1814,10 +2583,21 @@ def chatbot_message(
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Chatbot service unavailable. Ensure Ollama is running and "
-                    "CHATBOT_MODEL points to an installed Gemma model (example: gemma2:2b)."
+                    "Chatbot service unavailable. Ensure SARVAM_API_KEY is configured and SARVAM_MODEL is valid."
                 ),
             )
+
+    if _looks_incomplete_response(response_text):
+        response_text = _repair_incomplete_response(
+            model_name=model_name,
+            response_text=response_text,
+            temperature=temperature,
+            max_num_predict_cap=max_num_predict_cap,
+            retry_timeout_seconds=retry_timeout_seconds,
+            keep_alive=keep_alive,
+            num_ctx=num_ctx,
+            num_thread=num_thread,
+        )
 
     response_payload = {
         "response": response_text,

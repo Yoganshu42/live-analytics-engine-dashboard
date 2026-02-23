@@ -25,7 +25,7 @@ export default function Sidebar({
     brand === "samsung" || brand === "samsung_croma" || brand === "samsung_vs"
 
   return (
-    <div className="w-64 border-r bg-white p-4 h-full flex flex-col overflow-y-auto">
+    <div className="w-full md:w-64 shrink-0 border-b md:border-b-0 md:border-r bg-white p-3 sm:p-4 h-auto md:h-full flex flex-col overflow-y-auto">
       <div>
         <h2 className="text-xs font-bold text-gray-400 mb-4 uppercase tracking-wider">
           Navigation

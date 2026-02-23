@@ -35,8 +35,10 @@ logger = logging.getLogger(__name__)
 def _normalize_source(source: str) -> tuple[str, str]:
     source_key = source.lower().strip()
     # normalize known aliases
-    if source_key in {"samsung_vs", "samsung_vijay_sales"}:
+    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung vs", "samsung vijay sales", "vijay sales"}:
         resolved = "samsung_vs"
+    elif source_key in {"samsung_croma", "samsung croma", "croma"}:
+        resolved = "samsung_croma"
     elif source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         resolved = "reliance"
     elif source_key in {"godrej", "goodrej", "goddrej"}:

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useMemo, useEffect, useRef, useCallback } from "react"
+import { useState, useMemo, useEffect, useRef, useCallback, useLayoutEffect } from "react"
 import Image from "next/image"
 import { useRouter } from "next/navigation"
 import { motion, AnimatePresence, Variants, useReducedMotion } from "framer-motion"
@@ -20,7 +20,6 @@ import GraphSection from "@/components/GraphSection"
 import { clearGraphDataCache } from "@/components/GraphView"
 import ResultCard from "@/components/ResultCard"
 import LastUpdatedCard from "@/components/LastUpdatedCard"
-import AdminFileAccess from "@/components/AdminFileAccess"
 import DateRangePicker from "@/components/DateRangePicker"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
 
@@ -147,6 +146,9 @@ export default function DashboardPage() {
   const [authName, setAuthName] = useState<string>("")
   const [authReady, setAuthReady] = useState(false)
   const prefersReducedMotion = useReducedMotion()
+  const homeViewportRef = useRef<HTMLDivElement | null>(null)
+  const homeSceneRef = useRef<HTMLDivElement | null>(null)
+  const [homeSceneScale, setHomeSceneScale] = useState(1)
 
   const [fromDate, setFromDate] = useState<string>(initialDashboardState.from)
   const [toDate, setToDate] = useState<string>(initialDashboardState.to)
@@ -214,7 +216,6 @@ export default function DashboardPage() {
       localStorage.setItem("dashboard_fullscreen", "0")
     }
     forceFilterRefresh()
-    forcePageRefresh()
   }
 
   useEffect(() => {
@@ -293,8 +294,10 @@ export default function DashboardPage() {
           return
         }
         const fallbackFrom = min || max || today
-        const fallbackTo = today
-        const upperBound = today
+        const upperBound = max
+          ? (max <= today ? max : today)
+          : today
+        const fallbackTo = upperBound
         const clampToFilterWindow = (value: string) => {
           if (!value) return value
           if (min && value < min) return min
@@ -410,6 +413,55 @@ export default function DashboardPage() {
     accent: mode === "sales" ? "text-indigo-600" : "text-rose-600",
     bgLight: mode === "sales" ? "bg-indigo-50/50" : "bg-rose-50/50",
   }), [mode])
+
+  useLayoutEffect(() => {
+    if (view !== "home") {
+      return
+    }
+
+    const viewportNode = homeViewportRef.current
+    const sceneNode = homeSceneRef.current
+    if (!viewportNode || !sceneNode) return
+
+    let frame = 0
+    const recalc = () => {
+      const viewportWidth = Math.max(0, viewportNode.clientWidth - 20)
+      const viewportHeight = Math.max(0, viewportNode.clientHeight - 20)
+      const sceneWidth = sceneNode.scrollWidth
+      const sceneHeight = sceneNode.scrollHeight
+      if (!viewportWidth || !viewportHeight || !sceneWidth || !sceneHeight) return
+
+      const widthScale = viewportWidth / sceneWidth
+      const heightScale = viewportHeight / sceneHeight
+      const nextScale = Math.min(1, widthScale, heightScale)
+      const rounded = Number(nextScale.toFixed(3))
+      setHomeSceneScale((prev) => (Math.abs(prev - rounded) > 0.005 ? rounded : prev))
+    }
+
+    const schedule = () => {
+      if (frame) cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(recalc)
+    }
+
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null
+    observer?.observe(viewportNode)
+    observer?.observe(sceneNode)
+
+    window.addEventListener("resize", schedule)
+    window.addEventListener("orientationchange", schedule)
+
+    schedule()
+    const lateTimer = window.setTimeout(schedule, 180)
+
+    return () => {
+      window.clearTimeout(lateTimer)
+      if (frame) cancelAnimationFrame(frame)
+      window.removeEventListener("resize", schedule)
+      window.removeEventListener("orientationchange", schedule)
+      observer?.disconnect()
+    }
+  }, [view])
+
   const activeDateKey = `${brand}|${mode}|${effectiveJobId || ""}`
   const hasResolvedDateBounds = defaultKey === activeDateKey
   const hasDateBounds = Boolean(defaultFromDate && defaultToDate)
@@ -439,7 +491,7 @@ export default function DashboardPage() {
       forceFilterRefresh()
       return
     }
-    const defaultUpper = todayIso()
+    const defaultUpper = defaultToDate || todayIso()
     const resetRange = normalizeDateRange(
       defaultFromDate,
       defaultUpper,
@@ -486,15 +538,15 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="smooth-surface h-screen flex flex-col bg-[#fbfcfd] text-slate-900 font-sans selection:bg-indigo-100 overflow-hidden">
+    <div className="smooth-surface h-[100dvh] min-h-screen flex flex-col bg-[#fbfcfd] text-slate-900 font-sans selection:bg-indigo-100 overflow-hidden">
       {/* HEADER */}
       <motion.header 
         variants={headerSlide}
         initial="initial"
         animate="animate"
-        className="h-20 flex items-center justify-between px-10 border-b bg-white/80 backdrop-blur-2xl sticky top-0 z-40"
+        className="h-20 flex items-center justify-between px-4 sm:px-6 lg:px-10 border-b bg-white/80 backdrop-blur-2xl sticky top-0 z-40"
       >
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-3 sm:gap-6">
           <motion.button
             whileHover={{ scale: 1.05 }}
             onClick={() => handleViewChange("home")}
@@ -508,7 +560,7 @@ export default function DashboardPage() {
               className="h-9 w-auto object-contain"
             />
           </motion.button>
-          <div className="h-8 w-[1px] bg-slate-200" />
+          <div className="hidden sm:block h-8 w-[1px] bg-slate-200" />
           <h1 className="flex items-center gap-3">
             <span className={`${theme.accent} font-black uppercase text-[11px] tracking-[0.4em]`}>
               Analytics 
@@ -516,7 +568,7 @@ export default function DashboardPage() {
           </h1>
         </div>
 
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-3 sm:gap-6">
           <AnimatePresence>
             {view === "dashboard" && (
               <motion.div 
@@ -564,7 +616,8 @@ export default function DashboardPage() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0, scale: 0.98 }}
             transition={{ duration: 0.5 }}
-            className="content-auto relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-6"
+            ref={homeViewportRef}
+            className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-4 sm:p-6"
           >
             {/* Background Elements */}
             <div className="absolute inset-0 -z-10">
@@ -685,7 +738,14 @@ export default function DashboardPage() {
               </div>
             </motion.div>
 
-            <div className="w-full max-w-6xl mx-auto relative z-20 min-h-full flex flex-col justify-center py-6 items-center">
+            <div
+              ref={homeSceneRef}
+              className="w-full max-w-6xl mx-auto relative z-20 min-h-full flex flex-col justify-center py-6 items-center will-change-transform"
+              style={{
+                transform: `scale(${homeSceneScale})`,
+                transformOrigin: "top center",
+              }}
+            >
               <div className="text-center mb-20">
                 <motion.div variants={staggerContainer} initial="initial" animate="animate">
                   <motion.div variants={fadeIn} className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white border border-slate-200 shadow-sm mb-8">
@@ -751,18 +811,6 @@ export default function DashboardPage() {
                 ))}
               </motion.div>
 
-              {authRole === "admin" && (
-                <div className="mt-8 w-full md:max-w-[1204px]">
-                  <div className="grid grid-cols-1 md:grid-cols-3">
-                    <div className="md:col-start-2 flex justify-center">
-                      <div className="w-full max-w-xs">
-                        <AdminFileAccess isAdmin />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
             </div>
           </motion.div>
         ) : (
@@ -771,7 +819,7 @@ export default function DashboardPage() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="flex flex-1 overflow-hidden"
+            className="flex flex-1 flex-col md:flex-row overflow-hidden"
           >
             <Sidebar
               brand={brand}
@@ -781,9 +829,9 @@ export default function DashboardPage() {
               authRole={authRole}
             />
 
-            <main className="flex-1 p-10 overflow-y-auto bg-[#fbfcfd] custom-scrollbar">
+            <main className="flex-1 min-w-0 p-4 sm:p-6 lg:p-10 overflow-y-auto bg-[#fbfcfd] custom-scrollbar">
               <div className="max-w-7xl mx-auto">
-                <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="flex justify-between items-end mb-12">
+                <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="flex flex-col gap-6 xl:flex-row xl:justify-between xl:items-end mb-12">
                   <div className="space-y-2">
                     <div className="flex items-center gap-3">
                        <div className={`p-2 rounded-lg ${theme.bgLight}`}>
@@ -791,12 +839,12 @@ export default function DashboardPage() {
                        </div>
                        <span className="text-[11px] font-black uppercase tracking-[0.3em] text-slate-400">Strategic Performance</span>
                     </div>
-                    <h2 className="text-5xl font-black capitalize text-slate-900 tracking-tighter">
+                    <h2 className="text-3xl sm:text-4xl xl:text-5xl font-black capitalize text-slate-900 tracking-tighter">
                       {brandLabel(brand)}
                     </h2>
                   </div>
 
-                  <div className="flex flex-col items-end gap-5">
+                  <div className="flex flex-col items-start xl:items-end gap-5">
                     {brand.startsWith("samsung") && (
                       <motion.div 
                         initial={{ opacity: 0, scale: 0.9 }} 
@@ -813,7 +861,7 @@ export default function DashboardPage() {
                   </div>
                 </motion.div>
 
-                <motion.div variants={staggerContainer} initial="initial" animate="animate" className="grid grid-cols-1 lg:grid-cols-12 gap-8 mb-10">
+                <motion.div variants={staggerContainer} initial="initial" animate="animate" className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 lg:gap-8 mb-10">
                   <motion.div variants={fadeIn} className="lg:col-span-4 h-full">
                     {isDashboardDataReady ? (
                       <ResultCard
@@ -872,7 +920,7 @@ export default function DashboardPage() {
                   </motion.div>
                 </motion.div>
 
-                <motion.section initial={{ opacity: 0, y: 40 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }} className="bg-white p-10 rounded-[48px] border border-slate-200 shadow-sm relative group">
+                <motion.section initial={{ opacity: 0, y: 40 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }} className="bg-white p-4 sm:p-6 lg:p-10 rounded-[32px] sm:rounded-[40px] lg:rounded-[48px] border border-slate-200 shadow-sm relative group">
                   <div className="flex justify-between items-center mb-10">
                     <div className="space-y-1">
                       <h3 className="font-bold text-2xl flex items-center gap-4">
@@ -923,7 +971,7 @@ export default function DashboardPage() {
       <AnimatePresence>
         {isFullscreen && (
           <motion.div initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} className="fixed inset-0 z-50 bg-white overflow-hidden flex flex-col">
-            <div className="p-8 border-b flex items-center justify-between bg-white/80 backdrop-blur-md">
+            <div className="p-4 sm:p-6 lg:p-8 border-b flex items-center justify-between gap-3 bg-white/80 backdrop-blur-md">
               <div className="flex items-center gap-4">
                 <div className={`h-10 w-10 rounded-xl flex items-center justify-center ${theme.bgLight} ${theme.accent}`}>
                    <Activity size={20} />
@@ -933,9 +981,9 @@ export default function DashboardPage() {
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{mode === "sales" ? "Sales Velocity" : "Claims Integrity"}</p>
                 </div>
               </div>
-              <button className="px-8 py-3 bg-slate-900 text-white rounded-2xl text-xs font-bold hover:bg-black transition-all" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
+              <button className="px-4 sm:px-6 lg:px-8 py-3 bg-slate-900 text-white rounded-2xl text-xs font-bold hover:bg-black transition-all whitespace-nowrap" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
             </div>
-            <div className="flex-1 p-12 overflow-auto">
+            <div className="flex-1 p-4 sm:p-6 lg:p-12 overflow-auto">
               {isDashboardDataReady ? (
                 <GraphSection
                   key={`fullscreen-graph-${brand}-${mode}-${effectiveJobId || ""}-${fromDate}-${toDate}-${filterRefreshTick}`}

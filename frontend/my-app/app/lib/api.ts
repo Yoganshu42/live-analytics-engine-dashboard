@@ -202,7 +202,7 @@ const API_FALLBACKS = Array.from(
 )
 const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
 const ADMIN_UPLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_ADMIN_UPLOAD_TIMEOUT_MS || 180000)
-const CHATBOT_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_CHATBOT_TIMEOUT_MS || 60000)
+const CHATBOT_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_CHATBOT_TIMEOUT_MS || 120000)
 let preferredApiBase = API_FALLBACKS[0] || ""
 
 const orderedApiBases = () => {

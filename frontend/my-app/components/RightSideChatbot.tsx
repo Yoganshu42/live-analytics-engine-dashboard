@@ -21,7 +21,10 @@ const normalizeSource = (value: string) => {
     return "reliance"
   }
   if (key === "goodrej" || key === "goddrej") return "godrej"
-  if (key === "samsung_vijay_sales") return "samsung_vs"
+  if (key === "samsung_vijay_sales" || key === "samsung vijay sales" || key === "samsung vs" || key === "vijay sales") {
+    return "samsung_vs"
+  }
+  if (key === "samsung croma" || key === "croma") return "samsung_croma"
   return key
 }
 
@@ -56,7 +59,7 @@ export default function RightSideChatbot() {
   const history: ChatbotTurn[] = useMemo(
     () =>
       messages
-        .slice(-6)
+        .slice(-10)
         .map((msg) => ({ role: msg.role, content: msg.content })),
     [messages]
   )
@@ -81,10 +84,7 @@ export default function RightSideChatbot() {
     setIsSending(true)
     try {
       const compactText = text.replace(/\s+/g, " ").trim()
-      const maxTokens =
-        compactText.length <= 80 ? 120 :
-        compactText.length <= 220 ? 180 :
-        260
+      const maxTokens = Math.max(900, Math.min(4096, Math.ceil(compactText.length * 4.5)))
 
       const source = normalizeSource(
         typeof window !== "undefined" ? localStorage.getItem("dashboard_brand") || "" : ""
@@ -107,7 +107,7 @@ export default function RightSideChatbot() {
       const result = await sendChatbotMessage({
         message: text,
         history,
-        temperature: 0.15,
+        temperature: 0.14,
         max_tokens: maxTokens,
         source: source || undefined,
         dataset_type: datasetType,
@@ -121,7 +121,7 @@ export default function RightSideChatbot() {
       const detail =
         err instanceof Error
           ? err.message
-          : "Chatbot is unavailable right now. Check Ollama/Gemma service."
+          : "Chatbot is unavailable right now. Check Sarvam service configuration."
       setMessages((prev) => [...prev, { role: "assistant", content: detail }])
     } finally {
       setIsSending(false)

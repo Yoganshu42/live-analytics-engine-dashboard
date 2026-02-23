@@ -14,6 +14,33 @@ services:
       EMPLOYEE_USERNAME: employee.user@zopper.com
       EMPLOYEE_PASSWORD: employee123
       UVICORN_WORKERS: "2"
+      SARVAM_API_URL: https://api.sarvam.ai/v1/chat/completions
+      SARVAM_API_KEY: sk_nw2w0nwy_cnKdoteNsOPuFaA35ACGepc4
+      SARVAM_MODEL: sarvam-m
+      SARVAM_TIMEOUT_SECONDS: "110"
+      LLM_PREWARM: "1"
+      CHATCARDS_MODEL: sarvam-m
+      CHATCARDS_TEMPERATURE: "0.20"
+      CHATCARDS_NUM_PREDICT: "900"
+      CHATCARDS_TIMEOUT_SECONDS: "75"
+      CHATBOT_MODEL: sarvam-m
+      CHATBOT_TEMPERATURE: "0.14"
+      CHATBOT_TIMEOUT_SECONDS: "110"
+      CHATBOT_RETRY_TIMEOUT_SECONDS: "45"
+      CHATBOT_HISTORY_LIMIT: "10"
+      CHATBOT_HISTORY_CHAR_LIMIT: "650"
+      CHATBOT_MESSAGE_CHAR_LIMIT: "2600"
+      CHATBOT_MAX_NUM_PREDICT: "4096"
+      CHATBOT_SMALL_NUM_PREDICT: "420"
+      CHATBOT_MEDIUM_NUM_PREDICT: "900"
+      CHATBOT_LARGE_NUM_PREDICT: "1800"
+      CHATBOT_RETRY_NUM_PREDICT: "640"
+      CHATBOT_REPAIR_NUM_PREDICT: "640"
+      CHATBOT_NUM_CTX: "4096"
+      CHATBOT_CACHE_TTL_SECONDS: "180"
+      CHATBOT_CACHE_MAX_ITEMS: "256"
+      ENABLE_GRAPH_INSIGHTS: "1"
+      ENABLE_CHATBOT: "1"
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -22,10 +49,11 @@ services:
     build:
       context: ./frontend/my-app
       args:
-        NEXT_PUBLIC_API_BASE: http://43.205.134.36:8000
+        NEXT_PUBLIC_API_BASE: http://65.2.116.200
     image: live-dashboard-frontend:latest
     environment:
-      NEXT_PUBLIC_API_BASE: http://43.205.134.36:8000
+      NEXT_PUBLIC_API_BASE: http://65.2.116.200
+      NEXT_PUBLIC_CHATBOT_TIMEOUT_MS: "120000"
     ports:
       - "3000:3000"
     depends_on:
