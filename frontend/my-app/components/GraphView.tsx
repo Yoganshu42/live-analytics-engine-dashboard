@@ -3,8 +3,19 @@
 import { useEffect, useId, useRef, useState } from "react"
 import { useReducedMotion } from "framer-motion"
 import {
+  Area,
+  AreaChart,
   BarChart,
   Bar,
+  Cell,
+  Line,
+  Pie,
+  PieChart,
+  PolarAngleAxis,
+  PolarGrid,
+  PolarRadiusAxis,
+  Radar,
+  RadarChart,
   XAxis,
   YAxis,
   Tooltip,
@@ -13,6 +24,8 @@ import {
 } from "recharts"
 
 /* ---------- TYPES ---------- */
+export type GraphChartType = "bar" | "line" | "pie" | "radar"
+
 type Props = {
   source: string
   dimension?: string
@@ -24,6 +37,8 @@ type Props = {
   toDate?: string
   fetchDelayMs?: number
   deferUntilVisible?: boolean
+  chartType?: GraphChartType
+  heightClassName?: string
   onDataReady?: (snapshot: GraphDataSnapshot) => void
 }
 
@@ -486,6 +501,15 @@ const mixWithWhite = (hex: string, amount: number) => {
     .join("")}`
 }
 
+const formatAxisCompact = (value: number, measure: string) => {
+  const m = measure.toLowerCase()
+  if (m.includes("loss_ratio")) return `${value.toFixed(1)}%`
+  return new Intl.NumberFormat("en-IN", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value)
+}
+
 /* ---------- TOOLTIP ---------- */
 type TooltipEntry = {
   dataKey: string
@@ -543,6 +567,8 @@ export default function GraphView({
   toDate,
   fetchDelayMs,
   deferUntilVisible = false,
+  chartType = "bar",
+  heightClassName = "h-72",
   onDataReady,
 }: Props) {
   const prefersReducedMotion = useReducedMotion()
@@ -726,7 +752,7 @@ export default function GraphView({
 
   if (deferUntilVisible && !isVisible) {
     return (
-      <div ref={containerRef} className="h-72 flex items-center justify-center text-sm text-gray-400">
+      <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-400`}>
         Loading chart...
       </div>
     )
@@ -734,7 +760,7 @@ export default function GraphView({
 
   if (loading) {
     return (
-      <div ref={containerRef} className="h-72 flex items-center justify-center text-sm text-gray-500">
+      <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-500`}>
         Loading...
       </div>
     )
@@ -742,7 +768,7 @@ export default function GraphView({
 
   if (error || !data.length || !measure) {
     return (
-      <div ref={containerRef} className="h-72 flex items-center justify-center text-sm text-gray-400">
+      <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-400`}>
         No Data Available
       </div>
     )
@@ -782,11 +808,25 @@ export default function GraphView({
     : data
   const shouldAnimateBars = !prefersReducedMotion && chartData.length <= 36
   const barAnimationDuration = shouldAnimateBars ? 500 : 0
+  const pieData = chartData
+    .map((row) => ({
+      name: String(row[dimKey] ?? "Unknown"),
+      value: compareMode
+        ? Math.max(0, asNumber(row.samsung_vs) + asNumber(row.samsung_croma))
+        : Math.max(0, asNumber(row[measure])),
+    }))
+    .filter((row) => row.value > 0)
+  const radarData = chartData.map((row) => ({
+    name: String(row[dimKey] ?? "Unknown"),
+    samsung_vs: Math.max(0, asNumber(row.samsung_vs)),
+    samsung_croma: Math.max(0, asNumber(row.samsung_croma)),
+    [measure]: Math.max(0, asNumber(row[measure])),
+  }))
 
   return (
-    <div ref={containerRef} className="smooth-surface h-72">
-      {compareMode && (
-        <div className="flex items-center gap-3 text-[11px] font-semibold text-slate-500 mb-2">
+    <div ref={containerRef} className={`smooth-surface ${heightClassName}`}>
+      {compareMode && chartType !== "pie" && (
+        <div className="mb-2 flex items-center gap-3 text-[11px] font-semibold text-slate-500">
           <span className="flex items-center gap-1.5">
             <span
               className="inline-block h-2.5 w-2.5 rounded-full"
@@ -804,89 +844,243 @@ export default function GraphView({
         </div>
       )}
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 6 }} barCategoryGap={14}>
-          <defs>
-            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={mixWithWhite(primaryColor, 0.35)} />
-              <stop offset="100%" stopColor={primaryColor} />
-            </linearGradient>
-            <linearGradient id={gradientIdAlt} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.35)} />
-              <stop offset="100%" stopColor={secondaryColor} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
-          <XAxis
-            dataKey={dimKey}
-            interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
-            minTickGap={isTemporalDimension ? 16 : 8}
-            tick={{ fontSize: 11 }}
-            tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : v)}
-          />
-          <YAxis
-            domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
-            tick={{ fontSize: 11 }}
-            tickFormatter={(v) => formatValue(v as number, measure)}
-          />
-          <Tooltip content={<CustomTooltip measure={measure} />} />
-          {compareMode ? (
-            <>
-              <Bar
-                dataKey="samsung_vs"
-                name="Vijay Sales"
-                barSize={18}
-                radius={[8, 8, 2, 2]}
-                fill={`url(#${gradientId})`}
+        {chartType === "line" ? (
+          <AreaChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 6 }}>
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={mixWithWhite(primaryColor, 0.15)} stopOpacity={0.55} />
+                <stop offset="100%" stopColor={primaryColor} stopOpacity={0.04} />
+              </linearGradient>
+              <linearGradient id={gradientIdAlt} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.15)} stopOpacity={0.55} />
+                <stop offset="100%" stopColor={secondaryColor} stopOpacity={0.04} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
+            <XAxis
+              dataKey={dimKey}
+              interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
+              minTickGap={isTemporalDimension ? 16 : 8}
+              tick={{ fontSize: 11 }}
+              tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : String(v))}
+            />
+            <YAxis
+              domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
+              tick={{ fontSize: 11 }}
+              tickFormatter={(v) => formatAxisCompact(asNumber(v), measure)}
+            />
+            <Tooltip content={<CustomTooltip measure={measure} />} />
+            {compareMode ? (
+              <>
+                <Area
+                  type="monotone"
+                  dataKey="samsung_vs"
+                  name="Vijay Sales"
+                  stroke={primaryColor}
+                  fill={`url(#${gradientId})`}
+                  strokeWidth={2.4}
+                  fillOpacity={1}
+                  isAnimationActive={shouldAnimateBars}
+                  dot={false}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="samsung_croma"
+                  name="Croma"
+                  stroke={secondaryColor}
+                  fill={`url(#${gradientIdAlt})`}
+                  strokeWidth={2.4}
+                  fillOpacity={1}
+                  isAnimationActive={shouldAnimateBars}
+                  dot={false}
+                />
+              </>
+            ) : (
+              <>
+                <Area
+                  type="monotone"
+                  dataKey={measure}
+                  name={prettyLabel(measure)}
+                  stroke={primaryColor}
+                  fill={`url(#${gradientId})`}
+                  strokeWidth={2.5}
+                  fillOpacity={1}
+                  isAnimationActive={shouldAnimateBars}
+                  dot={false}
+                />
+                {showEwCounts && (
+                  <Line
+                    type="monotone"
+                    dataKey="ew_count"
+                    name="EW Count"
+                    stroke={secondaryColor}
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={shouldAnimateBars}
+                  />
+                )}
+              </>
+            )}
+          </AreaChart>
+        ) : chartType === "pie" ? (
+          <PieChart margin={{ top: 6, right: 16, bottom: 6, left: 16 }}>
+            <Tooltip
+              formatter={(value: unknown, name: unknown) => [
+                formatValue(asNumber(value), measure),
+                String(name || ""),
+              ]}
+            />
+            <Pie
+              data={pieData.length ? pieData : [{ name: "No Data", value: 1 }]}
+              dataKey="value"
+              nameKey="name"
+              innerRadius={44}
+              outerRadius={98}
+              paddingAngle={2}
+              stroke="#ffffff"
+              strokeWidth={1}
+              isAnimationActive={shouldAnimateBars}
+            >
+              {(pieData.length ? pieData : [{ name: "No Data", value: 1 }]).map((entry, idx) => (
+                <Cell
+                  key={`${entry.name}-${idx}`}
+                  fill={pieData.length ? pickColor(`${baseKey}-${entry.name}`, palette) : "#dbeafe"}
+                />
+              ))}
+            </Pie>
+          </PieChart>
+        ) : chartType === "radar" ? (
+          <RadarChart
+            data={radarData}
+            cx="50%"
+            cy="50%"
+            outerRadius="72%"
+            margin={{ top: 8, right: 10, bottom: 8, left: 10 }}
+          >
+            <PolarGrid stroke="#d6dde8" />
+            <PolarAngleAxis dataKey="name" tick={{ fontSize: 10, fill: "#64748b" }} />
+            <PolarRadiusAxis tick={{ fontSize: 10, fill: "#94a3b8" }} tickFormatter={(v) => formatAxisCompact(asNumber(v), measure)} />
+            <Tooltip
+              formatter={(value: unknown, name: unknown) => [
+                formatValue(asNumber(value), measure),
+                String(name || ""),
+              ]}
+            />
+            {compareMode ? (
+              <>
+                <Radar
+                  name="Vijay Sales"
+                  dataKey="samsung_vs"
+                  stroke={primaryColor}
+                  fill={primaryColor}
+                  fillOpacity={0.3}
+                  isAnimationActive={shouldAnimateBars}
+                />
+                <Radar
+                  name="Croma"
+                  dataKey="samsung_croma"
+                  stroke={secondaryColor}
+                  fill={secondaryColor}
+                  fillOpacity={0.25}
+                  isAnimationActive={shouldAnimateBars}
+                />
+              </>
+            ) : (
+              <Radar
+                name={prettyLabel(measure)}
+                dataKey={measure}
+                stroke={primaryColor}
+                fill={primaryColor}
+                fillOpacity={0.3}
                 isAnimationActive={shouldAnimateBars}
-                animationDuration={barAnimationDuration}
-                animationBegin={150}
               />
-              <Bar
-                dataKey="samsung_croma"
-                name="Croma"
-                barSize={18}
-                radius={[8, 8, 2, 2]}
-                fill={`url(#${gradientIdAlt})`}
-                isAnimationActive={shouldAnimateBars}
-                animationDuration={barAnimationDuration}
-                animationBegin={250}
-              />
-            </>
-          ) : showEwCounts ? (
-            <>
+            )}
+          </RadarChart>
+        ) : (
+          <BarChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 6 }} barCategoryGap={14}>
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={mixWithWhite(primaryColor, 0.35)} />
+                <stop offset="100%" stopColor={primaryColor} />
+              </linearGradient>
+              <linearGradient id={gradientIdAlt} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.35)} />
+                <stop offset="100%" stopColor={secondaryColor} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
+            <XAxis
+              dataKey={dimKey}
+              interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
+              minTickGap={isTemporalDimension ? 16 : 8}
+              tick={{ fontSize: 11 }}
+              tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : String(v))}
+            />
+            <YAxis
+              domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
+              tick={{ fontSize: 11 }}
+              tickFormatter={(v) => formatValue(asNumber(v), measure)}
+            />
+            <Tooltip content={<CustomTooltip measure={measure} />} />
+            {compareMode ? (
+              <>
+                <Bar
+                  dataKey="samsung_vs"
+                  name="Vijay Sales"
+                  barSize={18}
+                  radius={[8, 8, 2, 2]}
+                  fill={`url(#${gradientId})`}
+                  isAnimationActive={shouldAnimateBars}
+                  animationDuration={barAnimationDuration}
+                  animationBegin={150}
+                />
+                <Bar
+                  dataKey="samsung_croma"
+                  name="Croma"
+                  barSize={18}
+                  radius={[8, 8, 2, 2]}
+                  fill={`url(#${gradientIdAlt})`}
+                  isAnimationActive={shouldAnimateBars}
+                  animationDuration={barAnimationDuration}
+                  animationBegin={250}
+                />
+              </>
+            ) : showEwCounts ? (
+              <>
+                <Bar
+                  dataKey={measure}
+                  name="Units Sold"
+                  barSize={18}
+                  radius={[8, 8, 2, 2]}
+                  fill={`url(#${gradientId})`}
+                  isAnimationActive={shouldAnimateBars}
+                  animationDuration={barAnimationDuration}
+                  animationBegin={120}
+                />
+                <Bar
+                  dataKey="ew_count"
+                  name="EW Count"
+                  barSize={18}
+                  radius={[8, 8, 2, 2]}
+                  fill={`url(#${gradientIdAlt})`}
+                  isAnimationActive={shouldAnimateBars}
+                  animationDuration={barAnimationDuration}
+                  animationBegin={200}
+                />
+              </>
+            ) : (
               <Bar
                 dataKey={measure}
-                name="Units Sold"
-                barSize={18}
-                radius={[8, 8, 2, 2]}
+                barSize={28}
+                radius={[10, 10, 2, 2]}
                 fill={`url(#${gradientId})`}
                 isAnimationActive={shouldAnimateBars}
                 animationDuration={barAnimationDuration}
                 animationBegin={120}
               />
-              <Bar
-                dataKey="ew_count"
-                name="EW Count"
-                barSize={18}
-                radius={[8, 8, 2, 2]}
-                fill={`url(#${gradientIdAlt})`}
-                isAnimationActive={shouldAnimateBars}
-                animationDuration={barAnimationDuration}
-                animationBegin={200}
-              />
-            </>
-          ) : (
-            <Bar
-              dataKey={measure}
-              barSize={28}
-              radius={[10, 10, 2, 2]}
-              fill={`url(#${gradientId})`}
-              isAnimationActive={shouldAnimateBars}
-              animationDuration={barAnimationDuration}
-              animationBegin={120}
-            />
-          )}
-        </BarChart>
+            )}
+          </BarChart>
+        )}
       </ResponsiveContainer>
     </div>
   )

@@ -12,10 +12,10 @@ import {
   Tooltip as RechartsTooltip,
 } from "recharts"
 
-import GraphView from "@/components/GraphView"
+import GraphView, { prefetchGraphData } from "@/components/GraphView"
+import RightSideChatbot from "@/components/RightSideChatbot"
 import DateRangePicker from "@/components/DateRangePicker"
-import type { GraphDataSnapshot } from "@/components/GraphView"
-import { prefetchGraphData } from "@/components/GraphView"
+import type { GraphChartType, GraphDataSnapshot } from "@/components/GraphView"
 import {
   fetchCategoryPercentage,
   fetchCityBreakdownByState,
@@ -53,6 +53,7 @@ type FullscreenGraph = {
   metric: string
   dimension: string
   bucket?: "day" | "week" | "month"
+  chartType?: GraphChartType
 } | null
 
 type NavigableGraph = {
@@ -61,6 +62,25 @@ type NavigableGraph = {
   metric: string
   dimension: string
   bucket?: "day" | "week" | "month"
+  chartType?: GraphChartType
+}
+
+type GraphQueueItem = {
+  dimension: string
+  metric: string
+  bucket?: "day" | "week" | "month"
+  chartType?: GraphChartType
+}
+
+type SamsungOverviewCard = {
+  id: string
+  title: string
+  subtitle: string
+  dimension: string
+  metric: "quantity"
+  bucket?: "day" | "week" | "month"
+  chartType: GraphChartType
+  size: "main" | "small"
 }
 
 type CityBreakdownSlice = {
@@ -403,8 +423,9 @@ const getGraphTitle = (
 const toGraphKey = (
   dimension: string,
   metric: string,
-  bucket?: "day" | "week" | "month"
-) => `${dimension}|${metric}|${bucket || ""}`
+  bucket?: "day" | "week" | "month",
+  chartType?: GraphChartType
+) => `${dimension}|${metric}|${bucket || ""}|${chartType || "bar"}`
 
 export default function MultiGraphView({
   source,
@@ -418,7 +439,41 @@ export default function MultiGraphView({
 }: Props) {
   const prefersReducedMotion = useReducedMotion()
   const isGodrej = source === "godrej"
+  const isSamsungOverview = source === "samsung"
   const isGodrejClaims = isGodrej && datasetType === "claims"
+  const samsungOverviewCards = useMemo<SamsungOverviewCard[]>(
+    () => [
+      {
+        id: "samsung-month-quantity",
+        title: "Quantity Trend by Month",
+        subtitle: "Month-on-month quantity line range comparison between Vijay Sales and Croma.",
+        dimension: "month",
+        metric: "quantity",
+        bucket: "month",
+        chartType: "line",
+        size: "main",
+      },
+      {
+        id: "samsung-plan-pie",
+        title: "Plan Category Distribution",
+        subtitle: "Quantity split by plan category in pie format.",
+        dimension: "plan_category",
+        metric: "quantity",
+        chartType: "pie",
+        size: "small",
+      },
+      {
+        id: "samsung-device-radar",
+        title: "Device Plan Category Radar",
+        subtitle: "Spider-web comparison of quantity across device plan categories.",
+        dimension: "device_plan_category",
+        metric: "quantity",
+        chartType: "radar",
+        size: "small",
+      },
+    ],
+    []
+  )
   const activeGroupOrder = useMemo(
     () => (
       isGodrej
@@ -537,6 +592,7 @@ export default function MultiGraphView({
     return GROUP_TITLES[group] || group
   }, [isGodrej, source])
   const sectionConfigs = useMemo(() => {
+    if (isSamsungOverview) return []
     return activeGroupOrder
       .map(group => {
         const presets = activePresets.filter((p: Preset) => p.group === group)
@@ -552,9 +608,17 @@ export default function MultiGraphView({
         return { group, entries }
       })
       .filter(section => section.entries.length > 0)
-  }, [activeGroupOrder, activePresets, datasetType])
+  }, [isSamsungOverview, activeGroupOrder, activePresets, datasetType])
 
-  const graphQueue = useMemo(() => {
+  const graphQueue = useMemo<GraphQueueItem[]>(() => {
+    if (isSamsungOverview) {
+      return samsungOverviewCards.map((card) => ({
+        dimension: card.dimension,
+        metric: card.metric,
+        bucket: card.bucket,
+        chartType: card.chartType,
+      }))
+    }
     return sectionConfigs.flatMap(section =>
       section.entries.flatMap(entry =>
         entry.visibleMetrics.map(metric => ({
@@ -564,9 +628,19 @@ export default function MultiGraphView({
         }))
       )
     )
-  }, [sectionConfigs])
+  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs])
 
   const navigableGraphs = useMemo(() => {
+    if (isSamsungOverview) {
+      return samsungOverviewCards.map((card) => ({
+        group: "samsung_overview",
+        sectionTitle: "Samsung Quantity Focus",
+        metric: card.metric,
+        dimension: card.dimension,
+        bucket: card.bucket,
+        chartType: card.chartType,
+      }))
+    }
     const out: NavigableGraph[] = []
     sectionConfigs.forEach(({ group, entries }) => {
       const sectionTitle = getSectionTitle(group)
@@ -578,18 +652,19 @@ export default function MultiGraphView({
             metric,
             dimension: preset.dimension,
             bucket: preset.bucket,
+            chartType: "bar",
           })
         })
       })
     })
     return out
-  }, [sectionConfigs, getSectionTitle])
+  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs, getSectionTitle])
 
   const fullscreenGraphIndex = useMemo(() => {
     if (!fullscreen) return -1
-    const currentKey = toGraphKey(fullscreen.dimension, fullscreen.metric, fullscreen.bucket)
+    const currentKey = toGraphKey(fullscreen.dimension, fullscreen.metric, fullscreen.bucket, fullscreen.chartType)
     return navigableGraphs.findIndex((item) =>
-      toGraphKey(item.dimension, item.metric, item.bucket) === currentKey
+      toGraphKey(item.dimension, item.metric, item.bucket, item.chartType) === currentKey
     )
   }, [fullscreen, navigableGraphs])
 
@@ -602,7 +677,7 @@ export default function MultiGraphView({
   const graphOrderIndex = useMemo(() => {
     const map = new Map<string, number>()
     graphQueue.forEach((item, idx) => {
-      map.set(toGraphKey(item.dimension, item.metric, item.bucket), idx)
+      map.set(toGraphKey(item.dimension, item.metric, item.bucket, item.chartType), idx)
     })
     return map
   }, [graphQueue])
@@ -1039,22 +1114,99 @@ export default function MultiGraphView({
       metric: target.metric,
       dimension: target.dimension,
       bucket: target.bucket,
+      chartType: target.chartType,
     })
+  }
+
+  const renderSamsungCard = (
+    card: SamsungOverviewCard,
+    layout: "main" | "small"
+  ) => {
+    const queueKey = toGraphKey(card.dimension, card.metric, card.bucket, card.chartType)
+    const queueIndex = graphOrderIndex.get(queueKey) ?? 0
+    const fetchDelayMs =
+      queueIndex < FAST_LOAD_COUNT
+        ? 0
+        : Math.min((queueIndex - FAST_LOAD_COUNT + 1) * DEFER_STEP_MS, 1400)
+
+    return (
+      <motion.div
+        key={card.id}
+        initial={prefersReducedMotion ? false : { opacity: 0, y: 16 }}
+        animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
+        transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
+        whileHover={prefersReducedMotion ? undefined : { y: -4 }}
+        className="smooth-surface relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-5"
+      >
+        <div className="pointer-events-none absolute -top-16 right-[-58px] h-32 w-32 rounded-full bg-cyan-100/60 blur-2xl" />
+        <div className="relative">
+          <div className="mb-3 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-bold leading-snug text-slate-800 sm:text-base">
+                {card.title}
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500">
+                {card.subtitle}
+              </div>
+            </div>
+            <button
+              className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
+              onClick={() => {
+                handleOpenFullscreen({
+                  metric: card.metric,
+                  dimension: card.dimension,
+                  bucket: card.bucket,
+                  chartType: card.chartType,
+                })
+              }}
+            >
+              <Maximize2 size={16} />
+            </button>
+          </div>
+
+          <GraphView
+            source={source}
+            dimension={card.dimension}
+            metric={card.metric}
+            datasetType={datasetType}
+            bucket={card.bucket}
+            jobId={jobId}
+            fromDate={fromDate}
+            toDate={toDate}
+            fetchDelayMs={fetchDelayMs}
+            deferUntilVisible={queueIndex >= FAST_LOAD_COUNT}
+            chartType={card.chartType}
+            heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
+          />
+        </div>
+      </motion.div>
+    )
   }
 
   return (
     <>
-      {sectionConfigs.map(({ group, entries }) => {
+      {isSamsungOverview ? (
+        <div className="space-y-4">
+          {samsungOverviewCards
+            .filter((card) => card.size === "main")
+            .map((card) => renderSamsungCard(card, "main"))}
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            {samsungOverviewCards
+              .filter((card) => card.size === "small")
+              .map((card) => renderSamsungCard(card, "small"))}
+          </div>
+        </div>
+      ) : sectionConfigs.map(({ group, entries }) => {
         const sectionTitle = getSectionTitle(group)
         return (
           <div
             key={group}
-            className="relative mb-10 overflow-hidden rounded-[28px] border border-slate-200/80 bg-white shadow-[0_22px_60px_-38px_rgba(15,23,42,0.45)]"
+            className="relative mb-6 overflow-hidden rounded-[24px] border border-slate-200/80 bg-white shadow-[0_22px_60px_-38px_rgba(15,23,42,0.45)] sm:mb-10 sm:rounded-[28px]"
           >
             <div className="pointer-events-none absolute -top-24 right-[-140px] h-64 w-64 rounded-full bg-cyan-100/70 blur-3xl" />
             <div className="pointer-events-none absolute -bottom-24 left-[-120px] h-56 w-56 rounded-full bg-amber-100/70 blur-3xl" />
 
-            <div className="relative p-5 md:p-6">
+            <div className="relative p-3.5 sm:p-5 md:p-6">
               <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="text-[13px] font-black uppercase tracking-[0.16em] text-slate-700">
@@ -1074,7 +1226,7 @@ export default function MultiGraphView({
               <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
                 {entries.map(({ preset, visibleMetrics }) => {
                   return visibleMetrics.map((metric: string) => {
-                    const queueKey = toGraphKey(preset.dimension, metric, preset.bucket)
+                    const queueKey = toGraphKey(preset.dimension, metric, preset.bucket, "bar")
                     const queueIndex = graphOrderIndex.get(queueKey) ?? 0
                     const fetchDelayMs =
                       queueIndex < FAST_LOAD_COUNT
@@ -1089,7 +1241,7 @@ export default function MultiGraphView({
                       animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
                       transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
                       whileHover={prefersReducedMotion ? undefined : { y: -6, scale: 1.01 }}
-                      className="smooth-surface group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)]"
+                      className="smooth-surface group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-3 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-4"
                     >
                       <div className="pointer-events-none absolute -top-14 right-[-52px] h-32 w-32 rounded-full bg-cyan-100/60 blur-2xl" />
                       <div className="relative">
@@ -1110,6 +1262,7 @@ export default function MultiGraphView({
                                 metric,
                                 dimension: preset.dimension,
                                 bucket: preset.bucket,
+                                chartType: "bar",
                               })
                             }}
                           >
@@ -1159,10 +1312,11 @@ export default function MultiGraphView({
       {/* FULLSCREEN */}
       <AnimatePresence>
         {fullscreen && (
-          <motion.div className="fixed inset-0 z-50 bg-slate-950/35 p-2 md:p-4">
-            <div className="h-full w-full overflow-hidden rounded-[28px] border border-slate-200 bg-gradient-to-b from-slate-50 via-white to-slate-100 shadow-2xl">
+          <motion.div className="fixed inset-0 z-50 bg-slate-950/35 p-1.5 sm:p-2 md:p-4">
+            <div className="h-full w-full overflow-hidden rounded-[20px] border border-slate-200 bg-gradient-to-b from-slate-50 via-white to-slate-100 shadow-2xl sm:rounded-[28px]">
               <div className="h-full w-full overflow-auto">
-                <div className="sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-slate-200/80 bg-white/90 px-4 py-4 backdrop-blur md:px-6">
+                <div className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur sm:px-4 sm:py-4 md:px-6">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
                       Expanded View
@@ -1176,32 +1330,35 @@ export default function MultiGraphView({
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
                     <button
                       className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={() => handleTraverseGraph(-1)}
                       disabled={!canGoToPreviousGraph}
                     >
-                      Previous Graph
+                      <span className="sm:hidden">Prev</span>
+                      <span className="hidden sm:inline">Previous Graph</span>
                     </button>
                     <button
                       className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={() => handleTraverseGraph(1)}
                       disabled={!canGoToNextGraph}
                     >
-                      Next Graph
+                      <span className="sm:hidden">Next</span>
+                      <span className="hidden sm:inline">Next Graph</span>
                     </button>
                     <button
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                      className="ml-auto rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 sm:ml-0"
                       onClick={handleCloseFullscreen}
                     >
                       Close
                     </button>
                   </div>
+                  </div>
                 </div>
 
-                <div className="sticky top-[73px] z-10 border-b border-slate-200/80 bg-white/90 px-4 py-3 backdrop-blur md:px-6">
-                  <div className="flex flex-wrap items-center gap-3">
+                <div className="sticky top-[116px] z-10 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur sm:top-[73px] sm:px-4 md:px-6">
+                  <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
                     <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
                       Date Window
                     </div>
@@ -1220,9 +1377,9 @@ export default function MultiGraphView({
                         onReset={handleResetFullscreenDateRange}
                       />
                     </div>
-                    <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+                    <div className="flex w-full flex-wrap items-center gap-2 sm:ml-auto sm:w-auto sm:justify-end">
                       {isStateFullscreen && (
-                        <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2">
+                        <div className="flex w-full items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 sm:w-auto">
                           <span className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
                             {`Focus ${geographyLabel}`}
                           </span>
@@ -1232,7 +1389,7 @@ export default function MultiGraphView({
                               setSelectedState(e.target.value)
                               setActiveCityName("")
                             }}
-                            className="min-w-[180px] rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
+                            className="w-full min-w-0 rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700 sm:min-w-[180px]"
                           >
                             <option value="">{`Choose ${geographyLabel}`}</option>
                             {stateOptions.map((stateOption) => (
@@ -1252,7 +1409,7 @@ export default function MultiGraphView({
                           {`Compare ${geographyLabelPlural} (${activeComparisonStates.length})`}
                         </button>
                         {compareDropdownOpen && (
-                          <div className="absolute right-0 mt-2 w-64 rounded-xl border border-slate-200 bg-white shadow-lg p-3 z-30">
+                          <div className="absolute right-0 z-30 mt-2 w-[min(18rem,calc(100vw-2.5rem))] rounded-xl border border-slate-200 bg-white p-3 shadow-lg">
                             <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400 mb-2">
                               {`Pick ${geographyLabelPlural} To Compare`}
                             </div>
@@ -1302,7 +1459,7 @@ export default function MultiGraphView({
                 </div>
               </div>
 
-              <div className="min-h-[70vh] px-6 py-6 flex items-center justify-center">
+              <div className="flex min-h-[64vh] items-center justify-center px-3 py-4 sm:min-h-[70vh] sm:px-6 sm:py-6">
                 <div
                   className="w-full max-w-6xl origin-center transition-transform"
                   style={{ transform: `scale(${zoom})` }}
@@ -1316,10 +1473,12 @@ export default function MultiGraphView({
                     jobId={jobId}
                     fromDate={fromDate}
                     toDate={toDate}
+                    chartType={fullscreen.chartType}
+                    heightClassName={isSamsungOverview ? "h-[56vh]" : undefined}
                     onDataReady={setOpenedGraphData}
                   />
                   {isStateFullscreen && (
-                    <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-5 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)]">
+                    <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
                       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
                         <div>
                           <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
@@ -1435,7 +1594,7 @@ export default function MultiGraphView({
                     </div>
                   )}
                   {isStateFullscreen && (
-                    <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-5 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)]">
+                    <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
                       <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
                         <div>
                           <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
@@ -1682,7 +1841,7 @@ export default function MultiGraphView({
                       )}
                     </div>
                   )}
-                  <div className="mt-6 rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/50 p-5 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)]">
+                  <div className="mt-6 rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/50 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
                     <div className="flex items-center justify-between gap-3 mb-3">
                       <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
                         Sahyogi Insights
@@ -1717,6 +1876,7 @@ export default function MultiGraphView({
                 </div>
               </div>
             </div>
+            <RightSideChatbot variant="floating" />
           </motion.div>
         )}
       </AnimatePresence>

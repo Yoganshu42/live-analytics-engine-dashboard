@@ -1,7 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import MotionProvider from "@/components/MotionProvider";
-import RightSideChatbot from "@/components/RightSideChatbot";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -37,7 +36,6 @@ export default function RootLayout({
       >
         <MotionProvider>
           {children}
-          <RightSideChatbot />
         </MotionProvider>
       </body>
     </html>

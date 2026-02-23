@@ -114,18 +114,25 @@ export default function DateRangePicker({
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const [panelSide, setPanelSide] = useState<"left" | "right">("left")
   const [panelVertical, setPanelVertical] = useState<"down" | "up">("down")
+  const [runtimePanelWidth, setRuntimePanelWidth] = useState<number>(compact ? 540 : 580)
 
   const today = useMemo(() => startOfDay(new Date()), [])
   const minBound = useMemo(() => parseIso(minDate || ""), [minDate])
   const maxBound = useMemo(() => parseIso(maxDate || "") || today, [maxDate, today])
   const panelWidth = compact ? 540 : 580
   const estimatedPanelHeight = compact ? 480 : 530
+  const effectivePanelWidth = Math.min(panelWidth, runtimePanelWidth || panelWidth)
+  const isNarrowPanel = effectivePanelWidth < 500
 
   const parsedFrom = useMemo(() => parseIso(draftFromDate || ""), [draftFromDate])
   const parsedTo = useMemo(() => parseIso(draftToDate || ""), [draftToDate])
   const [visibleMonth, setVisibleMonth] = useState<Date>(() =>
     startOfMonth(parsedFrom || parsedTo || maxBound || today)
   )
+
+  useEffect(() => {
+    setRuntimePanelWidth(panelWidth)
+  }, [panelWidth])
 
   useEffect(() => {
     if (!open) return
@@ -231,6 +238,12 @@ export default function DateRangePicker({
         : "Select Date Range"
 
   const openPicker = () => {
+    const viewportWidth = window.innerWidth
+    const maxAllowedWidth = Math.max(300, viewportWidth - 16)
+    const nextPanelWidth = Math.min(panelWidth, maxAllowedWidth)
+    const panelHeightEstimate =
+      nextPanelWidth < 500 ? estimatedPanelHeight + 120 : estimatedPanelHeight
+
     const rect = triggerRef.current?.getBoundingClientRect()
     if (rect) {
       let nextSide: "left" | "right" = "left"
@@ -239,15 +252,16 @@ export default function DateRangePicker({
       } else if (align === "left") {
         nextSide = "left"
       } else {
-        nextSide = rect.left + panelWidth > window.innerWidth - 12 ? "right" : "left"
+        nextSide = rect.left + nextPanelWidth > window.innerWidth - 12 ? "right" : "left"
       }
       const spaceBelow = window.innerHeight - rect.bottom
       const spaceAbove = rect.top
       const nextVertical: "down" | "up" =
-        spaceBelow < estimatedPanelHeight && spaceAbove > spaceBelow ? "up" : "down"
+        spaceBelow < panelHeightEstimate && spaceAbove > spaceBelow ? "up" : "down"
       setPanelSide(nextSide)
       setPanelVertical(nextVertical)
     }
+    setRuntimePanelWidth(nextPanelWidth)
     setVisibleMonth(startOfMonth(parsedFrom || parsedTo || maxBound || today))
     setOpen(true)
   }
@@ -286,20 +300,30 @@ export default function DateRangePicker({
           } ${
             panelVertical === "down" ? "top-[calc(100%+10px)]" : "bottom-[calc(100%+10px)]"
           }`}
-          style={{ width: `${panelWidth}px` }}
+          style={{ width: `${effectivePanelWidth}px` }}
         >
           <div
-            className="grid"
-            style={{ gridTemplateColumns: `${compact ? 114 : 126}px minmax(0, 1fr)` }}
+            className={isNarrowPanel ? "grid grid-cols-1" : "grid"}
+            style={isNarrowPanel ? undefined : { gridTemplateColumns: `${compact ? 114 : 126}px minmax(0, 1fr)` }}
           >
-            <div className="border-r border-slate-200 bg-slate-50/60">
+            <div
+              className={
+                isNarrowPanel
+                  ? "grid grid-cols-2 gap-1 border-b border-slate-200 bg-slate-50/60 p-2"
+                  : "border-r border-slate-200 bg-slate-50/60"
+              }
+            >
               {PRESETS.map((preset) => (
                 <button
                   key={preset.key}
                   type="button"
                   onClick={() => handlePreset(preset.key)}
                   className={`block w-full border-b border-slate-200 text-left font-medium text-slate-700 transition-colors hover:bg-white ${
-                    compact ? "px-3 py-2.5 text-[13px]" : "px-4 py-3 text-[15px]"
+                    isNarrowPanel
+                      ? "rounded-md border border-slate-200 bg-white px-2.5 py-2 text-[12px]"
+                      : compact
+                        ? "px-3 py-2.5 text-[13px]"
+                        : "px-4 py-3 text-[15px]"
                   }`}
                 >
                   {preset.label}
@@ -307,7 +331,7 @@ export default function DateRangePicker({
               ))}
             </div>
 
-            <div className={compact ? "p-3.5" : "p-4"}>
+            <div className={compact ? "p-3 sm:p-3.5" : "p-4"}>
               <div className={`${compact ? "mb-3" : "mb-4"} flex items-center justify-between`}>
                 <button
                   type="button"
@@ -429,13 +453,13 @@ export default function DateRangePicker({
             </div>
           </div>
 
-          <div className={`flex items-center gap-3 border-t border-slate-200 bg-slate-50 ${compact ? "px-3.5 py-2.5" : "px-4 py-3"}`}>
+          <div className={`flex flex-wrap items-center gap-2 border-t border-slate-200 bg-slate-50 ${compact ? "px-3 py-2.5" : "px-4 py-3"}`}>
             <input
               type="text"
               readOnly
               value={draftFromDate || "-"}
               className={`rounded-lg border border-slate-300 bg-white text-center text-slate-700 ${
-                compact ? "w-[112px] px-2.5 py-1.5 text-[12px]" : "w-[126px] px-3 py-2 text-sm"
+                compact ? "w-[104px] px-2 py-1.5 text-[12px] sm:w-[112px]" : "w-[126px] px-3 py-2 text-sm"
               }`}
             />
             <span className="text-slate-500">-</span>
@@ -444,7 +468,7 @@ export default function DateRangePicker({
               readOnly
               value={draftToDate || "-"}
               className={`rounded-lg border border-slate-300 bg-white text-center text-slate-700 ${
-                compact ? "w-[112px] px-2.5 py-1.5 text-[12px]" : "w-[126px] px-3 py-2 text-sm"
+                compact ? "w-[104px] px-2 py-1.5 text-[12px] sm:w-[112px]" : "w-[126px] px-3 py-2 text-sm"
               }`}
             />
 
@@ -452,7 +476,7 @@ export default function DateRangePicker({
               type="button"
               onClick={onReset}
               className={`ml-auto font-semibold text-sky-600 transition-colors hover:text-sky-700 ${
-                compact ? "text-base" : "text-xl"
+                compact ? "text-sm" : "text-base"
               }`}
             >
               Reset
@@ -461,7 +485,7 @@ export default function DateRangePicker({
               type="button"
               onClick={() => setOpen(false)}
               className={`font-semibold text-sky-600 transition-colors hover:text-sky-700 ${
-                compact ? "text-base" : "text-xl"
+                compact ? "text-sm" : "text-base"
               }`}
             >
               Close
@@ -471,7 +495,7 @@ export default function DateRangePicker({
               onClick={applySelection}
               disabled={!draftFromDate && !draftToDate}
               className={`rounded-lg bg-slate-800 font-semibold text-white transition-colors enabled:hover:bg-slate-900 disabled:cursor-not-allowed disabled:bg-slate-300 ${
-                compact ? "px-3 py-1.5 text-sm" : "px-4 py-2 text-lg"
+                compact ? "px-3 py-1.5 text-sm" : "px-4 py-2 text-base"
               }`}
             >
               Apply

@@ -8,7 +8,6 @@ import {
   Maximize2,
   BarChart3,
   ShieldCheck,
-  Calendar,
   Activity,
   LogOut,
   ChevronRight
@@ -18,9 +17,9 @@ import Sidebar from "@/components/Sidebar"
 import Tabs from "@/components/Tabs"
 import GraphSection from "@/components/GraphSection"
 import { clearGraphDataCache } from "@/components/GraphView"
-import ResultCard from "@/components/ResultCard"
-import LastUpdatedCard from "@/components/LastUpdatedCard"
 import DateRangePicker from "@/components/DateRangePicker"
+import KpiCardsRow from "@/components/KpiCardsRow"
+import RightSideChatbot from "@/components/RightSideChatbot"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
 
 // --- ENHANCED ANIMATION VARIANTS ---
@@ -544,7 +543,7 @@ export default function DashboardPage() {
         variants={headerSlide}
         initial="initial"
         animate="animate"
-        className="h-20 flex items-center justify-between px-4 sm:px-6 lg:px-10 border-b bg-white/80 backdrop-blur-2xl sticky top-0 z-40"
+        className="sticky top-0 z-40 flex h-16 items-center justify-between border-b bg-white/80 px-3 backdrop-blur-2xl sm:h-20 sm:px-6 lg:px-10"
       >
         <div className="flex items-center gap-3 sm:gap-6">
           <motion.button
@@ -557,18 +556,18 @@ export default function DashboardPage() {
               alt="Zopper Logo"
               width={140}
               height={36}
-              className="h-9 w-auto object-contain"
+              className="h-7 w-auto object-contain sm:h-9"
             />
           </motion.button>
           <div className="hidden sm:block h-8 w-[1px] bg-slate-200" />
-          <h1 className="flex items-center gap-3">
+          <h1 className="hidden items-center gap-3 sm:flex">
             <span className={`${theme.accent} font-black uppercase text-[11px] tracking-[0.4em]`}>
               Analytics 
             </span>
           </h1>
         </div>
 
-        <div className="flex items-center gap-3 sm:gap-6">
+        <div className="flex items-center gap-2 sm:gap-6">
           <AnimatePresence>
             {view === "dashboard" && (
               <motion.div 
@@ -585,7 +584,7 @@ export default function DashboardPage() {
 
           <div className="flex items-center gap-3">
             {authRole && (
-              <div className="text-right mr-2">
+              <div className="mr-2 hidden text-right sm:block">
                 <p className="text-[10px] font-black uppercase tracking-tighter text-slate-400 leading-none mb-1">{authRole}</p>
                 <p className="text-xs font-bold text-slate-700">{authName}</p>
               </div>
@@ -600,7 +599,7 @@ export default function DashboardPage() {
                   router.replace("/login")
                 }, 800)
               }}
-              className="p-2.5 rounded-full border border-slate-200 bg-white text-slate-500 hover:text-slate-900 transition-colors"
+              className="rounded-full border border-slate-200 bg-white p-2 text-slate-500 transition-colors hover:text-slate-900 sm:p-2.5"
             >
               <LogOut size={18} />
             </motion.button>
@@ -617,7 +616,7 @@ export default function DashboardPage() {
             exit={{ opacity: 0, scale: 0.98 }}
             transition={{ duration: 0.5 }}
             ref={homeViewportRef}
-            className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-4 sm:p-6"
+            className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3 sm:p-6"
           >
             {/* Background Elements */}
             <div className="absolute inset-0 -z-10">
@@ -758,12 +757,12 @@ export default function DashboardPage() {
 
                   <motion.h2 variants={fadeIn} className="font-black tracking-tight mb-8 text-center">
                     <span className="block text-slate-900 leading-tight text-2xl md:text-3xl">Welcome to</span>
-                    <span className="block text-5xl md:text-7xl text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 via-purple-600 to-rose-500 italic font-serif">
+                    <span className="block text-4xl text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 via-purple-600 to-rose-500 italic font-serif sm:text-5xl md:text-7xl">
                      Business Control Centre
                     </span>
                   </motion.h2>
                   
-                  <motion.p variants={fadeIn} className="text-slate-500 text-xl max-w-2xl mx-auto leading-relaxed font-medium text-center">
+                  <motion.p variants={fadeIn} className="mx-auto max-w-2xl text-center text-base font-medium leading-relaxed text-slate-500 sm:text-lg md:text-xl">
                     Navigate through partner ecosystems with precision. <br/>Real-time performance metrics at your fingertips.
                   </motion.p>
                 </motion.div>
@@ -773,7 +772,7 @@ export default function DashboardPage() {
                 variants={staggerContainer} 
                 initial="initial" 
                 animate="animate"
-                className="grid grid-cols-1 md:grid-cols-3 gap-8 justify-items-center"
+                className="grid grid-cols-1 gap-4 justify-items-center sm:gap-8 md:grid-cols-3"
               >
                 {brandConfigs.map((cfg) => (
                   <motion.div
@@ -783,9 +782,9 @@ export default function DashboardPage() {
                     onClick={() => {
                       applyBrandChange(cfg.value)
                     }}
-                    className="group cursor-pointer relative bg-white/70 backdrop-blur-md border border-white p-10 rounded-[48px] shadow-2xl transition-all duration-500 text-center w-full max-w-[380px]"
+                    className="group relative w-full max-w-[360px] cursor-pointer rounded-[30px] border border-white bg-white/70 p-6 text-center shadow-2xl transition-all duration-500 backdrop-blur-md sm:max-w-[380px] sm:rounded-[48px] sm:p-10"
                   >
-                    <div className="h-24 flex items-center justify-center mb-10 overflow-hidden">
+                    <div className="mb-6 flex h-20 items-center justify-center overflow-hidden sm:mb-10 sm:h-24">
                       <motion.div
                         whileHover={{ scale: 1.1, rotate: 2 }}
                       >
@@ -800,8 +799,8 @@ export default function DashboardPage() {
                     </div>
                     <div className="space-y-4 text-center">
                       <div className="flex items-center justify-center gap-3">
-                        <h3 className="font-bold text-2xl text-slate-800 tracking-tight">{cfg.label}</h3>
-                        <div className="w-10 h-10 rounded-full flex items-center justify-center bg-slate-900 text-white scale-0 group-hover:scale-100 transition-transform duration-300">
+                        <h3 className="text-xl font-bold tracking-tight text-slate-800 sm:text-2xl">{cfg.label}</h3>
+                        <div className="flex h-9 w-9 scale-0 items-center justify-center rounded-full bg-slate-900 text-white transition-transform duration-300 group-hover:scale-100 sm:h-10 sm:w-10">
                            <ChevronRight size={20} />
                         </div>
                       </div>
@@ -814,12 +813,12 @@ export default function DashboardPage() {
             </div>
           </motion.div>
         ) : (
-          <motion.div 
+          <motion.div
             key="dashboard"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="flex flex-1 flex-col md:flex-row overflow-hidden"
+            className="flex flex-1 flex-col overflow-hidden bg-[#edf1f6] md:flex-row"
           >
             <Sidebar
               brand={brand}
@@ -829,80 +828,108 @@ export default function DashboardPage() {
               authRole={authRole}
             />
 
-            <main className="flex-1 min-w-0 p-4 sm:p-6 lg:p-10 overflow-y-auto bg-[#fbfcfd] custom-scrollbar">
-              <div className="max-w-7xl mx-auto">
-                <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="flex flex-col gap-6 xl:flex-row xl:justify-between xl:items-end mb-12">
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-3">
-                       <div className={`p-2 rounded-lg ${theme.bgLight}`}>
-                         <Activity size={18} className={theme.accent} />
-                       </div>
-                       <span className="text-[11px] font-black uppercase tracking-[0.3em] text-slate-400">Strategic Performance</span>
+            <main className="custom-scrollbar min-w-0 flex-1 overflow-y-auto bg-[#edf1f6] px-3 py-3 sm:px-6 sm:py-4 lg:px-8">
+              <div className="mx-auto w-full max-w-[1380px] pb-10">
+                <motion.div
+                  initial={{ opacity: 0, x: 16 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  className="mb-4 rounded-2xl border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-5 sm:py-4"
+                >
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div className="space-y-1">
+                      <h2 className="text-2xl font-bold tracking-tight text-slate-800 sm:text-3xl">
+                        Dashboard <span className="text-slate-500">Control panel</span>
+                      </h2>
+                      <p className="text-sm text-slate-500">
+                        {brandLabel(brand)} | {mode === "sales" ? "Sales Analytics" : "Claims Analytics"}
+                      </p>
                     </div>
-                    <h2 className="text-3xl sm:text-4xl xl:text-5xl font-black capitalize text-slate-900 tracking-tighter">
-                      {brandLabel(brand)}
-                    </h2>
-                  </div>
 
-                  <div className="flex flex-col items-start xl:items-end gap-5">
-                    {brand.startsWith("samsung") && (
-                      <motion.div 
-                        initial={{ opacity: 0, scale: 0.9 }} 
-                        animate={{ opacity: 1, scale: 1 }} 
-                        className="flex items-center gap-4 bg-white px-5 py-3 rounded-[24px] shadow-sm border border-slate-100"
-                      >
-                        <Image src="/WhatsApp Image 2026-02-04 at 11.14.29.jpeg" alt="Samsung" width={120} height={40} className="h-10 w-auto" />
-                        {brand !== "samsung" && <div className="h-4 w-[1px] bg-slate-200" />}
-                        {brand === "samsung_vs" && <Image src="/vs_logo.jpg" width={96} height={32} className="h-8 w-auto" alt="VS" />}
-                        {brand === "samsung_croma" && <Image src="/croma_logo.jpg" width={96} height={32} className="h-8 w-auto" alt="Croma" />}
-                      </motion.div>
-                    )}
-                    <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
+                    <div className="flex flex-wrap items-center gap-2 sm:gap-3 lg:justify-end">
+                      {brand.startsWith("samsung") && (
+                        <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-2 sm:gap-3 sm:px-3">
+                          <Image src="/WhatsApp Image 2026-02-04 at 11.14.29.jpeg" alt="Samsung" width={104} height={32} className="h-7 w-auto" />
+                          {brand !== "samsung" && <div className="h-4 w-[1px] bg-slate-300" />}
+                          {brand === "samsung_vs" && <Image src="/vs_logo.jpg" width={78} height={26} className="h-6 w-auto" alt="VS" />}
+                          {brand === "samsung_croma" && <Image src="/croma_logo.jpg" width={78} height={26} className="h-6 w-auto" alt="Croma" />}
+                        </div>
+                      )}
+                      <div className="hidden rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold text-slate-500 sm:block">
+                        Home <span className="mx-1 text-slate-300">-</span> Dashboard
+                      </div>
+                    </div>
                   </div>
                 </motion.div>
 
-                <motion.div variants={staggerContainer} initial="initial" animate="animate" className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 lg:gap-8 mb-10">
-                  <motion.div variants={fadeIn} className="lg:col-span-4 h-full">
-                    {isDashboardDataReady ? (
-                      <ResultCard
-                        source={brand}
-                        datasetType={mode}
-                        color={theme.primary}
-                        jobId={effectiveJobId || undefined}
-                        fromDate={fromDate || undefined}
-                        toDate={toDate || undefined}
-                        refreshTick={filterRefreshTick}
-                      />
-                    ) : (
-                      <div className="h-full min-h-[320px] rounded-[32px] border border-slate-200 bg-white p-8 flex items-center justify-center text-sm text-slate-400">
-                        Loading summary...
-                      </div>
-                    )}
-                  </motion.div>
-                  
-                  <motion.div variants={fadeIn} className="lg:col-span-4 h-full">
-                    {isDashboardDataReady ? (
-                      <LastUpdatedCard
-                        source={brand}
-                        datasetType={mode}
-                        jobId={effectiveJobId || undefined}
-                        fromDate={fromDate || undefined}
-                        toDate={toDate || undefined}
-                        refreshTick={filterRefreshTick}
-                      />
-                    ) : (
-                      <div className="h-full min-h-[320px] rounded-[32px] border border-slate-200 bg-white p-8 flex items-center justify-center text-sm text-slate-400">
-                        Loading freshness...
-                      </div>
-                    )}
-                  </motion.div>
+                <div className="sticky top-0 z-30 mb-4 bg-[#edf1f6]/95 py-1.5 backdrop-blur sm:mb-5 sm:py-2">
+                  <KpiCardsRow
+                    source={brand}
+                    datasetType={mode}
+                    jobId={effectiveJobId || undefined}
+                    fromDate={fromDate || undefined}
+                    toDate={toDate || undefined}
+                    refreshTick={filterRefreshTick}
+                  />
+                </div>
 
-                  <motion.div variants={fadeIn} className="lg:col-span-4 bg-white p-8 rounded-[32px] border border-slate-200 shadow-sm flex flex-col justify-between h-full min-h-[320px]">
-                    <div>
-                      <div className="flex gap-3 items-center mb-6">
-                        <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-100 text-slate-600"><Calendar size={20} /></div>
-                        <span className="text-[11px] font-black uppercase tracking-widest text-slate-500">Date Range</span>
+                <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
+                  <motion.section
+                    initial={{ opacity: 0, y: 24 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.15 }}
+                    className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-5 xl:col-span-8"
+                  >
+                    <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
+                      <div className="space-y-1">
+                        <h3 className="text-xl font-bold text-slate-800">Traffic Sources</h3>
+                        <p className="text-xs text-slate-500">Interactive trend workspace for selected filters</p>
                       </div>
+                      <motion.button
+                        whileHover={{ scale: 1.06, rotate: 4 }}
+                        onClick={() => handleFullscreenToggle(true)}
+                        className="rounded-full border border-slate-200 bg-slate-50 p-2.5 text-slate-600 transition-colors hover:bg-slate-100"
+                      >
+                        <Maximize2 size={18} />
+                      </motion.button>
+                    </div>
+
+                    <div className="min-h-[360px] w-full sm:min-h-[460px]">
+                      {isDashboardDataReady ? (
+                        <GraphSection
+                          key={`main-graph-${brand}-${mode}-${effectiveJobId || ""}-${fromDate}-${toDate}-${filterRefreshTick}`}
+                          source={brand}
+                          datasetType={mode}
+                          jobId={effectiveJobId}
+                          primaryColor={theme.primary}
+                          secondaryColor={theme.secondary}
+                          fromDate={fromDate || undefined}
+                          toDate={toDate || undefined}
+                          resetFromDate={defaultFromDate || undefined}
+                          resetToDate={defaultToDate || undefined}
+                          onDateRangeApply={handleGraphDateRangeApply}
+                        />
+                      ) : (
+                        <div className="flex h-[360px] items-center justify-center text-sm text-slate-400 sm:h-[460px]">
+                          Loading charts...
+                        </div>
+                      )}
+                    </div>
+                  </motion.section>
+
+                  <motion.aside
+                    variants={staggerContainer}
+                    initial="initial"
+                    animate="animate"
+                    className="space-y-4 xl:col-span-4 xl:sticky xl:top-4 xl:self-start"
+                  >
+                    <motion.div variants={fadeIn} className="sticky top-2 z-20 rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-5">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <h4 className="text-sm font-bold text-slate-800">Control Filters</h4>
+                        <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                          {mode}
+                        </span>
+                      </div>
+                      <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
                       <DateRangePicker
                         draftFromDate={draftFromDate}
                         draftToDate={draftToDate}
@@ -916,51 +943,13 @@ export default function DashboardPage() {
                         onApply={handleGraphDateRangeApply}
                         onReset={resetDateRange}
                       />
-                    </div>
-                  </motion.div>
-                </motion.div>
+                    </motion.div>
 
-                <motion.section initial={{ opacity: 0, y: 40 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }} className="bg-white p-4 sm:p-6 lg:p-10 rounded-[32px] sm:rounded-[40px] lg:rounded-[48px] border border-slate-200 shadow-sm relative group">
-                  <div className="flex justify-between items-center mb-10">
-                    <div className="space-y-1">
-                      <h3 className="font-bold text-2xl flex items-center gap-4">
-                        <div className={`p-3 rounded-2xl ${theme.bgLight} ${theme.accent}`}>
-                          {mode === "sales" ? <BarChart3 size={24} /> : <ShieldCheck size={24} />}
-                        </div>
-                        Analysis Workspace
-                      </h3>
-                      <p className="text-slate-400 text-xs font-medium ml-16">Deep dive into granular data points and trends</p>
-                    </div>
-                    <motion.button 
-                      whileHover={{ scale: 1.1, rotate: 90 }}
-                      onClick={() => handleFullscreenToggle(true)}
-                      className="p-3 bg-slate-50 hover:bg-slate-100 rounded-full transition-colors"
-                    >
-                      <Maximize2 size={20} className="text-slate-600" />
-                    </motion.button>
-                  </div>
-                  <div className="min-h-[500px] w-full">
-                    {isDashboardDataReady ? (
-                      <GraphSection
-                        key={`main-graph-${brand}-${mode}-${effectiveJobId || ""}-${fromDate}-${toDate}-${filterRefreshTick}`}
-                        source={brand}
-                        datasetType={mode}
-                        jobId={effectiveJobId}
-                        primaryColor={theme.primary}
-                        secondaryColor={theme.secondary}
-                        fromDate={fromDate || undefined}
-                        toDate={toDate || undefined}
-                        resetFromDate={defaultFromDate || undefined}
-                        resetToDate={defaultToDate || undefined}
-                        onDateRangeApply={handleGraphDateRangeApply}
-                      />
-                    ) : (
-                      <div className="h-[500px] flex items-center justify-center text-sm text-slate-400">
-                        Loading charts...
-                      </div>
-                    )}
-                  </div>
-                </motion.section>
+                    <motion.div variants={fadeIn}>
+                      <RightSideChatbot variant="card" />
+                    </motion.div>
+                  </motion.aside>
+                </div>
               </div>
             </main>
           </motion.div>
@@ -970,9 +959,10 @@ export default function DashboardPage() {
       {/* MODALS & OVERLAYS */}
       <AnimatePresence>
         {isFullscreen && (
-          <motion.div initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} className="fixed inset-0 z-50 bg-white overflow-hidden flex flex-col">
-            <div className="p-4 sm:p-6 lg:p-8 border-b flex items-center justify-between gap-3 bg-white/80 backdrop-blur-md">
-              <div className="flex items-center gap-4">
+          <motion.div initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} className="fixed inset-0 z-[60] flex flex-col overflow-hidden bg-white">
+            <div className="border-b bg-white/80 p-3 backdrop-blur-md sm:p-6 lg:p-8">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-3 sm:gap-4">
                 <div className={`h-10 w-10 rounded-xl flex items-center justify-center ${theme.bgLight} ${theme.accent}`}>
                    <Activity size={20} />
                 </div>
@@ -981,9 +971,10 @@ export default function DashboardPage() {
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{mode === "sales" ? "Sales Velocity" : "Claims Integrity"}</p>
                 </div>
               </div>
-              <button className="px-4 sm:px-6 lg:px-8 py-3 bg-slate-900 text-white rounded-2xl text-xs font-bold hover:bg-black transition-all whitespace-nowrap" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
+              <button className="w-full whitespace-nowrap rounded-2xl bg-slate-900 px-4 py-3 text-[11px] font-bold text-white transition-all hover:bg-black sm:w-auto sm:px-6 sm:text-xs lg:px-8" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
+              </div>
             </div>
-            <div className="flex-1 p-4 sm:p-6 lg:p-12 overflow-auto">
+            <div className="flex-1 overflow-auto p-3 sm:p-6 lg:p-12">
               {isDashboardDataReady ? (
                 <GraphSection
                   key={`fullscreen-graph-${brand}-${mode}-${effectiveJobId || ""}-${fromDate}-${toDate}-${filterRefreshTick}`}
@@ -998,11 +989,12 @@ export default function DashboardPage() {
                   onDateRangeApply={handleGraphDateRangeApply}
                 />
               ) : (
-                <div className="h-full min-h-[500px] flex items-center justify-center text-sm text-slate-400">
+                <div className="flex h-full min-h-[360px] items-center justify-center text-sm text-slate-400 sm:min-h-[500px]">
                   Loading charts...
                 </div>
               )}
             </div>
+            <RightSideChatbot variant="floating" />
           </motion.div>
         )}
       </AnimatePresence>
