@@ -1136,8 +1136,16 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 .reset_index()
             )
 
-            claims_out["_k"] = _norm_dim(claims_out[dim])
-            sales_out["_k"] = _norm_dim(sales_out[sales_dim])
+            if dim_key == "month":
+                claim_month_key = pd.to_datetime(claims_out[dim], errors="coerce").dt.to_period("M")
+                sales_month_key = pd.to_datetime(sales_out[sales_dim], errors="coerce").dt.to_period("M")
+                claims_out = claims_out[claim_month_key.notna()].copy()
+                sales_out = sales_out[sales_month_key.notna()].copy()
+                claims_out["_k"] = claim_month_key[claim_month_key.notna()].astype(str)
+                sales_out["_k"] = sales_month_key[sales_month_key.notna()].astype(str)
+            else:
+                claims_out["_k"] = _norm_dim(claims_out[dim])
+                sales_out["_k"] = _norm_dim(sales_out[sales_dim])
 
             # Avoid column name collision when claims and sales use the same dim (e.g., _month_key)
             sales_dim_col = sales_dim

@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from typing import Any
 from io import BytesIO
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from urllib.error import URLError
 from urllib.request import Request as UrlRequest, urlopen
 
@@ -415,15 +415,18 @@ DEFAULT_LLM_MODEL = (
 )
 DEFAULT_CHATBOT_SYSTEM_PROMPT = (
     "You are AI Sahyogi, Senior Analytics Advisor for Zopper leadership reviews. "
-    "Answer only from dashboard context and never use outside assumptions. "
+    "Answer from analytics context built from dashboard metrics and underlying dataset signals. "
     "Do not invent brands, products, numbers, dates, or events. "
-    "If the context is insufficient for a data question, respond exactly: "
-    "\"I can’t confirm that from the current dashboard data.\" "
+    "If key data is insufficient, explicitly state what is missing and provide the closest defensible estimate with assumptions. "
     "For greetings, acknowledgements, or short conversational messages, respond naturally and invite a data question. "
     "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, "
-    "samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma. "
+    "samsung/overview/overall/ -> Samsung Overview, samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma. "
+    "When Samsung model codes are mentioned (for example A06, S24, Fold7), map them to the provided Samsung device-plan category mapping in context. "
+    "Use Samsung plan abbreviations consistently: ADLD = Accidental Damage and Liquid Damage, EW = Extended Warranty, SP/SPP = Screen Protection Plan, CPP = Comprehensive Protection Plan, Combo = ADLD + EW. "
     "Write in a clear executive tone with concise, evidence-backed reasoning. "
     "Lead with the direct answer, then support it with key metrics, trend direction, and business impact. "
+    "Vary phrasing and structure across turns; avoid repeating identical templates or sentence openings. "
+    "For forecasting questions, derive next-month directional estimates only from historical monthly values in context. "
     "Do not re-introduce yourself unless the user explicitly asks who you are."
 )
 try:
@@ -551,8 +554,8 @@ def _normalize_source_key(source: str) -> str:
 _CHATBOT_SOURCE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
     ("reliance", ("reliance resq", "reliance-resq", "reliance_resq", "resq", "reliance")),
     ("godrej", ("godrej", "goodrej", "goddrej")),
-    ("samsung_vs", ("samsung vijay sales", "samsung_vs", "samsung vs", "vijay sales")),
-    ("samsung_croma", ("samsung croma", "samsung_croma")),
+    ("samsung_vs", ("samsung vijay sales", "samsung_vs", "samsung vs", "vijay sales", "vijay")),
+    ("samsung_croma", ("samsung croma", "samsung_croma", "croma sales", "croma")),
     ("samsung", ("samsung",)),
 ]
 
@@ -825,6 +828,10 @@ def _requests_global_scope(text: str) -> bool:
         "entire database",
         "full database",
         "all datasets",
+        "across datasets",
+        "look into those datasets",
+        "actual datasets",
+        "raw datasets",
         "all data",
         "complete database",
         "whole database",
@@ -1092,6 +1099,163 @@ def _resolve_summary_for_scope(
     )
 
 
+def _pick_frame_column(frame: Any, candidates: list[str]) -> str | None:
+    if frame is None or getattr(frame, "empty", True):
+        return None
+    try:
+        columns = [str(col) for col in list(frame.columns)]
+    except Exception:
+        return None
+    safe_to_raw: dict[str, str] = {}
+    for col in columns:
+        safe_to_raw[_to_safe_key(col)] = col
+    for candidate in candidates:
+        hit = safe_to_raw.get(_to_safe_key(candidate))
+        if hit:
+            return hit
+    return None
+
+
+def _build_dataset_field_profile(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> str | None:
+    try:
+        frame = get_dataframe(
+            db=db,
+            job_id=job_id,
+            source=source,
+            dataset_type=dataset_type,
+        )
+    except Exception:
+        logger.exception(
+            "Chatbot dataset profile fetch failed source=%s dataset=%s job_id=%s",
+            source,
+            dataset_type,
+            job_id,
+        )
+        return None
+
+    if frame is None or getattr(frame, "empty", True):
+        return None
+
+    if from_date or to_date:
+        try:
+            frame = filter_by_date_range(
+                frame,
+                dataset_type,
+                from_date,
+                to_date,
+            )
+        except Exception:
+            logger.exception(
+                "Chatbot dataset profile date filtering failed source=%s dataset=%s from=%s to=%s",
+                source,
+                dataset_type,
+                from_date,
+                to_date,
+            )
+            return None
+
+    if frame is None or getattr(frame, "empty", True):
+        return None
+
+    try:
+        row_count = int(len(frame.index))
+    except Exception:
+        row_count = 0
+
+    try:
+        columns = [str(col) for col in list(frame.columns)]
+    except Exception:
+        columns = []
+
+    if not columns:
+        return None
+
+    col_preview = ", ".join(columns[:14])
+    if len(columns) > 14:
+        col_preview += ", ..."
+
+    dim_candidates = [
+        "month",
+        "state",
+        "city",
+        "channel",
+        "brand",
+        "plan_category",
+        "device_plan_category",
+        "product_category",
+    ]
+    detected_dims = [
+        dim
+        for dim in dim_candidates
+        if _pick_frame_column(
+            frame,
+            [
+                dim,
+                dim.replace("_", " "),
+                dim.replace("_", "-"),
+            ],
+        )
+    ]
+
+    price_col = _pick_frame_column(
+        frame,
+        [
+            "amount",
+            "gross_premium",
+            "plan_selling_price",
+            "plan_price",
+            "premium",
+            "net_amount",
+        ],
+    )
+    qty_col = _pick_frame_column(
+        frame,
+        [
+            "quantity",
+            "units_sold",
+            "units",
+            "count",
+            "claims_count",
+            "no_of_claims",
+            "no_of_policies",
+        ],
+    )
+    cost_or_margin_col = _pick_frame_column(
+        frame,
+        [
+            "net_amount",
+            "net_claims",
+            "claims",
+            "cost",
+            "margin",
+            "profit",
+            "contribution",
+            "zopper_share",
+            "zopper_shared_transfer_price",
+        ],
+    )
+
+    dim_text = ", ".join(detected_dims[:6]) if detected_dims else "none detected"
+    price_text = price_col or "not found"
+    qty_text = qty_col or "not found"
+    cost_text = cost_or_margin_col or "not found"
+
+    return (
+        f"{_source_display_name(source)} {dataset_type} dataset profile: "
+        f"rows={row_count:,}; columns sample={col_preview}; "
+        f"detected dimensions={dim_text}; pricing field={price_text}; "
+        f"quantity field={qty_text}; cost/margin related field={cost_text}."
+    )
+
+
 def _build_chatbot_global_context(
     *,
     db: Session,
@@ -1120,7 +1284,7 @@ def _build_chatbot_global_context(
     }
 
     context_lines = [
-        "Scope mode: full database access across all sources and datasets.",
+        "Scope mode: cross-source analytics context using dashboard summaries plus underlying dataset records.",
         f"Selected date range: {date_label}",
     ]
     if job_id:
@@ -1141,6 +1305,12 @@ def _build_chatbot_global_context(
             for scope in scopes[:12]
         )
     )
+    if any(
+        _normalize_source_key(str(scope.get("source", ""))) in {"samsung", "samsung_vs", "samsung_croma"}
+        for scope in scopes
+    ):
+        context_lines.append(_samsung_model_mapping_context_line())
+        context_lines.extend(_samsung_plan_reference_context_lines())
 
     sales_totals = {
         "gross_premium": 0.0,
@@ -1154,6 +1324,7 @@ def _build_chatbot_global_context(
         "units_sold": 0.0,
     }
     summary_lines: list[str] = []
+    dataset_profile_lines: list[str] = []
     for scope in scopes[:12]:
         source = str(scope.get("source", ""))
         dataset_type = str(scope.get("dataset_type", ""))
@@ -1201,12 +1372,26 @@ def _build_chatbot_global_context(
                 f"Units Sold={int(units_sold):,}"
             )
 
+        if len(dataset_profile_lines) < 4:
+            profile_line = _build_dataset_field_profile(
+                db=db,
+                source=source,
+                dataset_type=dataset_type,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            if profile_line:
+                dataset_profile_lines.append(profile_line)
+
     if summary_lines:
         context_lines.extend(summary_lines)
     else:
         context_lines.append(
-            "Summary metrics were not precomputed for these slices, but full row-level data exists in data_rows."
+            "Summary metrics were not precomputed for these slices, but row-level records are available in data_rows."
         )
+    if dataset_profile_lines:
+        context_lines.extend(dataset_profile_lines)
 
     if any(value > 0 for value in sales_totals.values()):
         context_lines.append(
@@ -1246,10 +1431,10 @@ def _build_chatbot_greeting_response(
         for scope in scopes[:5]
     )
     return (
-        "Hi. I'm AI Sahyogi and I now have full access to all dashboard rows in the database. "
+        "Hi. I'm AI Sahyogi and I can analyze dashboard metrics plus underlying dataset records across available sources. "
         f"Current coverage: {len(scopes)} source/dataset slices, {total_rows:,} rows total. "
         f"Examples: {preview}. "
-        "Ask any business question and I will answer from this data."
+        "Ask any business question and I will answer from the available analytics data."
     )
 
 
@@ -1518,6 +1703,9 @@ def _build_chatbot_dashboard_context(
         f"Selected dataset: {dataset_type}",
         f"Selected date range: {date_label}",
     ]
+    if _normalize_source_key(source) in {"samsung", "samsung_vs", "samsung_croma"}:
+        context_lines.append(_samsung_model_mapping_context_line())
+        context_lines.extend(_samsung_plan_reference_context_lines())
     if job_id:
         context_lines.append(f"Selected job tag: {job_id}")
 
@@ -1536,6 +1724,17 @@ def _build_chatbot_dashboard_context(
             f"Zopper Earned Premium={_format_metric_value('zopper_earned_premium', float(summary.get('zopper_earned_premium', 0) or 0))}; "
             f"Units Sold={int(float(summary.get('units_sold', 0) or 0)):,}"
         )
+
+    profile_line = _build_dataset_field_profile(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if profile_line:
+        context_lines.append(profile_line)
 
     if rankings:
         for snapshot in rankings:
@@ -1717,6 +1916,1260 @@ def _build_underperformance_answer(message: str, context_payload: dict[str, Any]
         )
     answer += "This is the current underperformer in the dashboard slice."
     return answer
+
+
+_SAMSUNG_PLAN_REFERENCE_LINES: tuple[str, ...] = (
+    "Samsung plan glossary: ADLD = Accidental Damage and Liquid Damage; SP/SPP = Screen Protection Plan; EW = Extended Warranty; CPP = Comprehensive Protection Plan; Combo = ADLD + EW.",
+    "Samsung products/devices covered: smartphones, tablets, laptops, and smartwatches (subject to Samsung terms and channel eligibility in India).",
+    "Coverage summary: ADLD covers accidental/liquid damage; SPP covers screen/display damage; EW covers mechanical and electrical breakdown; CPP covers accidental damage plus mechanical/electrical breakdown.",
+    "Claims process summary: login via registered mobile OTP on Samsung unified portal, open Raise Claim for active policy, submit issue/carry-in details, choose service center and visit slot, pay processing fee where applicable, then receive claim ID.",
+)
+
+
+def _samsung_plan_reference_context_lines() -> list[str]:
+    return list(_SAMSUNG_PLAN_REFERENCE_LINES)
+
+
+def _normalize_lookup_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (value or "").strip().lower())).strip()
+
+
+def _extract_location_query_token(message: str, context_payload: dict[str, Any]) -> str | None:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return None
+
+    patterns = (
+        r"\bin\s+([a-z][a-z\s\-]{1,40}?)(?=\s*,\s*in\b|\s+in\s+the\s+month\b|\s+in\s+month\b|\s+during\b|\s+for\b|\s+on\b|[?.!,]|$)",
+        r"\bfor\s+([a-z][a-z\s\-]{1,40}?)(?=\s*,|\s+in\s+the\s+month\b|\s+in\s+month\b|\s+during\b|\s+on\b|[?.!,]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, low)
+        if not match:
+            continue
+        token = _normalize_lookup_text(match.group(1))
+        if token and token not in {"month", "claims", "claim", "state", "city"}:
+            return token
+
+    allowed_labels = [str(label or "") for label in (context_payload.get("allowed_labels") or [])]
+    for label in sorted(allowed_labels, key=lambda item: len(item), reverse=True):
+        normalized_label = _normalize_lookup_text(label)
+        if not normalized_label:
+            continue
+        pattern = r"\b" + re.escape(normalized_label).replace(r"\ ", r"\s+") + r"\b"
+        if re.search(pattern, low):
+            return normalized_label
+    return None
+
+
+def _extract_month_window_from_text(message: str) -> tuple[str, str, str] | None:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return None
+
+    month_pattern = (
+        r"\b("
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+        r")\s*[,/\-]?\s*(\d{2}|\d{4})\b"
+    )
+    match = re.search(month_pattern, low)
+    if not match:
+        return None
+
+    month_key = match.group(1)[:3]
+    month_num = _FORECAST_MONTH_MAP.get(month_key)
+    if month_num is None:
+        return None
+
+    year_raw = match.group(2)
+    year = int(year_raw) + 2000 if len(year_raw) == 2 else int(year_raw)
+    if year < 1900 or year > 2200:
+        return None
+
+    start_dt = date(year, month_num, 1)
+    if month_num == 12:
+        end_dt = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_dt = date(year, month_num + 1, 1) - timedelta(days=1)
+    return start_dt.isoformat(), end_dt.isoformat(), start_dt.strftime("%B %Y")
+
+
+def _present_frame_columns(frame: Any, candidates: list[str]) -> list[str]:
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    try:
+        columns = [str(col) for col in list(frame.columns)]
+    except Exception:
+        return []
+
+    safe_candidates = {_to_safe_key(candidate) for candidate in candidates}
+    out: list[str] = []
+    for col in columns:
+        if _to_safe_key(col) in safe_candidates:
+            out.append(col)
+    return out
+
+
+def _location_mask_for_column(frame: Any, column: str, location_token: str) -> tuple[list[bool], int]:
+    if frame is None or getattr(frame, "empty", True):
+        return [], 0
+
+    needle = _normalize_lookup_text(location_token)
+    if not needle:
+        return [], 0
+
+    try:
+        raw_values = frame[column].tolist()
+    except Exception:
+        return [], 0
+
+    boundary_pattern = re.compile(r"(?:^| )" + re.escape(needle) + r"(?: |$)")
+    mask: list[bool] = []
+    count = 0
+    for raw in raw_values:
+        normalized = _normalize_lookup_text(str(raw or ""))
+        matched = (
+            bool(normalized)
+            and (
+                normalized == needle
+                or bool(boundary_pattern.search(normalized))
+                or needle in normalized
+            )
+        )
+        mask.append(bool(matched))
+        if matched:
+            count += 1
+    return mask, count
+
+
+def _match_frame_by_location(
+    frame: Any,
+    location_token: str,
+) -> tuple[Any, str, bool, bool]:
+    if frame is None or getattr(frame, "empty", True):
+        return frame, "", False, False
+
+    city_columns = _present_frame_columns(
+        frame,
+        [
+            "city",
+            "customer_city",
+            "customer city",
+            "city_name",
+            "location",
+            "district",
+            "state_city",
+            "state/city",
+            "state / city",
+        ],
+    )
+    state_columns = _present_frame_columns(
+        frame,
+        [
+            "state",
+            "customer_state",
+            "customer state",
+            "state_name",
+            "region",
+            "ut",
+            "union territory",
+            "state_city",
+            "state/city",
+            "state / city",
+        ],
+    )
+    city_present = bool(city_columns)
+    state_present = bool(state_columns)
+
+    best_city_mask: list[bool] | None = None
+    best_city_count = 0
+    for col in city_columns:
+        mask, count = _location_mask_for_column(frame, col, location_token)
+        if count > best_city_count:
+            best_city_mask = mask
+            best_city_count = count
+    if best_city_mask is not None and best_city_count > 0:
+        return frame[best_city_mask].copy(), "city", city_present, state_present
+
+    best_state_mask: list[bool] | None = None
+    best_state_count = 0
+    for col in state_columns:
+        mask, count = _location_mask_for_column(frame, col, location_token)
+        if count > best_state_count:
+            best_state_mask = mask
+            best_state_count = count
+    if best_state_mask is not None and best_state_count > 0:
+        return frame[best_state_mask].copy(), "state", city_present, state_present
+
+    return frame.iloc[0:0].copy(), "", city_present, state_present
+
+
+def _is_claim_average_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    if "claim" not in low:
+        return False
+    return any(token in low for token in ("average", "avg", "mean"))
+
+
+def _build_claim_average_answer(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_claim_average_query(payload.message):
+        return None
+
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
+    if dataset_type != "claims":
+        return None
+
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+    job_id = context_payload.get("job_id")
+    global_scope = bool(context_payload.get("global_scope"))
+
+    source_candidates: list[str] = []
+    if global_scope:
+        scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+        source_candidates = [
+            str(scope.get("source", ""))
+            for scope in scopes
+            if str(scope.get("dataset_type", "")).strip().lower() == "claims"
+        ]
+    else:
+        source = str(context_payload.get("source") or _resolve_chatbot_source(payload) or "").strip()
+        if source:
+            source_candidates = [source]
+
+    source_candidates = [src for src in source_candidates if src]
+    if not source_candidates:
+        return None
+
+    month_window = _extract_month_window_from_text(payload.message)
+    location_token = _extract_location_query_token(payload.message, context_payload)
+
+    total_net_claims = 0.0
+    total_claim_count = 0.0
+    total_rows = 0
+    city_match_hits = 0
+    state_match_hits = 0
+    city_columns_seen = False
+    state_columns_seen = False
+
+    for source in source_candidates:
+        try:
+            frame = get_dataframe(
+                db=db,
+                job_id=job_id,
+                source=source,
+                dataset_type="claims",
+            )
+        except Exception:
+            logger.exception(
+                "Chatbot claims average fetch failed source=%s job_id=%s",
+                source,
+                job_id,
+            )
+            continue
+
+        if frame is None or getattr(frame, "empty", True):
+            continue
+
+        try:
+            scoped = frame.copy()
+        except Exception:
+            continue
+
+        if from_date or to_date:
+            scoped = filter_by_date_range(scoped, "claims", from_date, to_date)
+        if month_window is not None:
+            scoped = filter_by_date_range(scoped, "claims", month_window[0], month_window[1])
+        if scoped is None or getattr(scoped, "empty", True):
+            continue
+
+        if location_token:
+            scoped, match_level, city_present, state_present = _match_frame_by_location(scoped, location_token)
+            city_columns_seen = city_columns_seen or city_present
+            state_columns_seen = state_columns_seen or state_present
+            if match_level == "city":
+                city_match_hits += 1
+            elif match_level == "state":
+                state_match_hits += 1
+            if scoped is None or getattr(scoped, "empty", True):
+                continue
+
+        net_claims = _sum_metric_from_dataframe(
+            scoped,
+            [
+                "net_claims",
+                "net_claim",
+                "net_amount",
+                "claims",
+                "claim_amount",
+                "zoppers_cost",
+                "amount",
+                "earned_premium",
+                "gross_premium",
+            ],
+        )
+        claim_count = _sum_metric_from_dataframe(
+            scoped,
+            [
+                "quantity",
+                "claims_count",
+                "no_of_claims",
+                "count",
+                "units_sold",
+            ],
+        )
+        if claim_count <= 0:
+            try:
+                claim_count = float(len(scoped.index))
+            except Exception:
+                claim_count = 0.0
+        if claim_count <= 0:
+            continue
+
+        total_net_claims += float(net_claims)
+        total_claim_count += float(claim_count)
+        try:
+            total_rows += int(len(scoped.index))
+        except Exception:
+            pass
+
+    if total_claim_count <= 0:
+        period_label = month_window[2] if month_window else "the selected period"
+        if location_token and (city_columns_seen or state_columns_seen):
+            return (
+                f"I can’t confirm average claim raised for {location_token.title()} in {period_label} from current matched rows. "
+                "Recommendation: standardize city values and keep a city-level filter in claims data to close this gap."
+            )
+        if location_token:
+            return (
+                f"I can’t confirm average claim raised for {location_token.title()} in {period_label} because city/state location fields are not consistently available in this claims slice. "
+                "Recommendation: add a normalized city column and make it mandatory at claim intake."
+            )
+        return "I don’t have enough claims rows in the selected scope to compute a reliable average claim."
+
+    avg_claim = total_net_claims / total_claim_count if total_claim_count > 0 else 0.0
+    scope_label = (
+        "all claims sources"
+        if global_scope
+        else str(context_payload.get("source_label") or _source_display_name(source_candidates[0]))
+    )
+    period_label = month_window[2] if month_window else (
+        f"{from_date or 'start'} to {to_date or 'latest'}" if (from_date or to_date) else "all available data"
+    )
+
+    if location_token:
+        answer = (
+            f"Average net claim raised in {location_token.title()} for {period_label} in {scope_label} is "
+            f"{_format_metric_value('net_claims', float(avg_claim))} per claim "
+            f"(total net claims {_format_metric_value('net_claims', float(total_net_claims))} across {int(total_claim_count):,} claims)."
+        )
+    else:
+        answer = (
+            f"Average net claim for {period_label} in {scope_label} is "
+            f"{_format_metric_value('net_claims', float(avg_claim))} per claim "
+            f"(total net claims {_format_metric_value('net_claims', float(total_net_claims))} across {int(total_claim_count):,} claims)."
+        )
+
+    if location_token and state_match_hits > 0 and city_match_hits == 0:
+        answer += " City-level match was unavailable, so this uses state/region-level matching."
+    elif location_token and city_match_hits > 0:
+        answer += " This is computed from city-level matched claims rows."
+
+    if total_rows > 0:
+        answer += f" Rows used: {total_rows:,}."
+    return answer
+
+
+_SAMSUNG_MODEL_TO_DEVICE_PLAN_CATEGORY: dict[str, str] = {
+    "A06": "Mass",
+    "F15": "Mass",
+    "A16": "Mid",
+    "A17": "Mid",
+    "F17": "Mid",
+    "A26": "High",
+    "A35": "High",
+    "A36": "High",
+    "F55": "High",
+    "A56": "Premium",
+    "S24": "Super Premium",
+    "S25": "Super Premium",
+    "Fold6": "Luxury Fold",
+    "Fold7": "Luxury Fold",
+    "Flip7": "Luxury Flip",
+}
+
+_SAMSUNG_MODEL_CODES_ORDERED: tuple[str, ...] = tuple(
+    sorted(_SAMSUNG_MODEL_TO_DEVICE_PLAN_CATEGORY.keys(), key=lambda token: (-len(token), token))
+)
+
+_SAMSUNG_DEVICE_CATEGORY_ORDER: tuple[str, ...] = (
+    "Luxury Fold",
+    "Luxury Flip",
+    "Super Premium",
+    "Premium",
+    "High",
+    "Mid",
+    "Mass",
+)
+
+_SAMSUNG_PLAN_CATEGORY_ORDER: tuple[str, ...] = (
+    "ADLD",
+    "Screen Protection",
+    "Combo",
+    "Extended Warranty",
+)
+
+_SAMSUNG_REFERENCE_PLAN_PRICES: dict[tuple[str, str], int] = {
+    ("Luxury Fold", "ADLD"): 5299,
+    ("Luxury Fold", "Screen Protection"): 3999,
+    ("Luxury Fold", "Combo"): 8587,
+    ("Luxury Fold", "Extended Warranty"): 2060,
+    ("Luxury Flip", "ADLD"): 4199,
+    ("Luxury Flip", "Screen Protection"): 3748,
+    ("Luxury Flip", "Combo"): 6800,
+    ("Luxury Flip", "Extended Warranty"): 1737,
+    ("Super Premium", "ADLD"): 2539,
+    ("Super Premium", "Screen Protection"): 1174,
+    ("Super Premium", "Combo"): 4694,
+    ("Super Premium", "Extended Warranty"): 1064,
+    ("Premium", "ADLD"): 1686,
+    ("Premium", "Screen Protection"): 523,
+    ("Premium", "Combo"): 2299,
+    ("Premium", "Extended Warranty"): 410,
+    ("High", "ADLD"): 799,
+    ("High", "Screen Protection"): 260,
+    ("High", "Combo"): 1399,
+    ("High", "Extended Warranty"): 242,
+    ("Mid", "ADLD"): 563,
+    ("Mid", "Screen Protection"): 135,
+    ("Mid", "Combo"): 806,
+    ("Mid", "Extended Warranty"): 149,
+    ("Mass", "ADLD"): 159,
+    ("Mass", "Screen Protection"): 53,
+    ("Mass", "Combo"): 267,
+    ("Mass", "Extended Warranty"): 46,
+}
+
+_SAMSUNG_DEVICE_CATEGORY_ALIASES: list[tuple[str, tuple[str, ...]]] = [
+    ("Luxury Fold", ("luxury fold", "fold")),
+    ("Luxury Flip", ("luxury flip", "flip")),
+    ("Super Premium", ("super premium", "super-premium")),
+    ("Premium", ("premium",)),
+    ("High", ("high",)),
+    ("Mid", ("mid",)),
+    ("Mass", ("mass",)),
+]
+
+_SAMSUNG_PLAN_CATEGORY_ALIASES: list[tuple[str, tuple[str, ...]]] = [
+    ("ADLD", ("adld",)),
+    ("Screen Protection", ("screen protection", "screen-protection")),
+    ("Combo", ("combo",)),
+    ("Extended Warranty", ("extended warranty", "extended-warranty", "warranty")),
+]
+
+
+def _detect_samsung_model_code_from_text(text: str) -> str | None:
+    low = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not low:
+        return None
+
+    for model_code in _SAMSUNG_MODEL_CODES_ORDERED:
+        pattern = r"\b" + re.escape(model_code.lower()) + r"\b"
+        if re.search(pattern, low):
+            return model_code
+    return None
+
+
+def _samsung_model_mapping_context_line() -> str:
+    pairs = "; ".join(
+        f"{model_code}->{category}"
+        for model_code, category in _SAMSUNG_MODEL_TO_DEVICE_PLAN_CATEGORY.items()
+    )
+    return f"Samsung model-to-device-plan-category mapping: {pairs}."
+
+
+def _contains_text_alias(text: str, alias: str) -> bool:
+    pattern = r"\b" + re.escape(alias).replace(r"\ ", r"\s+") + r"\b"
+    return re.search(pattern, text) is not None
+
+
+def _detect_samsung_device_category_from_text(text: str) -> str | None:
+    model_code = _detect_samsung_model_code_from_text(text)
+    if model_code:
+        mapped = _SAMSUNG_MODEL_TO_DEVICE_PLAN_CATEGORY.get(model_code)
+        if mapped:
+            return mapped
+
+    low = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not low:
+        return None
+
+    for category, aliases in _SAMSUNG_DEVICE_CATEGORY_ALIASES:
+        for alias in aliases:
+            if not _contains_text_alias(low, alias):
+                continue
+            if category in {"High", "Mid", "Mass"} and alias in {"high", "mid", "mass"}:
+                if not re.search(r"\b(device|plan|category|segment|tier)\b", low):
+                    continue
+            return category
+    return None
+
+
+def _detect_samsung_plan_category_from_text(text: str) -> str | None:
+    low = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not low:
+        return None
+
+    for category, aliases in _SAMSUNG_PLAN_CATEGORY_ALIASES:
+        for alias in aliases:
+            if _contains_text_alias(low, alias):
+                return category
+    return None
+
+
+def _is_samsung_source(source: str) -> bool:
+    source_key = _normalize_source_key(source)
+    return source_key in {"samsung", "samsung_vs", "samsung_croma"}
+
+
+def _is_samsung_price_lookup_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+
+    direct_lookup_tokens = ("price", "pricing", "cost", "rate", "amount", "mrp")
+    has_lookup_intent = any(token in low for token in direct_lookup_tokens)
+    if not has_lookup_intent and "how much" in low:
+        has_lookup_intent = any(token in low for token in ("plan", "category", "price", "cost", "rate"))
+    if not has_lookup_intent:
+        return False
+
+    uplift_tokens = ("increase", "hike", "raise", "uplift", "optimize", "optimise", "maximize")
+    return not any(token in low for token in uplift_tokens)
+
+
+def _format_rupee_int(value: int) -> str:
+    return f"Rs {int(value):,}"
+
+
+def _build_samsung_manual_price_answer(
+    *,
+    message: str,
+    source_candidates: list[str],
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_samsung_price_lookup_query(message):
+        return None
+
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    selected_source_key = _normalize_source_key(str(context_payload.get("source") or ""))
+    mentioned_source_key = _normalize_source_key(_detect_source_from_text(message) or "")
+    mentions_samsung_family = bool(re.search(r"\b(samsung|croma|vijay)\b", low))
+
+    in_samsung_scope = False
+    if _is_samsung_source(selected_source_key) or _is_samsung_source(mentioned_source_key):
+        in_samsung_scope = True
+    elif mentions_samsung_family and any(_is_samsung_source(source) for source in source_candidates):
+        in_samsung_scope = True
+
+    if not in_samsung_scope:
+        return None
+
+    device_category = _detect_samsung_device_category_from_text(message)
+    plan_category = _detect_samsung_plan_category_from_text(message)
+
+    if device_category and plan_category:
+        price = _SAMSUNG_REFERENCE_PLAN_PRICES.get((device_category, plan_category))
+        if price is None:
+            return None
+        return (
+            f"Samsung reference price for {device_category} in {plan_category} is {_format_rupee_int(price)}."
+        )
+
+    if device_category:
+        lines = [f"Samsung reference prices for {device_category}:"]
+        for plan in _SAMSUNG_PLAN_CATEGORY_ORDER:
+            price = _SAMSUNG_REFERENCE_PLAN_PRICES.get((device_category, plan))
+            if price is None:
+                continue
+            lines.append(f"- {plan}: {_format_rupee_int(price)}")
+        if len(lines) > 1:
+            return "\n".join(lines)
+        return None
+
+    if plan_category:
+        lines = [f"Samsung reference prices for {plan_category}:"]
+        for device in _SAMSUNG_DEVICE_CATEGORY_ORDER:
+            price = _SAMSUNG_REFERENCE_PLAN_PRICES.get((device, plan_category))
+            if price is None:
+                continue
+            lines.append(f"- {device}: {_format_rupee_int(price)}")
+        if len(lines) > 1:
+            return "\n".join(lines)
+        return None
+
+    lines = ["Samsung reference price matrix (Device Plan Category x Plan Category):"]
+    for device in _SAMSUNG_DEVICE_CATEGORY_ORDER:
+        chunks: list[str] = []
+        for plan in _SAMSUNG_PLAN_CATEGORY_ORDER:
+            price = _SAMSUNG_REFERENCE_PLAN_PRICES.get((device, plan))
+            if price is None:
+                continue
+            chunks.append(f"{plan} {_format_rupee_int(price)}")
+        if chunks:
+            lines.append(f"- {device}: {'; '.join(chunks)}")
+    lines.append("These are fixed category reference prices configured for Samsung queries.")
+    return "\n".join(lines)
+
+
+def _is_pricing_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    price_tokens = ("price", "pricing", "cost", "rate", "amount", "increase", "hike", "raise", "uplift")
+    has_price_intent = any(token in low for token in price_tokens)
+    if not has_price_intent and "how much" in low:
+        has_price_intent = any(
+            token in low
+            for token in ("plan", "category", "price", "cost", "rate", "increase", "uplift")
+        )
+    business_tokens = ("revenue", "premium", "sales", "category", "segment", "plan")
+    return has_price_intent and any(token in low for token in business_tokens)
+
+
+def _aggregate_metric_by_dimension(
+    rows: list[dict[str, Any]],
+    *,
+    dimension: str,
+    metric: str,
+) -> dict[str, float]:
+    if not rows:
+        return {}
+
+    dim_key = _pick_present_key(rows, [dimension])
+    if dim_key is None:
+        safe_map = {_to_safe_key(str(k)): str(k) for k in rows[0].keys()}
+        if _to_safe_key(dimension) == "plan_category":
+            dim_key = safe_map.get("device_plan_category")
+        elif _to_safe_key(dimension) == "device_plan_category":
+            dim_key = safe_map.get("plan_category")
+
+    metric_key = _pick_present_key(rows, [metric])
+    out: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        label = ""
+        if dim_key is not None:
+            label = str(row.get(dim_key, "")).strip()
+        if not label:
+            continue
+        if label.lower() in {"nan", "none", "null"}:
+            continue
+
+        value: float | None = None
+        if metric_key is not None:
+            value = _to_number(row.get(metric_key))
+
+        if value is None:
+            partner_vs = _to_number(row.get("samsung_vs"))
+            partner_croma = _to_number(row.get("samsung_croma"))
+            if partner_vs is not None or partner_croma is not None:
+                value = float(partner_vs or 0) + float(partner_croma or 0)
+
+        if value is None:
+            fallback_total = 0.0
+            found_numeric = False
+            for key, raw in row.items():
+                if dim_key is not None and str(key) == dim_key:
+                    continue
+                safe_key = _to_safe_key(str(key))
+                if safe_key.startswith("tooltip_"):
+                    continue
+                numeric = _to_number(raw)
+                if numeric is None:
+                    continue
+                fallback_total += float(numeric)
+                found_numeric = True
+            if found_numeric:
+                value = fallback_total
+
+        if value is None:
+            continue
+        out[label] = out.get(label, 0.0) + max(0.0, float(value))
+    return out
+
+
+def _build_pricing_recommendation_answer(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_pricing_query(payload.message):
+        return None
+
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
+    if dataset_type != "sales":
+        return (
+            "Pricing recommendations are meaningful for sales datasets. "
+            "Please switch to sales scope or ask a claims-specific optimization question."
+        )
+
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+    job_id = context_payload.get("job_id")
+    global_scope = bool(context_payload.get("global_scope"))
+
+    source_candidates: list[str] = []
+    if global_scope:
+        scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+        source_candidates = [
+            str(scope.get("source", ""))
+            for scope in scopes
+            if str(scope.get("dataset_type", "")).strip().lower() == "sales"
+        ]
+    else:
+        source = str(context_payload.get("source") or _resolve_chatbot_source(payload) or "").strip()
+        if source:
+            source_candidates = [source]
+
+    source_candidates = [src for src in source_candidates if src]
+    if not source_candidates:
+        return None
+
+    samsung_manual_price_answer = _build_samsung_manual_price_answer(
+        message=payload.message,
+        source_candidates=source_candidates,
+        context_payload=context_payload,
+    )
+    if samsung_manual_price_answer:
+        return samsung_manual_price_answer
+
+    dimension_used = ""
+    revenue_by_category: dict[str, float] = {}
+    quantity_by_category: dict[str, float] = {}
+
+    for dimension in ["plan_category", "device_plan_category", "product_category", "brand"]:
+        rev_agg: dict[str, float] = {}
+        qty_agg: dict[str, float] = {}
+        for source in source_candidates:
+            rev_rows = _chatbot_graph_rows(
+                db=db,
+                source=source,
+                dataset_type="sales",
+                job_id=job_id,
+                dimension=dimension,
+                metric="gross_premium",
+                from_date=from_date,
+                to_date=to_date,
+            )
+            qty_rows = _chatbot_graph_rows(
+                db=db,
+                source=source,
+                dataset_type="sales",
+                job_id=job_id,
+                dimension=dimension,
+                metric="quantity",
+                from_date=from_date,
+                to_date=to_date,
+            )
+            local_rev = _aggregate_metric_by_dimension(
+                rev_rows,
+                dimension=dimension,
+                metric="gross_premium",
+            )
+            local_qty = _aggregate_metric_by_dimension(
+                qty_rows,
+                dimension=dimension,
+                metric="quantity",
+            )
+            for label, value in local_rev.items():
+                rev_agg[label] = rev_agg.get(label, 0.0) + float(value)
+            for label, value in local_qty.items():
+                qty_agg[label] = qty_agg.get(label, 0.0) + float(value)
+
+        valid_count = sum(
+            1
+            for label, revenue in rev_agg.items()
+            if revenue > 0 and qty_agg.get(label, 0.0) > 0
+        )
+        if valid_count >= 2:
+            dimension_used = dimension
+            revenue_by_category = rev_agg
+            quantity_by_category = qty_agg
+            break
+
+    if not dimension_used:
+        return (
+            "I can analyze pricing only when category-level gross premium and quantity are available. "
+            "That split is not currently available in the selected dataset scope."
+        )
+
+    rows: list[dict[str, float | str]] = []
+    total_revenue = 0.0
+    for label, revenue in revenue_by_category.items():
+        quantity = float(quantity_by_category.get(label, 0.0))
+        if revenue <= 0 or quantity <= 0:
+            continue
+        avg_price = revenue / quantity
+        total_revenue += revenue
+        rows.append(
+            {
+                "label": label,
+                "revenue": float(revenue),
+                "quantity": float(quantity),
+                "avg_price": float(avg_price),
+            }
+        )
+
+    if len(rows) < 2 or total_revenue <= 0:
+        return (
+            "I can analyze pricing only when category-level gross premium and quantity are available. "
+            "That split is not currently available in the selected dataset scope."
+        )
+
+    rows.sort(key=lambda item: float(item["revenue"]), reverse=True)
+    for item in rows:
+        share = float(item["revenue"]) / total_revenue
+        if share >= 0.30:
+            uplift_pct = 3.0
+        elif share >= 0.15:
+            uplift_pct = 4.0
+        elif share >= 0.08:
+            uplift_pct = 6.0
+        else:
+            uplift_pct = 8.0
+        item["share"] = share
+        item["uplift_pct"] = uplift_pct
+        item["estimated_gain"] = float(item["revenue"]) * uplift_pct / 100.0
+
+    shown = rows[:8]
+    scope_label = (
+        "all sales datasets"
+        if global_scope
+        else str(context_payload.get("source_label") or _source_display_name(source_candidates[0]))
+    )
+    range_suffix = ""
+    if from_date or to_date:
+        range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
+
+    lines = [
+        f"Using {scope_label}{range_suffix} and category-level gross premium + quantity, this is a practical starting price-uplift plan by {_pretty_label(dimension_used).lower()} (assuming volume remains stable):"
+    ]
+    for idx, item in enumerate(shown, 1):
+        lines.append(
+            f"{idx}. {item['label']}: +{float(item['uplift_pct']):.0f}% "
+            f"(avg premium {_format_metric_value('gross_premium', float(item['avg_price']))}, "
+            f"current revenue {_format_metric_value('gross_premium', float(item['revenue']))}, "
+            f"estimated gain +{_format_metric_value('gross_premium', float(item['estimated_gain']))})."
+        )
+
+    remaining = len(rows) - len(shown)
+    if remaining > 0:
+        lines.append(
+            f"Remaining {remaining} lower-share categories can start with a +8% test band and be tuned weekly based on conversion."
+        )
+    lines.append(
+        "This is a revenue-side scenario. Share margin targets and expected volume elasticity to optimize exact category-wise price changes."
+    )
+    return "\n".join(lines)
+
+
+_FORECAST_MONTH_MAP: dict[str, int] = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+def _is_forecast_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    tokens = (
+        "forecast",
+        "predict",
+        "prediction",
+        "projection",
+        "projected",
+        "future month",
+        "next month",
+        "upcoming month",
+        "likely next",
+        "estimate next",
+        "month ahead",
+        "time series",
+    )
+    return any(token in low for token in tokens)
+
+
+def _forecast_metric_hint_present(message: str, dataset_type: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    if dataset_type == "claims":
+        return any(
+            token in low
+            for token in (
+                "loss ratio",
+                "net claim",
+                "claims",
+                "quantity",
+                "count",
+                "no. of claims",
+            )
+        )
+    return any(
+        token in low
+        for token in (
+            "gross premium",
+            "earned premium",
+            "zopper earned",
+            "quantity",
+            "units sold",
+            "units",
+            "count",
+            "premium",
+            "sales",
+        )
+    )
+
+
+def _is_forecast_followup_query(payload: ChatbotPayload) -> bool:
+    message = payload.message or ""
+    if _is_pricing_query(message):
+        return False
+    if _is_forecast_query(message):
+        return True
+
+    low = re.sub(r"\s+", " ", message.strip().lower())
+    if not low:
+        return False
+
+    followup_markers = (
+        "what about",
+        "how about",
+        "and what",
+        "and for",
+        "for croma",
+        "for vijay",
+        "for samsung",
+        "for reliance",
+        "for godrej",
+        "for this",
+        "for that",
+        "same for",
+        "same question",
+    )
+    source_hint = _detect_source_from_text(message) is not None
+    likely_followup = source_hint or any(marker in low for marker in followup_markers)
+    if not likely_followup:
+        return False
+
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() != "user":
+            continue
+        if _is_forecast_query(turn.content):
+            return True
+    return False
+
+
+def _forecast_metric_from_text(message: str, dataset_type: str) -> str:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if dataset_type == "claims":
+        if "loss ratio" in low:
+            return "loss_ratio"
+        if "net claim" in low:
+            return "net_claims"
+        if "quantity" in low or "count" in low or "no. of claims" in low:
+            return "quantity"
+        return "claims"
+
+    if "zopper earned" in low:
+        return "zopper_earned_premium"
+    if "earned premium" in low:
+        return "earned_premium"
+    if "quantity" in low or "units sold" in low or "units" in low or "count" in low:
+        return "quantity"
+    if "gross premium" in low or "premium" in low:
+        return "gross_premium"
+    return "gross_premium"
+
+
+def _resolve_forecast_metric(payload: ChatbotPayload, dataset_type: str) -> str:
+    message = payload.message or ""
+    if _forecast_metric_hint_present(message, dataset_type):
+        return _forecast_metric_from_text(message, dataset_type)
+
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() != "user":
+            continue
+        if not _is_forecast_query(turn.content):
+            continue
+        if _forecast_metric_hint_present(turn.content, dataset_type):
+            return _forecast_metric_from_text(turn.content, dataset_type)
+
+    return _forecast_metric_from_text(message, dataset_type)
+
+
+def _parse_month_start(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return date(value.year, value.month, 1)
+    if isinstance(value, datetime):
+        return date(value.year, value.month, 1)
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    short_match = re.match(r"^([A-Za-z]{3,9})[-/\s](\d{2}|\d{4})$", raw)
+    if short_match:
+        month_key = short_match.group(1)[:3].lower()
+        month = _FORECAST_MONTH_MAP.get(month_key)
+        if month:
+            year_raw = int(short_match.group(2))
+            year = year_raw + 2000 if len(short_match.group(2)) == 2 else year_raw
+            if 1900 <= year <= 2200:
+                return date(year, month, 1)
+
+    year_month_match = re.match(r"^(\d{4})[-/](\d{1,2})$", raw)
+    if year_month_match:
+        year = int(year_month_match.group(1))
+        month = int(year_month_match.group(2))
+        if 1 <= month <= 12:
+            return date(year, month, 1)
+
+    iso_candidate = raw[:10]
+    try:
+        parsed = date.fromisoformat(iso_candidate)
+        return date(parsed.year, parsed.month, 1)
+    except ValueError:
+        pass
+
+    for fmt in ("%b-%y", "%b %y", "%b-%Y", "%b %Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            parsed_dt = datetime.strptime(raw, fmt)
+            return date(parsed_dt.year, parsed_dt.month, 1)
+        except ValueError:
+            continue
+    return None
+
+
+def _next_month_start(month_start: date) -> date:
+    if month_start.month == 12:
+        return date(month_start.year + 1, 1, 1)
+    return date(month_start.year, month_start.month + 1, 1)
+
+
+def _extract_monthly_totals(rows: list[dict[str, Any]], metric: str) -> list[tuple[date, float]]:
+    if not rows:
+        return []
+
+    dimension_key = _pick_present_key(
+        rows,
+        [
+            "month",
+            "date",
+            "fiscal_month",
+            "month_year",
+        ],
+    )
+    if dimension_key is None:
+        for key in rows[0].keys():
+            safe_key = _to_safe_key(str(key))
+            if "month" in safe_key or "date" in safe_key:
+                dimension_key = str(key)
+                break
+    if dimension_key is None:
+        return []
+
+    metric_key = _pick_present_key(rows, [metric])
+    monthly: dict[date, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        month_start = _parse_month_start(row.get(dimension_key))
+        if month_start is None:
+            continue
+
+        value = _to_number(row.get(metric_key)) if metric_key else None
+        if value is None:
+            fallback_total = 0.0
+            found_numeric = False
+            for key, raw in row.items():
+                if str(key) == dimension_key:
+                    continue
+                safe_key = _to_safe_key(str(key))
+                if safe_key.startswith("tooltip_"):
+                    continue
+                numeric = _to_number(raw)
+                if numeric is None:
+                    continue
+                fallback_total += float(numeric)
+                found_numeric = True
+            if not found_numeric:
+                continue
+            value = fallback_total
+
+        monthly[month_start] = monthly.get(month_start, 0.0) + float(value)
+
+    return sorted(monthly.items(), key=lambda item: item[0])
+
+
+def _predict_next_month_value(series: list[tuple[date, float]]) -> dict[str, float] | None:
+    if len(series) < 2:
+        return None
+
+    values = [float(point[1]) for point in series]
+    deltas = [values[idx] - values[idx - 1] for idx in range(1, len(values))]
+    if not deltas:
+        return None
+
+    recent_delta_count = min(6, len(deltas))
+    recent_deltas = deltas[-recent_delta_count:]
+    delta_weights = list(range(1, recent_delta_count + 1))
+    delta_weight_total = float(sum(delta_weights))
+    weighted_delta = sum(delta * weight for delta, weight in zip(recent_deltas, delta_weights)) / delta_weight_total
+
+    growth_rates: list[float] = []
+    for idx in range(1, len(values)):
+        prev = values[idx - 1]
+        curr = values[idx]
+        if abs(prev) < 1e-9:
+            continue
+        growth_rates.append((curr - prev) / prev)
+
+    if growth_rates:
+        recent_growth_count = min(6, len(growth_rates))
+        recent_growth = growth_rates[-recent_growth_count:]
+        growth_weights = list(range(1, recent_growth_count + 1))
+        growth_weight_total = float(sum(growth_weights))
+        weighted_growth = sum(
+            growth * weight for growth, weight in zip(recent_growth, growth_weights)
+        ) / growth_weight_total
+        projected = values[-1] * (1.0 + weighted_growth)
+        trend_window = recent_growth_count
+    else:
+        projected = values[-1] + weighted_delta
+        weighted_growth = weighted_delta / values[-1] if abs(values[-1]) > 1e-9 else 0.0
+        trend_window = recent_delta_count
+
+    if all(value >= 0 for value in values) and projected < 0:
+        projected = 0.0
+
+    return {
+        "projected": float(projected),
+        "weighted_growth": float(weighted_growth),
+        "trend_window": float(trend_window),
+    }
+
+
+def _build_time_series_forecast_answer(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_forecast_followup_query(payload):
+        return None
+
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+    job_id = context_payload.get("job_id")
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
+    metric = _resolve_forecast_metric(payload, dataset_type)
+    global_scope = bool(context_payload.get("global_scope"))
+
+    series: list[tuple[date, float]] = []
+    scope_label = "selected dashboard scope"
+
+    if global_scope:
+        scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+        relevant_sources = [
+            str(scope.get("source", ""))
+            for scope in scopes
+            if str(scope.get("dataset_type", "")).strip().lower() == dataset_type
+        ]
+        aggregated: dict[date, float] = {}
+        for source in relevant_sources:
+            rows = _chatbot_graph_rows(
+                db=db,
+                source=source,
+                dataset_type=dataset_type,
+                job_id=job_id,
+                dimension="month",
+                metric=metric,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            for month_start, value in _extract_monthly_totals(rows, metric):
+                aggregated[month_start] = aggregated.get(month_start, 0.0) + float(value)
+        series = sorted(aggregated.items(), key=lambda item: item[0])
+        scope_label = f"all sources ({dataset_type})"
+    else:
+        source = str(context_payload.get("source") or _resolve_chatbot_source(payload) or "").strip()
+        if not source:
+            return None
+        rows = _chatbot_graph_rows(
+            db=db,
+            source=source,
+            dataset_type=dataset_type,
+            job_id=job_id,
+            dimension="month",
+            metric=metric,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        series = _extract_monthly_totals(rows, metric)
+        scope_label = f"{context_payload.get('source_label') or _source_display_name(source)} {dataset_type}"
+
+    if len(series) < 2:
+        return "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast."
+
+    forecast = _predict_next_month_value(series)
+    if forecast is None:
+        return "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast."
+
+    last_month, last_value = series[-1]
+    next_month = _next_month_start(last_month)
+    next_label = next_month.strftime("%b %y")
+    last_label = last_month.strftime("%b %y")
+    history_window = min(6, len(series))
+    history_start = series[-history_window][0].strftime("%b %y")
+    growth_pct = float(forecast["weighted_growth"]) * 100.0
+    trend_word = "increase" if growth_pct >= 0 else "decline"
+
+    range_suffix = ""
+    if from_date or to_date:
+        range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
+
+    return (
+        f"Directional forecast for {scope_label}{range_suffix}: "
+        f"{_pretty_label(metric)} is most likely around {_format_metric_value(metric, float(forecast['projected']))} in {next_label}, "
+        f"based on month-on-month trend from {history_start} to {last_label}. "
+        f"Latest observed value is {_format_metric_value(metric, last_value)} and recent momentum implies a {trend_word} of {abs(growth_pct):.1f}% MoM."
+    )
 
 
 def _pretty_label(key: str) -> str:
@@ -2052,7 +3505,7 @@ def _is_timeout_exception(exc: Exception) -> bool:
 
 def _build_chatbot_prompt(payload: ChatbotPayload, dashboard_context: str) -> str:
     lines: list[str] = [
-        "Dashboard context (authoritative; use only this data):",
+        "Analytics context (authoritative; includes dashboard + dataset-derived signals):",
         dashboard_context.strip(),
         "",
         "Conversation:",
@@ -2074,6 +3527,7 @@ def _build_chatbot_prompt(payload: ChatbotPayload, dashboard_context: str) -> st
     lines.append("2) Use concrete metrics, dates, and comparisons from context when available.")
     lines.append("3) Keep the answer structured, professional, and decision-oriented.")
     lines.append("4) If recommending actions, provide up to 3 prioritized next steps.")
+    lines.append("5) Avoid repeating the same phrasing from prior assistant turns; vary sentence openings and structure.")
     lines.append(f"User: {message}")
     lines.append("Assistant:")
     return "\n".join(lines)
@@ -2432,6 +3886,36 @@ def chatbot_message(
         }
 
     dashboard_context, context_payload = _build_chatbot_dashboard_context(db=db, payload=payload)
+    claims_average_answer = _build_claim_average_answer(
+        db=db,
+        payload=payload,
+        context_payload=context_payload,
+    )
+    if claims_average_answer:
+        return {
+            "response": claims_average_answer,
+            "model": "rule-based-claims-avg",
+        }
+    pricing_answer = _build_pricing_recommendation_answer(
+        db=db,
+        payload=payload,
+        context_payload=context_payload,
+    )
+    if pricing_answer:
+        return {
+            "response": pricing_answer,
+            "model": "rule-based-pricing",
+        }
+    forecast_answer = _build_time_series_forecast_answer(
+        db=db,
+        payload=payload,
+        context_payload=context_payload,
+    )
+    if forecast_answer:
+        return {
+            "response": forecast_answer,
+            "model": "rule-based-forecast",
+        }
     rule_based_answer = _build_underperformance_answer(payload.message, context_payload)
     if rule_based_answer:
         return {
@@ -2454,13 +3938,17 @@ def chatbot_message(
     system_prompt = (
         f"{base_system_prompt}\n\n"
         "Hard constraints:\n"
-        "1) Use only the Dashboard context block and conversation turns.\n"
-        "2) Never mention entities or numbers absent from Dashboard context.\n"
-        "3) If context is missing for a data question, reply exactly: I can’t confirm that from the current dashboard data.\n"
+        "1) Use the Analytics context block and conversation turns as primary evidence.\n"
+        "2) Never invent entities or numbers that are not supported by available context.\n"
+        "3) If key context is missing, state the gap and provide the closest defensible answer with explicit assumptions.\n"
         "4) Give a direct answer first, then supporting evidence and implications.\n"
         "5) Prefer precise metrics and avoid generic statements.\n"
         "6) Do not re-introduce AI Sahyogi unless the user explicitly asks.\n"
         "7) End with a complete final sentence and close any opened bracket.\n"
+        "8) For forecasting questions, estimate next-month values only from monthly history in context and mark it as directional.\n"
+        "9) Avoid repetitive templates across turns; vary phrasing while keeping the answer concise and factual.\n"
+        "10) If Samsung model codes appear (A06/F15/A16/A17/F17/A26/A35/A36/F55/A56/S24/S25/Fold6/Fold7/Flip7), use the mapping provided in context to infer device category.\n"
+        "11) Use Samsung plan abbreviations consistently: ADLD=Accidental Damage and Liquid Damage, EW=Extended Warranty, SP/SPP=Screen Protection Plan, CPP=Comprehensive Protection Plan, Combo=ADLD + EW.\n"
     )
     model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
     temperature = payload.temperature if payload.temperature is not None else _env_float("CHATBOT_TEMPERATURE", 0.15)
@@ -2638,4 +4126,3 @@ async def events():
 
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-

@@ -13,7 +13,6 @@ import {
 } from "recharts"
 
 import GraphView, { prefetchGraphData } from "@/components/GraphView"
-import RightSideChatbot from "@/components/RightSideChatbot"
 import DateRangePicker from "@/components/DateRangePicker"
 import type { GraphChartType, GraphDataSnapshot } from "@/components/GraphView"
 import {
@@ -54,6 +53,7 @@ type FullscreenGraph = {
   dimension: string
   bucket?: "day" | "week" | "month"
   chartType?: GraphChartType
+  tooltipMetricOverride?: string
 } | null
 
 type NavigableGraph = {
@@ -63,6 +63,7 @@ type NavigableGraph = {
   dimension: string
   bucket?: "day" | "week" | "month"
   chartType?: GraphChartType
+  tooltipMetricOverride?: string
 }
 
 type GraphQueueItem = {
@@ -77,10 +78,18 @@ type SamsungOverviewCard = {
   title: string
   subtitle: string
   dimension: string
-  metric: "quantity"
+  metric:
+    | "gross_premium"
+    | "earned_premium"
+    | "zopper_earned_premium"
+    | "quantity"
+    | "claims"
+    | "net_claims"
+    | "loss_ratio"
   bucket?: "day" | "week" | "month"
   chartType: GraphChartType
   size: "main" | "small"
+  tooltipMetricOverride?: string
 }
 
 type CityBreakdownSlice = {
@@ -442,37 +451,74 @@ export default function MultiGraphView({
   const isSamsungOverview = source === "samsung"
   const isGodrejClaims = isGodrej && datasetType === "claims"
   const samsungOverviewCards = useMemo<SamsungOverviewCard[]>(
-    () => [
-      {
-        id: "samsung-month-quantity",
-        title: "Quantity Trend by Month",
-        subtitle: "Month-on-month quantity line range comparison between Vijay Sales and Croma.",
-        dimension: "month",
-        metric: "quantity",
-        bucket: "month",
-        chartType: "line",
-        size: "main",
-      },
-      {
-        id: "samsung-plan-pie",
-        title: "Plan Category Distribution",
-        subtitle: "Quantity split by plan category in pie format.",
-        dimension: "plan_category",
-        metric: "quantity",
-        chartType: "pie",
-        size: "small",
-      },
-      {
-        id: "samsung-device-radar",
-        title: "Device Plan Category Radar",
-        subtitle: "Spider-web comparison of quantity across device plan categories.",
-        dimension: "device_plan_category",
-        metric: "quantity",
-        chartType: "radar",
-        size: "small",
-      },
-    ],
-    []
+    () => {
+      if (datasetType === "claims") {
+        return [
+          {
+            id: "samsung-month-claims-cost",
+            title: "Claims Cost Trend by Month",
+            subtitle: "Month-on-month claims cost line range comparison between Vijay Sales and Croma.",
+            dimension: "month",
+            metric: "claims",
+            bucket: "month",
+            chartType: "line",
+            size: "main",
+            tooltipMetricOverride: "quantity",
+          },
+          {
+            id: "samsung-plan-claims-pie",
+            title: "Plan Category Claims Distribution",
+            subtitle: "Claims cost split by plan category in pie format.",
+            dimension: "plan_category",
+            metric: "claims",
+            chartType: "pie",
+            size: "small",
+          },
+          {
+            id: "samsung-device-claims-radar",
+            title: "Device Plan Category Claims Radar",
+            subtitle: "Spider-web comparison of claims cost across device plan categories.",
+            dimension: "device_plan_category",
+            metric: "claims",
+            chartType: "radar",
+            size: "small",
+          },
+        ]
+      }
+
+      return [
+        {
+          id: "samsung-month-gross-premium",
+          title: "Gross Premium Trend by Month",
+          subtitle: "Month-on-month gross premium line range comparison between Vijay Sales and Croma.",
+          dimension: "month",
+          metric: "gross_premium",
+          bucket: "month",
+          chartType: "line",
+          size: "main",
+          tooltipMetricOverride: "quantity",
+        },
+        {
+          id: "samsung-plan-pie",
+          title: "Plan Category Distribution",
+          subtitle: "Quantity split by plan category in pie format.",
+          dimension: "plan_category",
+          metric: "quantity",
+          chartType: "pie",
+          size: "small",
+        },
+        {
+          id: "samsung-device-radar",
+          title: "Device Plan Category Radar",
+          subtitle: "Spider-web comparison of quantity across device plan categories.",
+          dimension: "device_plan_category",
+          metric: "quantity",
+          chartType: "radar",
+          size: "small",
+        },
+      ]
+    },
+    [datasetType]
   )
   const activeGroupOrder = useMemo(
     () => (
@@ -634,11 +680,12 @@ export default function MultiGraphView({
     if (isSamsungOverview) {
       return samsungOverviewCards.map((card) => ({
         group: "samsung_overview",
-        sectionTitle: "Samsung Quantity Focus",
+        sectionTitle: datasetType === "claims" ? "Samsung Claims Focus" : "Samsung Gross Premium Focus",
         metric: card.metric,
         dimension: card.dimension,
         bucket: card.bucket,
         chartType: card.chartType,
+        tooltipMetricOverride: card.tooltipMetricOverride,
       }))
     }
     const out: NavigableGraph[] = []
@@ -658,7 +705,7 @@ export default function MultiGraphView({
       })
     })
     return out
-  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs, getSectionTitle])
+  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs, getSectionTitle, datasetType])
 
   const fullscreenGraphIndex = useMemo(() => {
     if (!fullscreen) return -1
@@ -1115,6 +1162,7 @@ export default function MultiGraphView({
       dimension: target.dimension,
       bucket: target.bucket,
       chartType: target.chartType,
+      tooltipMetricOverride: target.tooltipMetricOverride,
     })
   }
 
@@ -1157,6 +1205,7 @@ export default function MultiGraphView({
                   dimension: card.dimension,
                   bucket: card.bucket,
                   chartType: card.chartType,
+                  tooltipMetricOverride: card.tooltipMetricOverride,
                 })
               }}
             >
@@ -1176,6 +1225,7 @@ export default function MultiGraphView({
             fetchDelayMs={fetchDelayMs}
             deferUntilVisible={queueIndex >= FAST_LOAD_COUNT}
             chartType={card.chartType}
+            tooltipMetricOverride={card.tooltipMetricOverride}
             heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
           />
         </div>
@@ -1474,6 +1524,7 @@ export default function MultiGraphView({
                     fromDate={fromDate}
                     toDate={toDate}
                     chartType={fullscreen.chartType}
+                    tooltipMetricOverride={fullscreen.tooltipMetricOverride}
                     heightClassName={isSamsungOverview ? "h-[56vh]" : undefined}
                     onDataReady={setOpenedGraphData}
                   />
@@ -1876,7 +1927,6 @@ export default function MultiGraphView({
                 </div>
               </div>
             </div>
-            <RightSideChatbot variant="floating" />
           </motion.div>
         )}
       </AnimatePresence>

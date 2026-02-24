@@ -22,26 +22,15 @@ type Props = {
   variant?: "floating" | "card"
 }
 
+type AssistantBlock =
+  | { kind: "paragraph"; text: string }
+  | { kind: "ordered"; items: string[] }
+  | { kind: "unordered"; items: string[] }
+
 const INITIAL_ASSISTANT_MESSAGE: ChatMessage = {
   role: "assistant",
   content: "AI Sahyogi is ready. Ask about trends, anomalies, or actions from your dashboard data.",
 }
-
-const normalizeSource = (value: string) => {
-  const key = (value || "").trim().toLowerCase()
-  if (!key) return ""
-  if (key === "reliance resq" || key === "reliance-resq" || key === "reliance_resq" || key === "resq") {
-    return "reliance"
-  }
-  if (key === "goodrej" || key === "goddrej") return "godrej"
-  if (key === "samsung_vijay_sales" || key === "samsung vijay sales" || key === "samsung vs" || key === "vijay sales") {
-    return "samsung_vs"
-  }
-  if (key === "samsung croma" || key === "croma") return "samsung_croma"
-  return key
-}
-
-const normalizeDatasetType = (value: string) => ((value || "").trim().toLowerCase() === "claims" ? "claims" : "sales")
 
 const normalizeDate = (value: string) => {
   const cleaned = (value || "").trim()
@@ -55,6 +44,101 @@ const normalizeJobId = (value: string) => {
     return ""
   }
   return cleaned
+}
+
+const splitToSentences = (text: string) =>
+  text
+    .replace(/([.!?])\s+(?=[A-Z0-9])/g, "$1\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+const formatAssistantText = (content: string) => {
+  if (!content) return ""
+  let text = content.replace(/\r/g, "\n").replace(/\t/g, " ").trim()
+  text = text.replace(/[ \u00A0]{2,}/g, " ")
+  text = text.replace(/([A-Za-z])\s*:\s*(?=\d+[.)]\s)/g, "$1:\n")
+  text = text.replace(/([.?!])\s+(?=\d+[.)]\s)/g, "$1\n")
+  text = text.replace(/([.?!])\s+(?=[-•]\s)/g, "$1\n")
+  text = text.replace(/\n{3,}/g, "\n\n")
+  return text.trim()
+}
+
+const parseAssistantBlocks = (content: string): AssistantBlock[] => {
+  const normalized = formatAssistantText(content)
+  if (!normalized) return []
+
+  const lines = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const blocks: AssistantBlock[] = []
+  let idx = 0
+
+  while (idx < lines.length) {
+    const ordered = lines[idx]?.match(/^\d+[.)]\s+(.*)$/)
+    if (ordered) {
+      const items: string[] = []
+      while (idx < lines.length) {
+        const match = lines[idx]?.match(/^\d+[.)]\s+(.*)$/)
+        if (!match) break
+        items.push(match[1].trim())
+        idx += 1
+      }
+      if (items.length) {
+        blocks.push({ kind: "ordered", items })
+      }
+      continue
+    }
+
+    const bullet = lines[idx]?.match(/^[-•]\s+(.*)$/)
+    if (bullet) {
+      const items: string[] = []
+      while (idx < lines.length) {
+        const match = lines[idx]?.match(/^[-•]\s+(.*)$/)
+        if (!match) break
+        items.push(match[1].trim())
+        idx += 1
+      }
+      if (items.length) {
+        blocks.push({ kind: "unordered", items })
+      }
+      continue
+    }
+
+    const line = lines[idx]
+    if (line.length > 260) {
+      const sentences = splitToSentences(line)
+      if (sentences.length >= 3) {
+        blocks.push({ kind: "unordered", items: sentences })
+      } else {
+        blocks.push({ kind: "paragraph", text: line })
+      }
+    } else {
+      blocks.push({ kind: "paragraph", text: line })
+    }
+    idx += 1
+  }
+
+  if (!blocks.length) {
+    return [{ kind: "paragraph", text: normalized }]
+  }
+  return blocks
+}
+
+const renderInlineRichText = (text: string) => {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean)
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={`${part}-${index}`} className="font-semibold text-slate-900">
+          {part.slice(2, -2)}
+        </strong>
+      )
+    }
+    return <span key={`${part}-${index}`}>{part}</span>
+  })
 }
 
 export default function RightSideChatbot({ variant = "floating" }: Props) {
@@ -137,12 +221,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
       const compactText = text.replace(/\s+/g, " ").trim()
       const maxTokens = Math.max(900, Math.min(4096, Math.ceil(compactText.length * 4.5)))
 
-      const source = normalizeSource(
-        typeof window !== "undefined" ? localStorage.getItem("dashboard_brand") || "" : ""
-      )
-      const datasetType = normalizeDatasetType(
-        typeof window !== "undefined" ? localStorage.getItem("dashboard_mode") || "sales" : "sales"
-      )
       const useJobFilter =
         typeof window !== "undefined" && localStorage.getItem("use_job_filter") === "1"
       const jobId = normalizeJobId(
@@ -160,8 +238,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
         history,
         temperature: 0.14,
         max_tokens: maxTokens,
-        source: source || undefined,
-        dataset_type: datasetType,
         job_id: jobId || undefined,
         from_date: fromDate || undefined,
         to_date: toDate || undefined,
@@ -198,26 +274,35 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
           : panelListRef
 
     const containerClass = isFullMode
-      ? "flex h-[min(92dvh,760px)] w-[min(98vw,960px)] flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl sm:rounded-3xl"
+      ? "flex h-[min(92dvh,760px)] w-[min(98vw,960px)] flex-col overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-[0_24px_80px_-28px_rgba(15,23,42,0.45)] sm:rounded-3xl"
       : mode === "card"
-        ? "flex h-[360px] w-full flex-col rounded-2xl border border-slate-200 bg-white shadow-sm sm:h-[420px]"
-        : "pointer-events-auto flex h-[min(74dvh,680px)] w-[min(95vw,380px)] flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl sm:mr-3"
+        ? "flex h-[380px] w-full flex-col overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-[0_16px_50px_-30px_rgba(15,23,42,0.4)] sm:h-[440px]"
+        : "pointer-events-auto flex h-[min(76dvh,700px)] w-[min(95vw,420px)] flex-col overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-2xl sm:mr-3"
 
     return (
       <aside className={containerClass}>
-        <header className={`flex items-center justify-between border-b border-slate-200 ${isFullMode ? "px-4 py-3 sm:px-5 sm:py-4" : "px-3 py-2.5 sm:px-4 sm:py-3"}`}>
-          <div className="flex items-center gap-2">
-            <Bot size={16} className="text-indigo-600" />
-            <h3 className="text-sm font-bold text-slate-800">AI Sahyogi</h3>
+        <header className={`flex items-center justify-between border-b border-slate-200/80 bg-gradient-to-r from-white via-slate-50 to-indigo-50/40 ${isFullMode ? "px-4 py-3 sm:px-5 sm:py-4" : "px-3 py-2.5 sm:px-4 sm:py-3"}`}>
+          <div className="flex items-center gap-2.5">
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-indigo-100 bg-indigo-50 text-indigo-600">
+              <Bot size={15} />
+            </span>
+            <div className="leading-tight">
+              <h3 className="text-sm font-bold text-slate-800">AI Sahyogi</h3>
+              <p className="text-[11px] font-medium text-slate-500">Dashboard Assistant</p>
+            </div>
           </div>
 
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1.5">
+            <span className="hidden items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 sm:inline-flex">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+              Live
+            </span>
             {!isFullMode && (
               <button
                 type="button"
                 onClick={openFullChat}
                 className={mode === "card"
-                  ? "inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                  ? "inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
                   : "rounded-full p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-700"
                 }
                 aria-label="Open full chat"
@@ -254,28 +339,92 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
           </div>
         </header>
 
-        <div ref={listRef} className={`flex-1 space-y-3 overflow-y-auto ${isFullMode ? "px-4 py-3 sm:px-5 sm:py-4" : "px-3 py-3"}`}>
-          {messages.map((message, idx) => (
-            <div
-              key={`${message.role}-${idx}-${message.content.slice(0, 24)}`}
-              className={`max-w-[90%] rounded-2xl px-3 py-2 text-sm leading-relaxed ${
-                message.role === "user"
-                  ? "ml-auto bg-slate-900 text-white"
-                  : "bg-slate-100 text-slate-800"
-              }`}
-            >
-              {message.content}
-            </div>
-          ))}
+        <div
+          ref={listRef}
+          className={`flex-1 space-y-4 overflow-y-auto bg-gradient-to-b from-slate-50/85 via-white to-slate-50/65 ${isFullMode ? "px-4 py-4 sm:px-5 sm:py-5" : "px-3 py-3.5"}`}
+        >
+          {messages.map((message, idx) => {
+            const isUser = message.role === "user"
+            const assistantBlocks = !isUser ? parseAssistantBlocks(message.content) : []
+            return (
+              <div
+                key={`${message.role}-${idx}-${message.content.slice(0, 24)}`}
+                className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}
+              >
+                <div className={`flex max-w-[96%] items-end gap-2 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
+                  <span
+                    className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${
+                      isUser
+                        ? "bg-slate-900 text-white"
+                        : "border border-indigo-100 bg-indigo-50 text-indigo-600"
+                    }`}
+                  >
+                    {isUser ? "You" : <Bot size={14} />}
+                  </span>
+
+                  <div
+                    className={`rounded-2xl border px-3.5 py-2.5 text-sm leading-relaxed ${
+                      isUser
+                        ? "rounded-br-md border-slate-900 bg-slate-900 text-white shadow-[0_14px_30px_-18px_rgba(15,23,42,0.65)]"
+                        : "rounded-bl-md border-slate-200 bg-white text-slate-800 shadow-[0_12px_24px_-18px_rgba(15,23,42,0.35)]"
+                    }`}
+                  >
+                    {isUser ? (
+                      <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                    ) : (
+                      <div className="space-y-2.5 text-[13px] text-slate-700">
+                        {assistantBlocks.map((block, blockIdx) => {
+                          if (block.kind === "paragraph") {
+                            return (
+                              <p key={`p-${blockIdx}`} className="whitespace-pre-wrap break-words leading-6">
+                                {renderInlineRichText(block.text)}
+                              </p>
+                            )
+                          }
+                          if (block.kind === "ordered") {
+                            return (
+                              <ol key={`o-${blockIdx}`} className="ml-4 list-decimal space-y-1.5 pr-1 leading-6 marker:font-semibold marker:text-slate-500">
+                                {block.items.map((item, itemIdx) => (
+                                  <li key={`oi-${itemIdx}`} className="break-words">
+                                    {renderInlineRichText(item)}
+                                  </li>
+                                ))}
+                              </ol>
+                            )
+                          }
+                          return (
+                            <ul key={`u-${blockIdx}`} className="ml-4 list-disc space-y-1.5 pr-1 leading-6 marker:text-slate-500">
+                              {block.items.map((item, itemIdx) => (
+                                <li key={`ui-${itemIdx}`} className="break-words">
+                                  {renderInlineRichText(item)}
+                                </li>
+                              ))}
+                            </ul>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )
+          })}
           {isSending && (
-            <div className="inline-flex items-center gap-2 rounded-2xl bg-slate-100 px-3 py-2 text-sm text-slate-700">
-              <Loader2 size={14} className="animate-spin" />
-              Thinking...
+            <div className="flex w-full justify-start">
+              <div className="flex items-end gap-2">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-indigo-100 bg-indigo-50 text-indigo-600">
+                  <Bot size={14} />
+                </span>
+                <div className="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm">
+                  <Loader2 size={14} className="animate-spin" />
+                  Thinking...
+                </div>
+              </div>
             </div>
           )}
         </div>
 
-        <div className={`border-t border-slate-200 ${isFullMode ? "p-3 sm:p-4" : "p-3"}`}>
+        <div className={`border-t border-slate-200/80 bg-white/95 ${isFullMode ? "p-3 sm:p-4" : "p-3"}`}>
           <div className="flex items-end gap-2">
             <textarea
               value={input}
@@ -283,7 +432,7 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
               onKeyDown={onInputKeyDown}
               rows={isFullMode ? 3 : 2}
               placeholder="Ask about dashboard insights..."
-              className="min-h-[44px] flex-1 resize-none rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-800 outline-none ring-indigo-500 transition focus:ring-2"
+              className="min-h-[44px] flex-1 resize-none rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none ring-indigo-500 transition focus:border-indigo-300 focus:ring-2"
             />
             <button
               type="button"
@@ -295,6 +444,9 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
               <Send size={15} />
             </button>
           </div>
+          <p className="mt-2 text-[11px] font-medium text-slate-400">
+            Press Enter to send, Shift+Enter for a new line.
+          </p>
         </div>
       </aside>
     )
@@ -331,8 +483,10 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
             aria-label="Open chatbot"
           >
             <span className="flex items-center gap-2">
-              <MessageCircle size={18} className="text-indigo-600" />
-              <span className="text-xs font-bold text-slate-700">AI Chat</span>
+              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-indigo-50 text-indigo-600">
+                <MessageCircle size={16} />
+              </span>
+              <span className="text-xs font-bold text-slate-700">AI Sahyogi</span>
             </span>
           </button>
         ) : (

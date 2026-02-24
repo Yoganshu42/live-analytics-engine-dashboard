@@ -18,6 +18,7 @@ type Props = {
   fromDate?: string
   toDate?: string
   refreshTick?: number
+  layout?: "auto" | "vertical"
 }
 
 type Summary = {
@@ -66,6 +67,7 @@ export default function KpiCardsRow({
   fromDate,
   toDate,
   refreshTick,
+  layout = "auto",
 }: Props) {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [lastUpdated, setLastUpdated] = useState<string | null>(null)
@@ -218,8 +220,13 @@ export default function KpiCardsRow({
     ]
   }, [datasetType, summary, lastUpdated])
 
+  const gridClassName =
+    layout === "vertical"
+      ? "grid grid-cols-1 gap-2.5 sm:gap-3"
+      : "grid grid-cols-1 gap-2.5 min-[420px]:grid-cols-2 sm:gap-3 xl:grid-cols-4"
+
   return (
-    <div className="grid grid-cols-1 gap-2.5 min-[420px]:grid-cols-2 sm:gap-3 xl:grid-cols-4">
+    <div className={gridClassName}>
       {cards.map((card) => {
         const Icon = card.icon
         const value = loading ? "--" : error ? "N/A" : card.value

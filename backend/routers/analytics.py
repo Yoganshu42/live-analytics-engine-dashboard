@@ -589,6 +589,61 @@ def _rows_have_non_zero_metric(
     return False
 
 
+def _is_samsung_claims_loss_ratio_cache_suspicious(
+    rows: list[dict[str, Any]] | None,
+    *,
+    dimension: str,
+    metric: str,
+    overview_mode: bool,
+) -> bool:
+    if not rows:
+        return False
+
+    metric_key = _to_safe_key(metric or "")
+    dimension_key = _to_safe_key(dimension or "")
+    seen_dimension_values: set[str] = set()
+    has_duplicate_dimension = False
+    max_abs_value = 0.0
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+        dim_col = safe_map.get(dimension_key) or safe_map.get(_to_safe_key(dimension or ""))
+        if dim_col is None:
+            if dimension_key == "plan_category":
+                dim_col = safe_map.get("device_plan_category")
+            elif dimension_key == "device_plan_category":
+                dim_col = safe_map.get("plan_category")
+
+        dim_val = row.get(dim_col) if dim_col is not None else row.get(dimension)
+        if dim_val is not None:
+            dim_label = str(dim_val).strip().lower()
+            if dim_label:
+                if dim_label in seen_dimension_values:
+                    has_duplicate_dimension = True
+                seen_dimension_values.add(dim_label)
+
+        value_candidates: list[Any] = []
+        if overview_mode:
+            value_candidates.extend([row.get("samsung_vs"), row.get("samsung_croma")])
+        else:
+            metric_col = safe_map.get(metric_key) or safe_map.get(_to_safe_key(metric or ""))
+            value_candidates.append(row.get(metric_col) if metric_col is not None else row.get(metric))
+
+        for raw in value_candidates:
+            try:
+                value = float(raw or 0)
+            except Exception:
+                continue
+            if pd.notna(value):
+                max_abs_value = max(max_abs_value, abs(value))
+
+    # Loss ratio above this threshold in samsung claims cache has been observed as stale/corrupt.
+    return has_duplicate_dimension or max_abs_value > 500.0
+
+
 def _load_godrej_claims_dataframe(
     *,
     db: Session,
@@ -768,8 +823,19 @@ def compute_by_dimension_rows(
                 # Fall back to live engine compute so one missing partner cache
                 # does not zero out compare rows for broad date ranges.
                 if partner_cached is not None and len(partner_cached) > 0:
-                    _merge(partner_cached, out_key)
-                    return
+                    suspicious_loss_ratio_cache = (
+                        dataset_type == "claims"
+                        and _to_safe_key(metric or "") == "loss_ratio"
+                        and _is_samsung_claims_loss_ratio_cache_suspicious(
+                            partner_cached,
+                            dimension=dimension,
+                            metric=metric,
+                            overview_mode=False,
+                        )
+                    )
+                    if not suspicious_loss_ratio_cache:
+                        _merge(partner_cached, out_key)
+                        return
                 try:
                     engine = engine_cls(
                         db=db,
@@ -886,6 +952,7 @@ def analytics_by_dimension(
         is_stale_cached_shape = False
         is_stale_zero_metric = False
         is_stale_samsung_partner_mismatch = False
+        is_stale_samsung_loss_ratio_cache = False
         is_stale_godrej_legacy_region = False
         is_stale_godrej_claims_range_mismatch = False
         is_stale_godrej_sales_month_mismatch = False
@@ -903,6 +970,18 @@ def analytics_by_dimension(
                 is_stale_cached_shape = True
             if metric_key and metric_key not in row_keys and not is_samsung_overview_shape:
                 is_stale_cached_shape = True
+
+        if (
+            resolved_source.startswith("samsung")
+            and normalized_dataset == "claims"
+            and metric_key == "loss_ratio"
+        ):
+            is_stale_samsung_loss_ratio_cache = _is_samsung_claims_loss_ratio_cache_suspicious(
+                cached,
+                dimension=dimension,
+                metric=metric,
+                overview_mode=(resolved_source == "samsung"),
+            )
 
         if resolved_source == "samsung":
             merged_dim_values: set[str] = set()
@@ -981,6 +1060,18 @@ def analytics_by_dimension(
                 is_stale_samsung_partner_mismatch = True
             if croma_has_non_zero and merged_partner_totals["samsung_croma"] <= 1e-12:
                 is_stale_samsung_partner_mismatch = True
+            if (
+                normalized_dataset == "claims"
+                and metric_key == "loss_ratio"
+                and not is_stale_samsung_loss_ratio_cache
+                and _is_samsung_claims_loss_ratio_cache_suspicious(
+                    cached,
+                    dimension=dimension,
+                    metric=metric,
+                    overview_mode=True,
+                )
+            ):
+                is_stale_samsung_loss_ratio_cache = True
 
         if (
             resolved_source == "godrej"
@@ -1105,6 +1196,7 @@ def analytics_by_dimension(
             is_stale_cached_shape
             or is_stale_zero_metric
             or is_stale_samsung_partner_mismatch
+            or is_stale_samsung_loss_ratio_cache
             or is_stale_godrej_legacy_region
             or is_stale_godrej_claims_range_mismatch
             or is_stale_godrej_sales_month_mismatch
@@ -1113,6 +1205,8 @@ def analytics_by_dimension(
                 reason = "shape"
             elif is_stale_zero_metric:
                 reason = "all_zero_metric"
+            elif is_stale_samsung_loss_ratio_cache:
+                reason = "samsung_loss_ratio_cache"
             elif is_stale_godrej_legacy_region:
                 reason = "godrej_legacy_region"
             elif is_stale_godrej_claims_range_mismatch:

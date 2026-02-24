@@ -11,6 +11,7 @@ import {
   Line,
   Pie,
   PieChart,
+  Legend,
   PolarAngleAxis,
   PolarGrid,
   PolarRadiusAxis,
@@ -38,6 +39,7 @@ type Props = {
   fetchDelayMs?: number
   deferUntilVisible?: boolean
   chartType?: GraphChartType
+  tooltipMetricOverride?: string
   heightClassName?: string
   onDataReady?: (snapshot: GraphDataSnapshot) => void
 }
@@ -501,6 +503,14 @@ const mixWithWhite = (hex: string, amount: number) => {
     .join("")}`
 }
 
+const mixWithBlack = (hex: string, amount: number) => {
+  const { r, g, b } = hexToRgb(hex)
+  const mix = (c: number) => Math.round(c * (1 - amount))
+  return `#${[mix(r), mix(g), mix(b)]
+    .map(v => v.toString(16).padStart(2, "0"))
+    .join("")}`
+}
+
 const formatAxisCompact = (value: number, measure: string) => {
   const m = measure.toLowerCase()
   if (m.includes("loss_ratio")) return `${value.toFixed(1)}%`
@@ -513,9 +523,10 @@ const formatAxisCompact = (value: number, measure: string) => {
 /* ---------- TOOLTIP ---------- */
 type TooltipEntry = {
   dataKey: string
-  color: string
+  color?: string
   name?: string
-  value: number
+  value?: number | string
+  payload?: Row
 }
 
 type CustomTooltipProps = {
@@ -523,11 +534,56 @@ type CustomTooltipProps = {
   payload?: TooltipEntry[]
   label?: string
   measure: string
+  compareTooltipQuantity?: boolean
 }
 
-const CustomTooltip = ({ active, payload, label, measure }: CustomTooltipProps) => {
+const CustomTooltip = ({
+  active,
+  payload,
+  label,
+  measure,
+  compareTooltipQuantity = false,
+}: CustomTooltipProps) => {
   if (!active || !payload?.length) return null
   const formattedLabel = formatMonth(label || "")
+  const tooltipRow = payload[0]?.payload
+  const showQuantityOnly =
+    compareTooltipQuantity &&
+    Boolean(tooltipRow) &&
+    ("tooltip_samsung_vs" in (tooltipRow || {}) || "tooltip_samsung_croma" in (tooltipRow || {}))
+
+  if (showQuantityOnly) {
+    const vsQuantity = asNumber(tooltipRow?.tooltip_samsung_vs)
+    const cromaQuantity = asNumber(tooltipRow?.tooltip_samsung_croma)
+    const vsMetric = asNumber(tooltipRow?.samsung_vs)
+    const cromaMetric = asNumber(tooltipRow?.samsung_croma)
+    return (
+      <div className="rounded-lg border bg-white p-3 shadow">
+        <p className="text-xs font-bold text-gray-400">{formattedLabel}</p>
+        <div className="mt-2">
+          <div className="grid grid-cols-[minmax(120px,1fr)_auto_auto] items-center gap-x-4 gap-y-1 text-[11px] font-semibold text-slate-500">
+            <span />
+            <span>Quantity</span>
+            <span>{prettyLabel(measure)}</span>
+          </div>
+          <div className="mt-1 grid grid-cols-[minmax(120px,1fr)_auto_auto] items-center gap-x-4 gap-y-2 text-sm font-semibold">
+            <span className="flex items-center gap-2 text-slate-700">
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[#f97316]" />
+              Vijay Sales
+            </span>
+            <span className="text-slate-900">{vsQuantity.toLocaleString()}</span>
+            <span className="text-slate-900">{formatValue(vsMetric, measure)}</span>
+            <span className="flex items-center gap-2 text-slate-700">
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[#8b5cf6]" />
+              Croma
+            </span>
+            <span className="text-slate-900">{cromaQuantity.toLocaleString()}</span>
+            <span className="text-slate-900">{formatValue(cromaMetric, measure)}</span>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="bg-white p-3 border shadow rounded-lg">
@@ -537,13 +593,13 @@ const CustomTooltip = ({ active, payload, label, measure }: CustomTooltipProps) 
           <div key={p.dataKey} className="flex items-center gap-2 text-sm font-semibold">
             <span
               className="inline-block h-2.5 w-2.5 rounded-full"
-              style={{ backgroundColor: p.color }}
+              style={{ backgroundColor: p.color || "#64748b" }}
             />
             <span className="text-slate-700">
               {p.name || p.dataKey}
             </span>
             <span className="ml-auto text-slate-900">
-              {formatValue(p.value, measure)}
+              {formatValue(asNumber(p.value), measure)}
             </span>
           </div>
         ))}
@@ -568,6 +624,7 @@ export default function GraphView({
   fetchDelayMs,
   deferUntilVisible = false,
   chartType = "bar",
+  tooltipMetricOverride,
   heightClassName = "h-72",
   onDataReady,
 }: Props) {
@@ -619,6 +676,7 @@ export default function GraphView({
       try {
         const dimKey = toSafeKey(dimension)
         const metricKey = toSafeKey(metric)
+        const tooltipMetricKey = toSafeKey(tooltipMetricOverride || "")
 
         if (source === "samsung") {
           setCompareMode(true)
@@ -639,6 +697,38 @@ export default function GraphView({
             samsung_vs: asNumber(row["samsung_vs"]),
             samsung_croma: asNumber(row["samsung_croma"]),
           }))
+
+          if (tooltipMetricOverride && tooltipMetricKey && tooltipMetricKey !== metricKey) {
+            const tooltipRows = await fetchRowsWithRangeFallback({
+              source: "samsung",
+              dimension,
+              metric: tooltipMetricOverride,
+              datasetType,
+              bucket,
+              jobId,
+              from_date: fromDate,
+              to_date: toDate,
+            })
+
+            const tooltipMap = new Map<string, { samsung_vs: number; samsung_croma: number }>()
+            for (const row of tooltipRows.data || []) {
+              const dimValue = String(row[dimKey] ?? "")
+              tooltipMap.set(dimValue, {
+                samsung_vs: asNumber(row.samsung_vs),
+                samsung_croma: asNumber(row.samsung_croma),
+              })
+            }
+
+            merged = merged.map((row) => {
+              const dimValue = String(row[dimKey] ?? "")
+              const tooltip = tooltipMap.get(dimValue)
+              return {
+                ...row,
+                tooltip_samsung_vs: tooltip?.samsung_vs ?? 0,
+                tooltip_samsung_croma: tooltip?.samsung_croma ?? 0,
+              }
+            })
+          }
 
           if (dimKey.includes("month") || dimKey.includes("date")) {
             merged = sortTemporalRows(merged, dimKey)
@@ -748,7 +838,7 @@ export default function GraphView({
     return () => {
       if (timer) clearTimeout(timer)
     }
-  }, [source, dimension, metric, datasetType, bucket, jobId, fromDate, toDate, fetchDelayMs, onDataReady, deferUntilVisible, isVisible])
+  }, [source, dimension, metric, datasetType, bucket, jobId, fromDate, toDate, fetchDelayMs, onDataReady, deferUntilVisible, isVisible, tooltipMetricOverride])
 
   if (deferUntilVisible && !isVisible) {
     return (
@@ -790,6 +880,8 @@ export default function GraphView({
 
   const isLossRatio = measure.includes("loss_ratio")
   const isTemporalDimension = dimKey.includes("month") || dimKey.includes("date")
+  const showCompareQuantityTooltip =
+    compareMode && toSafeKey(tooltipMetricOverride || "") === "quantity"
   const clampToZero = !isLossRatio || source === "reliance"
   const chartData: Row[] = clampToZero
     ? data.map((row) => {
@@ -816,6 +908,20 @@ export default function GraphView({
         : Math.max(0, asNumber(row[measure])),
     }))
     .filter((row) => row.value > 0)
+  const pieRows = pieData.length ? pieData : [{ name: "No Data", value: 1 }]
+  const pieGradientBase = (gradientId || "pie").replace(/[^a-zA-Z0-9_-]/g, "")
+  const pieSlices = pieRows.map((entry, idx) => {
+    const baseColor = pieData.length
+      ? pickColor(`${baseKey}-${entry.name}`, palette)
+      : "#dbeafe"
+    return {
+      ...entry,
+      baseColor,
+      gradientFrom: mixWithWhite(baseColor, 0.28),
+      gradientTo: mixWithBlack(baseColor, 0.16),
+      gradientId: `${pieGradientBase}-pie-${idx}`,
+    }
+  })
   const radarData = chartData.map((row) => ({
     name: String(row[dimKey] ?? "Unknown"),
     samsung_vs: Math.max(0, asNumber(row.samsung_vs)),
@@ -869,7 +975,14 @@ export default function GraphView({
               tick={{ fontSize: 11 }}
               tickFormatter={(v) => formatAxisCompact(asNumber(v), measure)}
             />
-            <Tooltip content={<CustomTooltip measure={measure} />} />
+            <Tooltip
+              content={
+                <CustomTooltip
+                  measure={measure}
+                  compareTooltipQuantity={showCompareQuantityTooltip}
+                />
+              }
+            />
             {compareMode ? (
               <>
                 <Area
@@ -923,7 +1036,22 @@ export default function GraphView({
             )}
           </AreaChart>
         ) : chartType === "pie" ? (
-          <PieChart margin={{ top: 6, right: 16, bottom: 6, left: 16 }}>
+          <PieChart margin={{ top: 6, right: 20, bottom: 34, left: 20 }}>
+            <defs>
+              {pieSlices.map((slice) => (
+                <linearGradient
+                  key={slice.gradientId}
+                  id={slice.gradientId}
+                  x1="0%"
+                  y1="0%"
+                  x2="100%"
+                  y2="100%"
+                >
+                  <stop offset="0%" stopColor={slice.gradientFrom} />
+                  <stop offset="100%" stopColor={slice.gradientTo} />
+                </linearGradient>
+              ))}
+            </defs>
             <Tooltip
               formatter={(value: unknown, name: unknown) => [
                 formatValue(asNumber(value), measure),
@@ -931,7 +1059,7 @@ export default function GraphView({
               ]}
             />
             <Pie
-              data={pieData.length ? pieData : [{ name: "No Data", value: 1 }]}
+              data={pieSlices}
               dataKey="value"
               nameKey="name"
               innerRadius={44}
@@ -941,13 +1069,20 @@ export default function GraphView({
               strokeWidth={1}
               isAnimationActive={shouldAnimateBars}
             >
-              {(pieData.length ? pieData : [{ name: "No Data", value: 1 }]).map((entry, idx) => (
+              {pieSlices.map((entry, idx) => (
                 <Cell
                   key={`${entry.name}-${idx}`}
-                  fill={pieData.length ? pickColor(`${baseKey}-${entry.name}`, palette) : "#dbeafe"}
+                  fill={`url(#${entry.gradientId})`}
                 />
               ))}
             </Pie>
+            <Legend
+              verticalAlign="bottom"
+              align="center"
+              iconType="circle"
+              wrapperStyle={{ fontSize: "11px", paddingTop: "8px", color: "#475569" }}
+              formatter={(value) => String(value)}
+            />
           </PieChart>
         ) : chartType === "radar" ? (
           <RadarChart
@@ -1021,7 +1156,14 @@ export default function GraphView({
               tick={{ fontSize: 11 }}
               tickFormatter={(v) => formatValue(asNumber(v), measure)}
             />
-            <Tooltip content={<CustomTooltip measure={measure} />} />
+            <Tooltip
+              content={
+                <CustomTooltip
+                  measure={measure}
+                  compareTooltipQuantity={showCompareQuantityTooltip}
+                />
+              }
+            />
             {compareMode ? (
               <>
                 <Bar

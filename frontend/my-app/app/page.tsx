@@ -138,6 +138,10 @@ export default function DashboardPage() {
     if (typeof window === "undefined") return false
     return localStorage.getItem("dashboard_fullscreen") === "1"
   })
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return localStorage.getItem("dashboard_sidebar_collapsed") === "1"
+  })
   const [isLoggingOut, setIsLoggingOut] = useState(false)
   const [jobId] = useState<string | null>(initialDashboardState.jobId)
   const effectiveJobId = brand === "godrej" ? null : jobId
@@ -263,6 +267,9 @@ export default function DashboardPage() {
   useEffect(() => { localStorage.setItem("dashboard_view", view) }, [view])
   useEffect(() => { localStorage.setItem("dashboard_brand", brand) }, [brand])
   useEffect(() => { localStorage.setItem("dashboard_mode", mode) }, [mode])
+  useEffect(() => {
+    localStorage.setItem("dashboard_sidebar_collapsed", isSidebarCollapsed ? "1" : "0")
+  }, [isSidebarCollapsed])
   useEffect(() => {
     localStorage.setItem("dashboard_from_date", fromDate)
     localStorage.setItem("dashboard_to_date", toDate)
@@ -826,52 +833,12 @@ export default function DashboardPage() {
               currentView={view}
               onViewChange={handleViewChange}
               authRole={authRole}
+              collapsed={isSidebarCollapsed}
+              onToggleCollapse={() => setIsSidebarCollapsed((prev) => !prev)}
             />
 
             <main className="custom-scrollbar min-w-0 flex-1 overflow-y-auto bg-[#edf1f6] px-3 py-3 sm:px-6 sm:py-4 lg:px-8">
               <div className="mx-auto w-full max-w-[1380px] pb-10">
-                <motion.div
-                  initial={{ opacity: 0, x: 16 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  className="mb-4 rounded-2xl border border-slate-200 bg-white px-3 py-3 shadow-sm sm:px-5 sm:py-4"
-                >
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-                    <div className="space-y-1">
-                      <h2 className="text-2xl font-bold tracking-tight text-slate-800 sm:text-3xl">
-                        Dashboard <span className="text-slate-500">Control panel</span>
-                      </h2>
-                      <p className="text-sm text-slate-500">
-                        {brandLabel(brand)} | {mode === "sales" ? "Sales Analytics" : "Claims Analytics"}
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2 sm:gap-3 lg:justify-end">
-                      {brand.startsWith("samsung") && (
-                        <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-2 sm:gap-3 sm:px-3">
-                          <Image src="/WhatsApp Image 2026-02-04 at 11.14.29.jpeg" alt="Samsung" width={104} height={32} className="h-7 w-auto" />
-                          {brand !== "samsung" && <div className="h-4 w-[1px] bg-slate-300" />}
-                          {brand === "samsung_vs" && <Image src="/vs_logo.jpg" width={78} height={26} className="h-6 w-auto" alt="VS" />}
-                          {brand === "samsung_croma" && <Image src="/croma_logo.jpg" width={78} height={26} className="h-6 w-auto" alt="Croma" />}
-                        </div>
-                      )}
-                      <div className="hidden rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold text-slate-500 sm:block">
-                        Home <span className="mx-1 text-slate-300">-</span> Dashboard
-                      </div>
-                    </div>
-                  </div>
-                </motion.div>
-
-                <div className="sticky top-0 z-30 mb-4 bg-[#edf1f6]/95 py-1.5 backdrop-blur sm:mb-5 sm:py-2">
-                  <KpiCardsRow
-                    source={brand}
-                    datasetType={mode}
-                    jobId={effectiveJobId || undefined}
-                    fromDate={fromDate || undefined}
-                    toDate={toDate || undefined}
-                    refreshTick={filterRefreshTick}
-                  />
-                </div>
-
                 <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
                   <motion.section
                     initial={{ opacity: 0, y: 24 }}
@@ -920,34 +887,47 @@ export default function DashboardPage() {
                     variants={staggerContainer}
                     initial="initial"
                     animate="animate"
-                    className="space-y-4 xl:col-span-4 xl:sticky xl:top-4 xl:self-start"
+                    className="space-y-4 xl:col-span-4"
                   >
-                    <motion.div variants={fadeIn} className="sticky top-2 z-20 rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-5">
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <h4 className="text-sm font-bold text-slate-800">Control Filters</h4>
-                        <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
-                          {mode}
-                        </span>
-                      </div>
-                      <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
-                      <DateRangePicker
-                        draftFromDate={draftFromDate}
-                        draftToDate={draftToDate}
-                        minDate={defaultFromDate || undefined}
-                        maxDate={defaultToDate && defaultToDate > todayIso() ? defaultToDate : todayIso()}
-                        compact
-                        onDraftChange={(from, to) => {
-                          setDraftFromDate(clampToCurrentMonth(from))
-                          setDraftToDate(clampToCurrentMonth(to))
-                        }}
-                        onApply={handleGraphDateRangeApply}
-                        onReset={resetDateRange}
-                      />
-                    </motion.div>
+                    <div className="space-y-4 xl:sticky xl:top-4">
+                      <motion.div variants={fadeIn} className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-5">
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                          <h4 className="text-sm font-bold text-slate-800">Control Filters</h4>
+                          <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                            {mode}
+                          </span>
+                        </div>
+                        <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
+                        <DateRangePicker
+                          draftFromDate={draftFromDate}
+                          draftToDate={draftToDate}
+                          minDate={defaultFromDate || undefined}
+                          maxDate={defaultToDate && defaultToDate > todayIso() ? defaultToDate : todayIso()}
+                          compact
+                          onDraftChange={(from, to) => {
+                            setDraftFromDate(clampToCurrentMonth(from))
+                            setDraftToDate(clampToCurrentMonth(to))
+                          }}
+                          onApply={handleGraphDateRangeApply}
+                          onReset={resetDateRange}
+                        />
+                      </motion.div>
 
-                    <motion.div variants={fadeIn}>
-                      <RightSideChatbot variant="card" />
-                    </motion.div>
+                      <motion.div variants={fadeIn} className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-4">
+                        <div className="mb-3 text-[10px] font-black uppercase tracking-[0.12em] text-slate-400">
+                          KPI Snapshot
+                        </div>
+                        <KpiCardsRow
+                          source={brand}
+                          datasetType={mode}
+                          jobId={effectiveJobId || undefined}
+                          fromDate={fromDate || undefined}
+                          toDate={toDate || undefined}
+                          refreshTick={filterRefreshTick}
+                          layout="vertical"
+                        />
+                      </motion.div>
+                    </div>
                   </motion.aside>
                 </div>
               </div>
@@ -994,10 +974,11 @@ export default function DashboardPage() {
                 </div>
               )}
             </div>
-            <RightSideChatbot variant="floating" />
           </motion.div>
         )}
       </AnimatePresence>
+
+      <RightSideChatbot variant="floating" />
 
       {isLoggingOut && (
         <motion.div initial={{ y: 100 }} animate={{ y: 0 }} className="fixed bottom-10 left-1/2 -translate-x-1/2 z-[100]">

@@ -8,6 +8,8 @@ import {
   ChevronRight,
   House,
   LayoutDashboard,
+  PanelLeftClose,
+  PanelLeftOpen,
   Shield,
   Store,
 } from "lucide-react"
@@ -20,6 +22,8 @@ type Props = {
   currentView: "home" | "dashboard"
   onViewChange: (view: "home" | "dashboard") => void
   authRole: "admin" | "employee" | null
+  collapsed?: boolean
+  onToggleCollapse?: () => void
 }
 
 const railLinkBase =
@@ -31,6 +35,8 @@ export default function Sidebar({
   currentView,
   onViewChange,
   authRole,
+  collapsed = false,
+  onToggleCollapse,
 }: Props) {
   const [openSamsung, setOpenSamsung] = useState(true)
   const [openSourcesMobile, setOpenSourcesMobile] = useState(false)
@@ -47,23 +53,41 @@ export default function Sidebar({
   }
 
   return (
-    <aside className="w-full shrink-0 border-b border-slate-200 bg-[#f6f8fc] p-2.5 sm:p-3 md:h-full md:w-[230px] md:border-b-0 md:border-r md:p-4 md:pt-5">
+    <aside
+      className={`w-full shrink-0 border-b border-slate-200 bg-[#f6f8fc] p-2.5 sm:p-3 md:h-full md:border-b-0 md:border-r md:p-4 md:pt-5 ${
+        collapsed ? "md:w-[82px]" : "md:w-[230px]"
+      }`}
+    >
+      <div className="mb-2 hidden items-center justify-end md:flex">
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition hover:bg-slate-50"
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+        </button>
+      </div>
+
       <div className="rounded-2xl border border-slate-200 bg-white p-2.5 shadow-sm sm:p-3">
         <div className="grid grid-cols-2 gap-2 md:grid-cols-1">
         <button
           onClick={() => onViewChange("dashboard")}
-          className={`${railLinkBase} ${currentView === "dashboard" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
+          title="Dashboard"
+          className={`${railLinkBase} ${collapsed ? "md:justify-center md:px-2" : ""} ${currentView === "dashboard" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
         >
           <LayoutDashboard size={16} />
-          Dashboard
+          <span className={collapsed ? "md:hidden" : ""}>Dashboard</span>
         </button>
 
         <button
           onClick={() => onViewChange("home")}
-          className={`${railLinkBase} ${currentView === "home" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
+          title="Home"
+          className={`${railLinkBase} ${collapsed ? "md:justify-center md:px-2" : ""} ${currentView === "home" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
         >
           <House size={16} />
-          Home
+          <span className={collapsed ? "md:hidden" : ""}>Home</span>
         </button>
         </div>
       </div>
@@ -80,22 +104,23 @@ export default function Sidebar({
           {openSourcesMobile ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
 
-        <div className="hidden px-2 pb-2 text-[10px] font-black uppercase tracking-[0.18em] text-slate-400 md:block">
+        <div className={`hidden px-2 pb-2 text-[10px] font-black uppercase tracking-[0.18em] text-slate-400 md:block ${collapsed ? "md:hidden" : ""}`}>
           Data Sources
         </div>
 
         <div className={`${openSourcesMobile ? "block" : "hidden"} md:block`}>
           <button
+            title="Samsung"
             onClick={() => {
               handleSourceChange("samsung")
               setOpenSamsung(true)
             }}
-            className={sourceItemClass(isSamsungActive)}
+            className={`${sourceItemClass(isSamsungActive)} ${collapsed ? "md:justify-center md:px-2" : ""}`}
           >
             <Store size={16} />
-            <span className="flex-1">Samsung</span>
+            <span className={`flex-1 ${collapsed ? "md:hidden" : ""}`}>Samsung</span>
             <span
-              className="rounded p-0.5 hover:bg-slate-200/70"
+              className={`rounded p-0.5 hover:bg-slate-200/70 ${collapsed ? "md:hidden" : ""}`}
               onClick={(event) => {
                 event.stopPropagation()
                 setOpenSamsung((prev) => !prev)
@@ -105,7 +130,7 @@ export default function Sidebar({
             </span>
           </button>
 
-          {openSamsung && (
+          {openSamsung && !collapsed && (
             <ul className="mt-1 space-y-1 pl-2">
               {[
                 { label: "Croma", value: "samsung_croma", logo: "/croma_logo.jpg" },
@@ -115,6 +140,7 @@ export default function Sidebar({
                 return (
                   <li key={item.value}>
                     <button
+                      title={item.label}
                       onClick={() => handleSourceChange(item.value)}
                       className={`${railLinkBase} ${active ? "bg-[#e8efff] text-[#1f5cc8]" : "text-slate-600 hover:bg-slate-100"}`}
                     >
@@ -134,24 +160,26 @@ export default function Sidebar({
           )}
 
           <button
+            title="Reliance ResQ"
             onClick={() => handleSourceChange("reliance")}
-            className={`${sourceItemClass(brand === "reliance")} mt-1`}
+            className={`${sourceItemClass(brand === "reliance")} mt-1 ${collapsed ? "md:justify-center md:px-2" : ""}`}
           >
             <ChartNoAxesColumn size={16} />
-            Reliance ResQ
+            <span className={collapsed ? "md:hidden" : ""}>Reliance ResQ</span>
           </button>
 
           <button
+            title="Godrej"
             onClick={() => handleSourceChange("godrej")}
-            className={`${sourceItemClass(brand === "godrej")} mt-1`}
+            className={`${sourceItemClass(brand === "godrej")} mt-1 ${collapsed ? "md:justify-center md:px-2" : ""}`}
           >
             <Shield size={16} />
-            Godrej
+            <span className={collapsed ? "md:hidden" : ""}>Godrej</span>
           </button>
         </div>
       </div>
 
-      <div className="mt-4 border-t border-slate-200 pt-4">
+      <div className={`mt-4 border-t border-slate-200 pt-4 ${collapsed ? "md:hidden" : ""}`}>
         <AdminFileAccess isAdmin={authRole === "admin"} />
       </div>
     </aside>
