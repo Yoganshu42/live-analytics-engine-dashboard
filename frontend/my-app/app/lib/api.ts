@@ -14,10 +14,47 @@ type FetchLastUpdatedParams = {
   to_date?: string
 }
 
+type FetchByDimensionParams = {
+  job_id?: string
+  source: string
+  dataset_type: "sales" | "claims"
+  dimension: string
+  metric: string
+  bucket?: "day" | "week" | "month"
+  from_date?: string
+  to_date?: string
+  filter_1_dimension?: string
+  filter_1_values?: string
+  filter_2_dimension?: string
+  filter_2_values?: string
+}
+
 type FetchDateBoundsParams = {
   job_id?: string
   source: string
   dataset_type: "sales" | "claims"
+}
+
+export type FetchMasterDashboardParams = {
+  job_id?: string
+  from_date?: string
+  to_date?: string
+}
+
+export type MasterDashboardSummary = {
+  gross_premium?: number
+  earned_premium?: number
+  zopper_earned_premium?: number
+  units_sold?: number
+}
+
+export type MasterDashboardResponse = {
+  summaries: Record<string, MasterDashboardSummary>
+  rows: Record<string, Array<Record<string, unknown>>>
+  date_bounds?: {
+    min_date?: string | null
+    max_date?: string | null
+  }
 }
 
 type LoginPayload = {
@@ -52,6 +89,39 @@ export type AdminFileItem = {
   tag: string
   rows: number
   latest_row_id: number | null
+}
+
+export type AdminReverseMapCandidate = {
+  column: string
+  score: number
+  confidence: number
+  reasons: string[]
+  sample_values: string[]
+}
+
+export type AdminReverseMapField = {
+  field: string
+  required: boolean
+  found: boolean
+  suggested_column: string | null
+  confidence: number
+  reasoning: string[]
+  sample_values: string[]
+  candidates: AdminReverseMapCandidate[]
+}
+
+export type AdminReverseMapResponse = {
+  source: string
+  dataset_type: "sales" | "claims"
+  total_rows: number
+  total_columns: number
+  required_fields_found: number
+  required_fields_total: number
+  coverage: number
+  can_reverse_map: boolean
+  message: string
+  file_name?: string
+  mappings: AdminReverseMapField[]
 }
 
 type AdminFileListResponse = {
@@ -101,6 +171,16 @@ export type ChatbotResponse = {
   message?: string
 }
 
+export type ChatbotFileTransformResult = {
+  blob: Blob
+  filename: string
+  summary: string
+  operations: number
+  rows_affected: number
+  columns_touched: number
+  skipped: number
+}
+
 export type CityBreakdownParams = {
   state: string
   metric: string
@@ -126,7 +206,13 @@ type CityBreakdownResponse = {
 }
 
 export type CategoryPercentageParams = {
-  dimension: "plan_category" | "device_plan_category"
+  dimension:
+    | "plan_category"
+    | "device_plan_category"
+    | "article_brand"
+    | "brand"
+    | "channel"
+    | "product_category"
   source: string
   dataset_type: "sales" | "claims"
   metric?: string
@@ -374,6 +460,19 @@ export async function fetchLastUpdated(params: FetchLastUpdatedParams) {
   return fetchJsonWithFallback("/analytics/last-updated", query)
 }
 
+export async function fetchByDimensionRows(params: FetchByDimensionParams): Promise<Array<Record<string, unknown>>> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [k, v]) => {
+      if (v !== undefined && v !== null && v !== "") acc[k] = String(v)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  const response = await fetchJsonWithFallback("/analytics/by-dimension", query)
+  return Array.isArray(response) ? (response as Array<Record<string, unknown>>) : []
+}
+
 export async function fetchDateBounds(params: FetchDateBoundsParams) {
   const query = new URLSearchParams(
     Object.entries(params).reduce((acc, [k, v]) => {
@@ -383,6 +482,20 @@ export async function fetchDateBounds(params: FetchDateBoundsParams) {
   ).toString()
 
   return fetchJsonWithFallback("/analytics/date-bounds", query)
+}
+
+export async function fetchMasterDashboard(
+  params: FetchMasterDashboardParams
+): Promise<MasterDashboardResponse> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [k, v]) => {
+      if (v !== undefined && v !== null && String(v).trim() !== "") acc[k] = String(v)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  return fetchJsonWithFallback("/analytics/master-dashboard", query)
 }
 
 export async function login(payload: LoginPayload): Promise<LoginResponse> {
@@ -505,6 +618,23 @@ export async function updateAdminFile(payload: {
   })
 }
 
+export async function reverseMapAdminFile(payload: {
+  file: File
+  source: string
+  dataset_type: "sales" | "claims"
+}): Promise<AdminReverseMapResponse> {
+  const form = new FormData()
+  form.append("file", payload.file)
+  form.append("source", payload.source)
+  form.append("dataset_type", payload.dataset_type)
+
+  return fetchJsonWithFallback("/admin/files/reverse-map", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
+}
+
 export async function downloadAdminFile(params: {
   source: string
   dataset_type: string
@@ -544,6 +674,54 @@ export async function sendChatbotMessage(payload: ChatbotPayload): Promise<Chatb
     body: JSON.stringify(payload),
     timeoutMs: CHATBOT_REQUEST_TIMEOUT_MS,
   })
+}
+
+export async function transformChatbotFile(payload: {
+  file: File
+  instruction: string
+  source?: string
+  dataset_type?: "sales" | "claims"
+  output_format?: "csv" | "xlsx"
+}): Promise<ChatbotFileTransformResult> {
+  const form = new FormData()
+  form.append("file", payload.file)
+  form.append("instruction", payload.instruction)
+  if (payload.source) {
+    form.append("source", payload.source)
+  }
+  if (payload.dataset_type) {
+    form.append("dataset_type", payload.dataset_type)
+  }
+  if (payload.output_format) {
+    form.append("output_format", payload.output_format)
+  }
+
+  const res = await fetchResponseWithFallback("/chatbot/file-transform", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: CHATBOT_REQUEST_TIMEOUT_MS,
+  })
+  const blob = await res.blob()
+
+  const contentDisposition = res.headers.get("content-disposition") || ""
+  const fileMatch = contentDisposition.match(/filename=\"?([^\";]+)\"?/)
+
+  const parseHeaderNumber = (headerName: string) => {
+    const raw = Number(res.headers.get(headerName) || "0")
+    return Number.isFinite(raw) ? raw : 0
+  }
+
+  const fallbackName = `${payload.file.name.replace(/\.[^.]+$/, "") || "chatbot_file"}_updated.${payload.output_format || "csv"}`
+
+  return {
+    blob,
+    filename: fileMatch?.[1] || fallbackName,
+    summary: res.headers.get("x-transform-summary") || "File updated successfully.",
+    operations: parseHeaderNumber("x-transform-operations"),
+    rows_affected: parseHeaderNumber("x-transform-rows-affected"),
+    columns_touched: parseHeaderNumber("x-transform-columns-touched"),
+    skipped: parseHeaderNumber("x-transform-skipped"),
+  }
 }
 
 export async function fetchCityBreakdownByState(params: CityBreakdownParams): Promise<CityBreakdownResponse> {

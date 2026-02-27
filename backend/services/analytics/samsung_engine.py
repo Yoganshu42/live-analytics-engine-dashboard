@@ -5,6 +5,7 @@ import time
 import threading
 import re
 import pandas as pd
+from pandas.tseries.offsets import MonthEnd
 from sqlalchemy.orm import Session
 
 from services.analytics.base_engine import BaseAnalyticsEngine
@@ -13,6 +14,7 @@ from services.analytics_repository import get_dataframe
 REPORT_START = pd.Timestamp("2000-01-01")
 REPORT_END = pd.Timestamp("2100-12-31")
 ZOPPER_GST_MULTIPLIER = 1.18
+LOSS_RATIO_CAP_PERCENT = 300.0
 logger = logging.getLogger(__name__)
 SAMSUNG_SOURCE_VARIANTS = (
     "samsung_vs",
@@ -147,14 +149,26 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         if month_dt.isna().all():
             month_num = pd.to_numeric(month_series, errors="coerce")
             if not month_num.isna().all():
-                month_dt = pd.to_datetime(
-                    {
-                        "year": REPORT_START.year,
-                        "month": month_num.clip(1, 12),
-                        "day": 1,
-                    },
-                    errors="coerce",
-                )
+                if start_date_series is not None:
+                    start_dt = pd.to_datetime(start_date_series, errors="coerce")
+                    year_vals = start_dt.dt.year.where(start_dt.notna(), self.report_start.year)
+                    month_dt = pd.to_datetime(
+                        {
+                            "year": year_vals,
+                            "month": month_num.clip(1, 12),
+                            "day": 1,
+                        },
+                        errors="coerce",
+                    )
+                else:
+                    month_dt = pd.Series(pd.NaT, index=month_series.index, dtype="datetime64[ns]")
+
+        # Month-only labels without explicit year are ambiguous; keep them null
+        # unless a start-date series was provided to infer year.
+        if start_date_series is None:
+            cleaned = month_series.astype(str).str.strip()
+            ambiguous_month_only = cleaned.str.fullmatch(r"[A-Za-z]{3,9}") | cleaned.str.fullmatch(r"\d{1,2}")
+            month_dt = month_dt.where(~ambiguous_month_only, pd.NaT)
 
         # If parsed years are bogus (e.g., 0001 or 1900), fix year using start date or report year
         if month_dt.notna().any():
@@ -684,6 +698,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         start_dates: pd.Series,
         end_dates: pd.Series,
     ) -> pd.Series:
+        base_amount = pd.to_numeric(df[col], errors="coerce").fillna(0)
         eff_start = start_dates.clip(lower=self.report_start)
         eff_end = end_dates.clip(upper=self.report_end)
 
@@ -691,13 +706,13 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         coverage = (end_dates - start_dates).dt.days + 1
 
         ratio = (exposure / coverage).clip(lower=0, upper=1)
-        earned = (df[col] * ratio).fillna(0)
+        earned = (base_amount * ratio).fillna(0)
 
         invalid = (coverage <= 0) | coverage.isna()
         earned = earned.where(~invalid, 0)
 
         # Safety cap to written premium
-        earned = earned.clip(upper=df[col])
+        earned = earned.clip(lower=0, upper=base_amount)
         return earned.fillna(0)
 
     # --------------------------------------------------
@@ -799,6 +814,83 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             mask &= date_series <= self.report_end
         return df[mask]
 
+    def _apply_sales_overlap_filter(
+        self,
+        df: pd.DataFrame,
+        use_adjusted: bool,
+    ) -> pd.DataFrame:
+        if not self.apply_date_filter or df.empty:
+            return df
+
+        start_col = None
+        end_col = None
+        if use_adjusted and "_adj_start_date" in df.columns:
+            start_col = "_adj_start_date"
+        elif "Start_Date" in df.columns:
+            start_col = "Start_Date"
+
+        if use_adjusted and "_adj_end_date" in df.columns:
+            end_col = "_adj_end_date"
+        elif "End_Date" in df.columns:
+            end_col = "End_Date"
+
+        if start_col is None or end_col is None:
+            return self._apply_sales_date_filter(df, use_adjusted=use_adjusted)
+
+        start_series = pd.to_datetime(df[start_col], errors="coerce")
+        end_series = pd.to_datetime(df[end_col], errors="coerce")
+        if start_series.isna().all() or end_series.isna().all():
+            return self._apply_sales_date_filter(df, use_adjusted=use_adjusted)
+
+        mask = pd.Series(True, index=df.index)
+        if self.report_start is not None:
+            mask &= end_series >= self.report_start
+        if self.report_end is not None:
+            mask &= start_series <= self.report_end
+        return df[mask]
+
+    def _numeric_series(self, series: pd.Series) -> pd.Series:
+        cleaned = (
+            series.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("INR", "", regex=False)
+            .str.replace("Rs.", "", regex=False)
+            .str.replace("Rs", "", regex=False)
+            .str.strip()
+        )
+        return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
+
+    def _find_column_by_alias(self, df: pd.DataFrame, *candidates: str) -> str | None:
+        def _norm_key(name: str) -> str:
+            return (
+                str(name)
+                .strip()
+                .lower()
+                .replace("_", "")
+                .replace(" ", "")
+                .replace("(", "")
+                .replace(")", "")
+                .replace("-", "")
+            )
+
+        normalized = {_norm_key(c): c for c in df.columns}
+        for candidate in candidates:
+            key = _norm_key(candidate)
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    def _earned_ratio_from_days(self, df: pd.DataFrame) -> pd.Series | None:
+        earned_days_col = self._find_column_by_alias(df, "earned_days", "Earned Days", "Earned_Days")
+        policy_days_col = self._find_column_by_alias(df, "policy_days", "Policy Days", "Policy_Days")
+        if earned_days_col is None or policy_days_col is None:
+            return None
+
+        earned_days = self._numeric_series(df[earned_days_col])
+        policy_days = self._numeric_series(df[policy_days_col]).replace(0, pd.NA)
+        ratio = (earned_days / policy_days).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
+        return ratio.clip(lower=0.0, upper=1.0)
+
     # --------------------------------------------------
     # MAIN AGGREGATION
     # --------------------------------------------------
@@ -863,24 +955,60 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         else:
             premium_metric = metric in {"gross_premium", "earned_premium", "zopper_earned_premium"}
             df = self._apply_sales_date_filter(df, use_adjusted=premium_metric)
+            amount_col = self._find_column_by_alias(
+                df,
+                "Amount",
+                "Gross Premium",
+                "gross_premium",
+                "Plan Selling Price",
+                "Customer Premium",
+            )
+            earned_col = self._find_column_by_alias(df, "Earned Premium", "Earned_Premium", "earned_premium")
+            zopper_earned_col = self._find_column_by_alias(
+                df,
+                "Zopper Earned Premium",
+                "zopper_earned_premium",
+                "earned_zopper",
+            )
+            zopper_share_col = self._find_column_by_alias(
+                df,
+                "Zopper Share",
+                "Zopper Shared ( Transfer Price )",
+                "transfer_price",
+            )
+            earned_ratio = self._earned_ratio_from_days(df)
             if metric == "gross_premium":
-                df["_value"] = df["Amount"]
+                if amount_col is None:
+                    return []
+                df["_value"] = self._numeric_series(df[amount_col])
 
             elif metric == "earned_premium":
-                if "_adj_start_date" in df.columns and "_adj_end_date" in df.columns:
+                if earned_col is not None:
+                    df["_value"] = self._numeric_series(df[earned_col])
+                elif amount_col is not None and earned_ratio is not None:
+                    df["_value"] = self._numeric_series(df[amount_col]) * earned_ratio
+                elif amount_col is not None and "_adj_start_date" in df.columns and "_adj_end_date" in df.columns:
                     df["_value"] = self._earned_with_dates(
-                        df, "Amount", df["_adj_start_date"], df["_adj_end_date"]
+                        df, amount_col, df["_adj_start_date"], df["_adj_end_date"]
                     )
+                elif amount_col is not None:
+                    df["_value"] = self._numeric_series(df[amount_col])
                 else:
-                    df["_value"] = self._earned(df, "Amount")
+                    return []
 
             elif metric == "zopper_earned_premium":
-                if "_adj_start_date" in df.columns and "_adj_end_date" in df.columns:
+                if zopper_earned_col is not None:
+                    df["_value"] = self._numeric_series(df[zopper_earned_col])
+                elif zopper_share_col is not None and earned_ratio is not None:
+                    df["_value"] = self._numeric_series(df[zopper_share_col]) * earned_ratio * ZOPPER_GST_MULTIPLIER
+                elif zopper_share_col is not None and "_adj_start_date" in df.columns and "_adj_end_date" in df.columns:
                     df["_value"] = self._earned_with_dates(
-                        df, "Zopper Share", df["_adj_start_date"], df["_adj_end_date"]
+                        df, zopper_share_col, df["_adj_start_date"], df["_adj_end_date"]
                     ) * ZOPPER_GST_MULTIPLIER
+                elif zopper_share_col is not None:
+                    df["_value"] = self._numeric_series(df[zopper_share_col]) * ZOPPER_GST_MULTIPLIER
                 else:
-                    df["_value"] = self._earned(df, "Zopper Share") * ZOPPER_GST_MULTIPLIER
+                    return []
 
             elif metric == "quantity":
                 df["_value"] = 1
@@ -1040,9 +1168,6 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 otd = 0
             claims_df["_net_claims"] = net_amt - otd
 
-            if "Zopper Share" not in sales_df.columns or "Start_Date" not in sales_df.columns or "End_Date" not in sales_df.columns:
-                return []
-
             sales_dim_candidates: list[str] = []
             primary_sales_dim = _find_dim_column(sales_df, candidates)
             if primary_sales_dim is not None:
@@ -1097,16 +1222,16 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 sales_df = self._apply_sales_date_filter(sales_df, use_adjusted=True)
             if dim_key == "month":
                 start_series = None
-                if "_adj_start_date" in sales_df.columns:
-                    adj_series = pd.to_datetime(sales_df["_adj_start_date"], errors="coerce")
-                    if not adj_series.isna().all():
-                        start_series = adj_series
-                if start_series is None and "Start_Date" in sales_df.columns:
-                    start_series = sales_df["Start_Date"]
-                if start_series is None and "Date" in sales_df.columns:
+                if "Date" in sales_df.columns:
                     date_series = pd.to_datetime(sales_df["Date"], errors="coerce")
                     if not date_series.isna().all():
                         start_series = date_series
+                if start_series is None and "Start_Date" in sales_df.columns:
+                    start_series = sales_df["Start_Date"]
+                if start_series is None and "_adj_start_date" in sales_df.columns:
+                    adj_series = pd.to_datetime(sales_df["_adj_start_date"], errors="coerce")
+                    if not adj_series.isna().all():
+                        start_series = adj_series
                 if start_series is not None and not start_series.isna().all():
                     month_source = start_series
                 else:
@@ -1116,12 +1241,45 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                     sales_df["_month_key"] = month_dt.dt.to_period("M").dt.to_timestamp()
                     sales_dim = "_month_key"
 
-            if "_adj_start_date" in sales_df.columns and "_adj_end_date" in sales_df.columns:
+            zopper_earned_col = self._find_column_by_alias(
+                sales_df,
+                "Zopper Earned Premium",
+                "zopper_earned_premium",
+                "earned_zopper",
+            )
+            zopper_share_col = self._find_column_by_alias(
+                sales_df,
+                "Zopper Share",
+                "Zopper Shared ( Transfer Price )",
+                "transfer_price",
+            )
+            earned_ratio = self._earned_ratio_from_days(sales_df)
+            if zopper_earned_col is not None:
+                sales_df["_zp"] = self._numeric_series(sales_df[zopper_earned_col])
+            elif zopper_share_col is not None and earned_ratio is not None:
+                sales_df["_zp"] = self._numeric_series(sales_df[zopper_share_col]) * earned_ratio * ZOPPER_GST_MULTIPLIER
+            elif (
+                zopper_share_col is not None
+                and "_adj_start_date" in sales_df.columns
+                and "_adj_end_date" in sales_df.columns
+            ):
                 sales_df["_zp"] = self._earned_with_dates(
-                    sales_df, "Zopper Share", sales_df["_adj_start_date"], sales_df["_adj_end_date"]
+                    sales_df,
+                    zopper_share_col,
+                    sales_df["_adj_start_date"],
+                    sales_df["_adj_end_date"],
                 ) * ZOPPER_GST_MULTIPLIER
+            elif zopper_share_col is not None and "Start_Date" in sales_df.columns and "End_Date" in sales_df.columns:
+                sales_df["_zp"] = self._earned_with_dates(
+                    sales_df,
+                    zopper_share_col,
+                    sales_df["Start_Date"],
+                    sales_df["End_Date"],
+                ) * ZOPPER_GST_MULTIPLIER
+            elif zopper_share_col is not None:
+                sales_df["_zp"] = self._numeric_series(sales_df[zopper_share_col]) * ZOPPER_GST_MULTIPLIER
             else:
-                sales_df["_zp"] = self._earned(sales_df, "Zopper Share") * ZOPPER_GST_MULTIPLIER
+                return []
 
             claims_out = (
                 claims_df
@@ -1129,41 +1287,113 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 .sum()
                 .reset_index()
             )
-            sales_out = (
-                sales_df
-                .groupby(sales_dim, dropna=False)["_zp"]
-                .sum()
-                .reset_index()
-            )
-
             if dim_key == "month":
                 claim_month_key = pd.to_datetime(claims_out[dim], errors="coerce").dt.to_period("M")
-                sales_month_key = pd.to_datetime(sales_out[sales_dim], errors="coerce").dt.to_period("M")
                 claims_out = claims_out[claim_month_key.notna()].copy()
-                sales_out = sales_out[sales_month_key.notna()].copy()
                 claims_out["_k"] = claim_month_key[claim_month_key.notna()].astype(str)
-                sales_out["_k"] = sales_month_key[sales_month_key.notna()].astype(str)
+                month_index = pd.DatetimeIndex(sorted(claim_month_key.dropna().dt.to_timestamp().unique()))
+                if month_index.empty:
+                    return []
+
+                # For monthly loss ratio, allocate zopper premium across active
+                # coverage months instead of lumping by policy start month.
+                if zopper_share_col is not None:
+                    zopper_total = self._numeric_series(sales_df[zopper_share_col]) * ZOPPER_GST_MULTIPLIER
+                elif zopper_earned_col is not None:
+                    zopper_total = self._numeric_series(sales_df[zopper_earned_col])
+                else:
+                    zopper_total = self._numeric_series(sales_df["_zp"])
+
+                if "_adj_start_date" in sales_df.columns:
+                    start_dt = pd.to_datetime(sales_df["_adj_start_date"], errors="coerce")
+                elif "Start_Date" in sales_df.columns:
+                    start_dt = pd.to_datetime(sales_df["Start_Date"], errors="coerce")
+                elif "Date" in sales_df.columns:
+                    start_dt = pd.to_datetime(sales_df["Date"], errors="coerce")
+                else:
+                    start_dt = pd.Series(pd.NaT, index=sales_df.index)
+
+                if "_adj_end_date" in sales_df.columns:
+                    end_dt = pd.to_datetime(sales_df["_adj_end_date"], errors="coerce")
+                elif "End_Date" in sales_df.columns:
+                    end_dt = pd.to_datetime(sales_df["End_Date"], errors="coerce")
+                else:
+                    end_dt = pd.Series(pd.NaT, index=sales_df.index)
+
+                policy_days = (end_dt - start_dt).dt.days + 1
+                valid = start_dt.notna() & end_dt.notna() & policy_days.gt(0) & zopper_total.ne(0)
+
+                monthly_denominator = pd.Series(0.0, index=month_index, dtype="float64")
+                for month_start in month_index:
+                    month_start = pd.Timestamp(month_start)
+                    month_end = (month_start + MonthEnd(1)).normalize()
+                    overlap_start = start_dt.clip(lower=month_start)
+                    overlap_end = end_dt.clip(upper=month_end)
+                    overlap_days = (overlap_end - overlap_start).dt.days + 1
+                    overlap_days = overlap_days.clip(lower=0)
+                    accrued = (
+                        zopper_total
+                        * (overlap_days / policy_days.where(policy_days.gt(0), pd.NA))
+                    ).fillna(0.0)
+                    monthly_denominator.loc[month_start] = float(accrued[valid].sum())
+
+                invalid = (~valid) & zopper_total.ne(0)
+                if invalid.any():
+                    fallback_parsed = self._parse_month_series(sales_df.loc[invalid, sales_dim])
+                    if fallback_parsed is not None:
+                        fallback_month = self._month_key(fallback_parsed)
+                        fallback_df = pd.DataFrame(
+                            {
+                                "_k": fallback_month.dt.to_period("M").astype(str),
+                                "_zp": zopper_total.loc[invalid],
+                            }
+                        )
+                        fallback_df = fallback_df[fallback_df["_k"].notna()]
+                        if not fallback_df.empty:
+                            fallback_g = fallback_df.groupby("_k", dropna=False)["_zp"].sum()
+                            for key, value in fallback_g.items():
+                                month_key = pd.to_datetime(key, errors="coerce")
+                                if pd.notna(month_key):
+                                    ts_key = month_key.to_period("M").to_timestamp()
+                                    if ts_key in monthly_denominator.index:
+                                        monthly_denominator.loc[ts_key] += float(value or 0.0)
+
+                sales_out = pd.DataFrame(
+                    {
+                        "_k": [m.to_period("M").strftime("%Y-%m") for m in monthly_denominator.index],
+                        "_zp": monthly_denominator.values,
+                    }
+                )
+                merged = claims_out.merge(sales_out, on="_k", how="left")
+                merged["loss_ratio"] = (
+                    merged["_net_claims"] / pd.to_numeric(merged["_zp"], errors="coerce").fillna(0).replace(0, pd.NA) * 100
+                ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
+                out = merged[[dim, "loss_ratio"]]
             else:
+                sales_out = (
+                    sales_df
+                    .groupby(sales_dim, dropna=False)["_zp"]
+                    .sum()
+                    .reset_index()
+                )
                 claims_out["_k"] = _norm_dim(claims_out[dim])
                 sales_out["_k"] = _norm_dim(sales_out[sales_dim])
 
-            # Avoid column name collision when claims and sales use the same dim (e.g., _month_key)
-            sales_dim_col = sales_dim
-            if sales_dim == dim:
-                sales_dim_col = f"{sales_dim}_sales"
-                sales_out = sales_out.rename(columns={sales_dim: sales_dim_col})
+                # Avoid column name collision when claims and sales use the same dim.
+                sales_dim_col = sales_dim
+                if sales_dim == dim:
+                    sales_dim_col = f"{sales_dim}_sales"
+                    sales_out = sales_out.rename(columns={sales_dim: sales_dim_col})
 
-            merged = claims_out.merge(sales_out, on="_k", how="left")
-            merged["loss_ratio"] = (
-                merged["_net_claims"] / merged["_zp"] * 100
-            ).replace([float("inf"), float("-inf")], 0).fillna(0)
+                merged = claims_out.merge(sales_out, on="_k", how="left")
+                merged["loss_ratio"] = (
+                    merged["_net_claims"] / merged["_zp"].replace(0, pd.NA) * 100
+                ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
 
-            # Prefer claims dimension label; fall back to sales label if needed
-            dim_col = dim if dim in merged.columns else (sales_dim_col if sales_dim_col in merged.columns else None)
-            if dim_col is None:
-                return []
-
-            out = merged[[dim_col, "loss_ratio"]].rename(columns={dim_col: dim})
+                dim_col = dim if dim in merged.columns else (sales_dim_col if sales_dim_col in merged.columns else None)
+                if dim_col is None:
+                    return []
+                out = merged[[dim_col, "loss_ratio"]].rename(columns={dim_col: dim})
         else:
             out = (
                 df.groupby(dim, dropna=False)["_value"]
@@ -1325,43 +1555,16 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         # Units sold should always reflect total rows (EW included), not date-filtered
         df_qty = df
         df_prem = self._apply_sales_date_filter(df, use_adjusted=True)
-
-        def _norm_key(name: str) -> str:
-            return (
-                str(name)
-                .strip()
-                .lower()
-                .replace("_", "")
-                .replace(" ", "")
-                .replace("(", "")
-                .replace(")", "")
-                .replace("-", "")
-            )
-
-        def _pick_col(frame: pd.DataFrame, *candidates: str) -> str | None:
-            normalized = {_norm_key(c): c for c in frame.columns}
-            for candidate in candidates:
-                key = _norm_key(candidate)
-                if key in normalized:
-                    return normalized[key]
-            return None
+        df_earned_scope = self._apply_sales_overlap_filter(df, use_adjusted=True)
 
         def _sum_col(frame: pd.DataFrame, *candidates: str) -> float:
-            col = _pick_col(frame, *candidates)
+            col = self._find_column_by_alias(frame, *candidates)
             if col is None:
                 return 0.0
             series = frame[col]
             if series is None:
                 return 0.0
-            cleaned = (
-                series.astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("INR", "", regex=False)
-                .str.replace("Rs.", "", regex=False)
-                .str.replace("Rs", "", regex=False)
-                .str.strip()
-            )
-            return float(pd.to_numeric(cleaned, errors="coerce").fillna(0).sum())
+            return float(self._numeric_series(series).sum())
 
         gross = _sum_col(
             df_prem,
@@ -1373,49 +1576,94 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             "Customer Premium",
         )
 
-        amount_col = _pick_col(df_prem, "Amount", "Gross Premium", "Plan Selling Price", "Customer Premium")
-        earned_col = _pick_col(df_prem, "Earned Premium", "earned_premium")
-        zopper_earned_col = _pick_col(df_prem, "Zopper Earned Premium", "zopper_earned_premium", "earned_zopper")
-        zopper_share_col = _pick_col(df_prem, "Zopper Share", "Zopper Shared ( Transfer Price )", "transfer_price")
+        amount_col = self._find_column_by_alias(df_earned_scope, "Amount", "Gross Premium", "Plan Selling Price", "Customer Premium")
+        earned_col = self._find_column_by_alias(df_earned_scope, "Earned Premium", "Earned_Premium", "earned_premium")
+        zopper_earned_col = self._find_column_by_alias(
+            df_earned_scope,
+            "Zopper Earned Premium",
+            "zopper_earned_premium",
+            "earned_zopper",
+        )
+        zopper_share_col = self._find_column_by_alias(
+            df_earned_scope,
+            "Zopper Share",
+            "Zopper Shared ( Transfer Price )",
+            "transfer_price",
+        )
+        earned_ratio = self._earned_ratio_from_days(df_earned_scope)
 
-        if earned_col is not None:
-            earned = _sum_col(df_prem, earned_col)
-        elif amount_col is not None and ("Start_Date" in df_prem.columns or "_adj_start_date" in df_prem.columns):
-            start_col = "_adj_start_date" if "_adj_start_date" in df_prem.columns else "Start_Date"
-            end_col = "_adj_end_date" if "_adj_end_date" in df_prem.columns else "End_Date"
-            if end_col in df_prem.columns:
-                earned = float(
-                    self._earned_with_dates(
-                        df_prem,
-                        amount_col,
-                        pd.to_datetime(df_prem[start_col], errors="coerce"),
-                        pd.to_datetime(df_prem[end_col], errors="coerce"),
-                    ).sum()
-                )
-            else:
-                earned = _sum_col(df_prem, amount_col)
+        start_col = "_adj_start_date" if "_adj_start_date" in df_earned_scope.columns else ("Start_Date" if "Start_Date" in df_earned_scope.columns else None)
+        end_col = "_adj_end_date" if "_adj_end_date" in df_earned_scope.columns else ("End_Date" if "End_Date" in df_earned_scope.columns else None)
+        can_accrue_by_overlap = (
+            self.apply_date_filter
+            and amount_col is not None
+            and start_col is not None
+            and end_col is not None
+        )
+
+        if can_accrue_by_overlap:
+            earned = float(
+                self._earned_with_dates(
+                    df_earned_scope,
+                    amount_col,
+                    pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
+                    pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
+                ).sum()
+            )
+        elif earned_col is not None:
+            earned = float(self._numeric_series(df_earned_scope[earned_col]).sum())
+        elif amount_col is not None and earned_ratio is not None:
+            earned = float((self._numeric_series(df_earned_scope[amount_col]) * earned_ratio).sum())
+        elif amount_col is not None and start_col is not None and end_col is not None:
+            earned = float(
+                self._earned_with_dates(
+                    df_earned_scope,
+                    amount_col,
+                    pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
+                    pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
+                ).sum()
+            )
+        elif amount_col is not None:
+            earned = float(self._numeric_series(df_earned_scope[amount_col]).sum())
         else:
             earned = 0.0
 
-        if zopper_earned_col is not None:
-            zopper_earned = _sum_col(df_prem, zopper_earned_col)
-        elif zopper_share_col is not None and ("Start_Date" in df_prem.columns or "_adj_start_date" in df_prem.columns):
-            start_col = "_adj_start_date" if "_adj_start_date" in df_prem.columns else "Start_Date"
-            end_col = "_adj_end_date" if "_adj_end_date" in df_prem.columns else "End_Date"
-            if end_col in df_prem.columns:
-                zopper_earned = float(
-                    (
-                        self._earned_with_dates(
-                            df_prem,
-                            zopper_share_col,
-                            pd.to_datetime(df_prem[start_col], errors="coerce"),
-                            pd.to_datetime(df_prem[end_col], errors="coerce"),
-                        )
-                        * ZOPPER_GST_MULTIPLIER
-                    ).sum()
-                )
-            else:
-                zopper_earned = _sum_col(df_prem, zopper_share_col) * ZOPPER_GST_MULTIPLIER
+        can_accrue_zopper_by_overlap = (
+            self.apply_date_filter
+            and zopper_share_col is not None
+            and start_col is not None
+            and end_col is not None
+        )
+        if can_accrue_zopper_by_overlap:
+            zopper_earned = float(
+                (
+                    self._earned_with_dates(
+                        df_earned_scope,
+                        zopper_share_col,
+                        pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
+                        pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
+                    )
+                    * ZOPPER_GST_MULTIPLIER
+                ).sum()
+            )
+        elif zopper_earned_col is not None:
+            zopper_earned = float(self._numeric_series(df_earned_scope[zopper_earned_col]).sum())
+        elif zopper_share_col is not None and earned_ratio is not None:
+            zopper_earned = float((self._numeric_series(df_earned_scope[zopper_share_col]) * earned_ratio * ZOPPER_GST_MULTIPLIER).sum())
+        elif zopper_share_col is not None and start_col is not None and end_col is not None:
+            zopper_earned = float(
+                (
+                    self._earned_with_dates(
+                        df_earned_scope,
+                        zopper_share_col,
+                        pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
+                        pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
+                    )
+                    * ZOPPER_GST_MULTIPLIER
+                ).sum()
+            )
+        elif zopper_share_col is not None:
+            zopper_earned = float(self._numeric_series(df_earned_scope[zopper_share_col]).sum() * ZOPPER_GST_MULTIPLIER)
         else:
             zopper_earned = 0.0
 

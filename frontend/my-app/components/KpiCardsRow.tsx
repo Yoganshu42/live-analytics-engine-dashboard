@@ -9,7 +9,7 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
-import { fetchLastUpdated, fetchSummary } from "@/app/lib/api"
+import { fetchByDimensionRows, fetchLastUpdated, fetchSummary } from "@/app/lib/api"
 
 type Props = {
   source: string
@@ -51,6 +51,27 @@ const money = (value: number) => {
 
 const formatDate = (value: string | null) => {
   if (!value) return "Unknown"
+  const raw = String(value).trim()
+  if (!raw) return "Unknown"
+
+  const shortMonthYear = raw.match(/^([A-Za-z]{3,9})[-/\s](\d{2}|\d{4})$/)
+  if (shortMonthYear) {
+    const monthShort = shortMonthYear[1].slice(0, 3)
+    const yearText = shortMonthYear[2]
+    const year2 = yearText.length === 4 ? yearText.slice(2) : yearText
+    return `${monthShort[0].toUpperCase()}${monthShort.slice(1).toLowerCase()} ${year2}`
+  }
+
+  const isoMonth = raw.match(/^(\d{4})-(\d{2})$/)
+  if (isoMonth) {
+    const [, year, month] = isoMonth
+    const monthIndex = Number(month) - 1
+    if (monthIndex >= 0 && monthIndex <= 11) {
+      const label = new Date(Number(year), monthIndex, 1).toLocaleString("en-US", { month: "short" })
+      return `${label} ${year.slice(2)}`
+    }
+  }
+
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
   return new Intl.DateTimeFormat("en-US", {
@@ -58,6 +79,70 @@ const formatDate = (value: string | null) => {
     month: "short",
     year: "numeric",
   }).format(date)
+}
+
+const toSafeKey = (value: string) => (
+  value
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[()%'.]/g, "")
+)
+
+const toTimeSortValue = (value: unknown) => {
+  const raw = String(value ?? "").trim()
+  if (!raw) return Number.NaN
+
+  const shortMatch = raw.match(/^([A-Za-z]{3})[-/\s](\d{2}|\d{4})$/)
+  if (shortMatch) {
+    const monthMap: Record<string, number> = {
+      jan: 1,
+      feb: 2,
+      mar: 3,
+      apr: 4,
+      may: 5,
+      jun: 6,
+      jul: 7,
+      aug: 8,
+      sep: 9,
+      oct: 10,
+      nov: 11,
+      dec: 12,
+    }
+    const month = monthMap[shortMatch[1].toLowerCase()]
+    if (month) {
+      const rawYear = Number(shortMatch[2])
+      const year = shortMatch[2].length === 2 ? 2000 + rawYear : rawYear
+      return new Date(`${year}-${String(month).padStart(2, "0")}-01`).getTime()
+    }
+  }
+
+  return new Date(raw).getTime()
+}
+
+const pickLatestTrendDate = (
+  rows: Array<Record<string, unknown>>,
+  dimensionKey: string
+): string | null => {
+  if (!rows.length) return null
+  const normalizedDimension = toSafeKey(dimensionKey)
+
+  let latestTs = Number.NEGATIVE_INFINITY
+  let latestRaw: string | null = null
+
+  rows.forEach((row) => {
+    const resolvedKey = Object.keys(row).find((key) => toSafeKey(key) === normalizedDimension)
+    if (!resolvedKey) return
+    const rawValue = row[resolvedKey]
+    const ts = toTimeSortValue(rawValue)
+    if (!Number.isFinite(ts)) return
+    if (ts > latestTs) {
+      latestTs = ts
+      latestRaw = String(rawValue)
+    }
+  })
+
+  return latestRaw
 }
 
 export default function KpiCardsRow({
@@ -70,6 +155,7 @@ export default function KpiCardsRow({
   layout = "auto",
 }: Props) {
   const [summary, setSummary] = useState<Summary | null>(null)
+  const [claimsSummary, setClaimsSummary] = useState<Summary | null>(null)
   const [lastUpdated, setLastUpdated] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -102,6 +188,21 @@ export default function KpiCardsRow({
       from_date: fromDate,
       to_date: toDate,
     }
+    const claimsSummaryParams: Parameters<typeof fetchSummary>[0] = {
+      job_id: jobId,
+      source,
+      dataset_type: "claims",
+      from_date: fromDate,
+      to_date: toDate,
+    }
+    const trendBaseParams = {
+      job_id: jobId,
+      source,
+      dataset_type: datasetType,
+      metric: "quantity",
+      from_date: fromDate,
+      to_date: toDate,
+    }
 
     const load = async () => {
       if (mounted) {
@@ -110,13 +211,29 @@ export default function KpiCardsRow({
       }
 
       try {
-        const [summaryRes, freshnessRes] = await Promise.all([
+        const [summaryRes, freshnessRes, claimsRes, monthRows, dateRows] = await Promise.all([
           fetchSummary(summaryParams),
           fetchLastUpdated(freshnessParams),
+          datasetType === "sales"
+            ? fetchSummary(claimsSummaryParams).catch(() => null)
+            : Promise.resolve(null),
+          fetchByDimensionRows({
+            ...trendBaseParams,
+            dimension: "month",
+          }).catch(() => []),
+          fetchByDimensionRows({
+            ...trendBaseParams,
+            dimension: "date",
+          }).catch(() => []),
         ])
         if (!mounted) return
         setSummary(summaryRes || null)
-        setLastUpdated((freshnessRes as LastUpdated | null)?.data_upto ?? null)
+        const trendLatest =
+          pickLatestTrendDate(monthRows, "month")
+          || pickLatestTrendDate(dateRows, "date")
+        const freshnessDate = (freshnessRes as LastUpdated | null)?.data_upto ?? null
+        setLastUpdated(trendLatest || freshnessDate)
+        setClaimsSummary((claimsRes as Summary | null) || null)
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase()
         const isAuthError = msg.includes("not authenticated") || msg.includes("invalid token")
@@ -125,6 +242,7 @@ export default function KpiCardsRow({
         }
         if (mounted) {
           setSummary(null)
+          setClaimsSummary(null)
           setLastUpdated(null)
           setError("No data")
         }
@@ -145,6 +263,7 @@ export default function KpiCardsRow({
     const earned = summary?.earned_premium ?? 0
     const zopper = summary?.zopper_earned_premium ?? 0
     const units = summary?.units_sold ?? 0
+    const claimsCount = claimsSummary?.units_sold ?? 0
     const updated = formatDate(lastUpdated)
 
     if (datasetType === "claims") {
@@ -173,14 +292,6 @@ export default function KpiCardsRow({
           tone: "from-[#d6a03b] to-[#b9852b]",
           icon: Layers,
         },
-        {
-          key: "claims-updated",
-          label: "Last Updated",
-          value: updated,
-          caption: "Latest available source date",
-          tone: "from-[#df7a5c] to-[#c45b47]",
-          icon: CalendarClock,
-        },
       ]
     }
 
@@ -203,9 +314,9 @@ export default function KpiCardsRow({
       },
       {
         key: "sales-zopper",
-        label: "Zopper Earned",
+        label: "Zopper Earned Premium",
         value: money(zopper),
-        caption: "Revenue contribution",
+        caption: "Basis Zopper COGS",
         tone: "from-[#d6a03b] to-[#b9852b]",
         icon: Layers,
       },
@@ -217,8 +328,16 @@ export default function KpiCardsRow({
         tone: "from-[#df7a5c] to-[#c45b47]",
         icon: CalendarClock,
       },
+      {
+        key: "sales-claims-count",
+        label: "No. of Claims",
+        value: claimsCount.toLocaleString(),
+        caption: "Claims count in same date range",
+        tone: "from-[#7c5cff] to-[#6142dc]",
+        icon: BarChart3,
+      },
     ]
-  }, [datasetType, summary, lastUpdated])
+  }, [datasetType, summary, claimsSummary, lastUpdated])
 
   const gridClassName =
     layout === "vertical"

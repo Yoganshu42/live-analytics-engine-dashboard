@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import difflib
 import hashlib
 import time
 import math
@@ -47,7 +48,9 @@ from services.precomputed_repository import (
     get_precomputed_summary,
     get_precomputed_insights,
     upsert_precomputed_insights,
+    clear_precomputed_for_source_dataset,
 )
+from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_engine import filter_by_date_range
 
 # --------------------------------------------------
@@ -82,6 +85,50 @@ def _refresh_jobs(job_id: str | None) -> list[str | None]:
     if normalized is not None:
         jobs.append(None)
     return jobs
+
+
+def _normalize_data_tag(
+    *,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+) -> tuple[str, str, str | None]:
+    src = (source or "").strip().lower()
+    ds = (dataset_type or "").strip().lower()
+    jb = (job_id or "").strip() or None
+    return src, ds, jb
+
+
+def _overwrite_rows_for_source_dataset(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    payloads: list[dict[str, Any]],
+) -> tuple[int, int, str | None]:
+    src, ds, jb = _normalize_data_tag(source=source, dataset_type=dataset_type, job_id=job_id)
+    deleted = int(
+        db.query(DataRow)
+        .filter(DataRow.source == src, DataRow.dataset_type == ds)
+        .delete(synchronize_session=False)
+        or 0
+    )
+    clear_precomputed_for_source_dataset(db, source=src, dataset_type=ds)
+    if payloads:
+        db.add_all(
+            [
+                DataRow(
+                    job_id=jb,
+                    source=src,
+                    dataset_type=ds,
+                    data=row,
+                )
+                for row in payloads
+            ]
+        )
+    db.commit()
+    return deleted, len(payloads), jb
 
 
 def _refresh_after_data_change(
@@ -237,6 +284,14 @@ app.add_middleware(
     allow_credentials=False,      #  FIX
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+        "X-Transform-Summary",
+        "X-Transform-Operations",
+        "X-Transform-Rows-Affected",
+        "X-Transform-Columns-Touched",
+        "X-Transform-Skipped",
+    ],
 )
 
 
@@ -301,41 +356,43 @@ async def upload_file(
         elif name.endswith(".xlsx") or name.endswith(".xls"):
             df = pd.read_excel(buf)
         else:
-            raise HTTPException(status_code=400, detail="Only .csv or .xlsx files are supported.")
+            raise HTTPException(status_code=400, detail="Only .csv, .xls, and .xlsx files are supported.")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
 
     df = df.astype(object).where(pd.notnull(df), None)
     rows = [_clean_json_row(r) for r in df.to_dict(orient="records")]
 
-    db.add_all(
-        [
-            DataRow(
-                job_id=job_id,
-                source=source.lower().strip(),
-                dataset_type=dataset_type.lower().strip(),
-                data=row,
-            )
-            for row in rows
-        ]
-    )
-    db.commit()
-    _refresh_after_data_change(
+    deleted_rows, inserted_rows, normalized_job_id = _overwrite_rows_for_source_dataset(
         db=db,
         source=source,
         dataset_type=dataset_type,
         job_id=job_id,
+        payloads=rows,
+    )
+    _refresh_after_data_change(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=normalized_job_id,
         action="upload",
     )
 
     logger.info(
-        "UPLOAD: source=%s dataset=%s rows=%s",
+        "UPLOAD overwrite: source=%s dataset=%s deleted_rows=%s inserted_rows=%s",
         source,
         dataset_type,
-        len(rows),
+        deleted_rows,
+        inserted_rows,
     )
 
-    return {"rows_inserted": len(rows), "source": source, "dataset_type": dataset_type}
+    return {
+        "deleted_rows": deleted_rows,
+        "rows_inserted": inserted_rows,
+        "source": source,
+        "dataset_type": dataset_type,
+        "job_id": normalized_job_id,
+    }
 
 # ==================================================
 # INGEST (JSON)
@@ -353,25 +410,867 @@ def ingest_rows(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    rows = [
-        DataRow(
-            job_id=payload.job_id,
-            source=payload.source.lower().strip(),
-            dataset_type=payload.dataset_type.lower().strip(),
-            data=row,
-        )
-        for row in payload.rows
-    ]
-    db.add_all(rows)
-    db.commit()
-    _refresh_after_data_change(
+    cleaned_rows = [_clean_json_row(row) for row in payload.rows]
+    deleted_rows, inserted_rows, normalized_job_id = _overwrite_rows_for_source_dataset(
         db=db,
         source=payload.source,
         dataset_type=payload.dataset_type,
         job_id=payload.job_id,
+        payloads=cleaned_rows,
+    )
+    _refresh_after_data_change(
+        db=db,
+        source=payload.source,
+        dataset_type=payload.dataset_type,
+        job_id=normalized_job_id,
         action="ingest",
     )
-    return {"rows_inserted": len(rows)}
+    return {"deleted_rows": deleted_rows, "rows_inserted": inserted_rows, "job_id": normalized_job_id}
+
+
+_FILE_COLUMN_ALIAS_TARGETS: dict[str, str] = {
+    "planprice": "Plan Selling Price",
+    "plansellingprice": "Plan Selling Price",
+    "grosspremium": "Gross Premium",
+    "earnedpremium": "Earned Premium",
+    "zopperearnedpremium": "Zopper Earned Premium",
+    "zoppershare": "Zopper Share",
+    "zoppersharedtransferprice": "Zopper Shared ( Transfer Price )",
+    "totalbillingamount": "Total Billing Amount",
+    "billingamount": "Billing Amount",
+    "invoicevalue": "INVOICE_VALUE",
+    "brand": "Brand",
+    "articlebrand": "Article_Brand",
+    "itembrand": "Item_Brand",
+    "planstartdate": "Plan Start Date",
+    "planenddate": "Plan End Date",
+    "warrantystartdate": "Warranty Start Date",
+    "warrantyenddate": "Warranty End Date",
+    "claimscost": "Claim_Amount",
+    "claimamount": "Claim_Amount",
+    "claimvalues": "Claim_Amount",
+    "claimdate": "Claim Date",
+    "plancategory": "Plan Category",
+    "deviceplancategory": "Device Plan Category",
+    "state": "State",
+    "month": "Month",
+    "channel": "Channel",
+    "productcategory": "Product_Category",
+}
+
+_COPY_INSTRUCTION_PATTERNS = [
+    re.compile(r"^(?:copy|map)\s+(?P<source>.+?)\s+(?:to|into|as|->)\s+(?P<target>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:map)\s+(?P<target>.+?)\s+from\s+(?P<source>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:use)\s+(?P<source>.+?)\s+as\s+(?P<target>.+)$", re.IGNORECASE),
+]
+_SET_INSTRUCTION_PATTERN = re.compile(
+    r"^(?:fill|set|update)\s+(?:(?P<scope>missing|blank|empty|null)\s+)?(?P<target>.+?)\s*(?:with|to|as|=)\s*(?P<value>.+)$",
+    re.IGNORECASE,
+)
+_IS_INSTRUCTION_PATTERN = re.compile(r"^(?P<target>.+?)\s+(?:will\s+be|is|=)\s+(?P<value>.+)$", re.IGNORECASE)
+_DUPLICATE_INTENT_PATTERN = re.compile(r"\bduplicate(?:s|d|ing)?\b", re.IGNORECASE)
+_DEDUPE_ACTION_PATTERN = re.compile(r"\b(?:remove|drop|delete|dedupe|deduplicate|clean)\b", re.IGNORECASE)
+_UNSAFE_TRANSFORM_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _normalize_file_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+
+def _clean_instruction_part(value: str) -> str:
+    cleaned = str(value or "").strip()
+    cleaned = cleaned.strip().strip("`")
+    cleaned = cleaned.strip().strip('"').strip("'")
+    cleaned = re.sub(r"^[\[\(\{]+", "", cleaned)
+    cleaned = re.sub(r"[\]\)\}]+$", "", cleaned)
+    cleaned = re.sub(r"^(?:column|field)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _sanitize_header_value(value: str, limit: int = 220) -> str:
+    out = re.sub(r"[\r\n\t]+", " ", str(value or ""))
+    out = re.sub(r"\s+", " ", out).strip()
+    if len(out) <= limit:
+        return out
+    return f"{out[:limit].rstrip()}..."
+
+
+def _safe_transform_filename(base_name: str, extension: str) -> str:
+    base = re.sub(r"\.[^.]+$", "", str(base_name or "").strip())
+    base = _UNSAFE_TRANSFORM_FILENAME.sub("_", base).strip("._-")
+    if not base:
+        base = "chatbot_file"
+    ext = (extension or "csv").strip().lower()
+    if ext not in {"csv", "xlsx"}:
+        ext = "csv"
+    return f"{base}_updated.{ext}"
+
+
+def _parse_file_transform_dataframe(file: UploadFile):
+    import pandas as pd
+
+    raw = file.file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file uploaded.")
+
+    filename = (file.filename or "").strip()
+    lowered = filename.lower()
+    buf = BytesIO(raw)
+    try:
+        if lowered.endswith(".csv"):
+            df = pd.read_csv(buf)
+            inferred_ext = "csv"
+        elif lowered.endswith(".xlsx") or lowered.endswith(".xls"):
+            df = pd.read_excel(buf)
+            inferred_ext = "xlsx"
+        else:
+            raise HTTPException(status_code=400, detail="Only .csv, .xls, and .xlsx files are supported.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
+
+    df.columns = [str(col).strip() for col in df.columns]
+    return df, inferred_ext
+
+
+def _split_file_instructions(instruction: str) -> list[str]:
+    if not instruction or not instruction.strip():
+        return []
+    parts = re.split(r"[;\n]+", instruction)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _missing_mask(series):
+    as_text = (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    return series.isna() | as_text.isin({"", "nan", "none", "null", "na"})
+
+
+def _parse_constant_value(raw_value: str):
+    value = _clean_instruction_part(raw_value)
+    if not value:
+        return ""
+
+    low = value.lower()
+    if low in {"none", "null", "nan", "na"}:
+        return None
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+
+    if re.fullmatch(r"-?\d+", value):
+        try:
+            return int(value)
+        except Exception:
+            return value
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        try:
+            return float(value)
+        except Exception:
+            return value
+    return value
+
+
+def _truncate_transform_preview(value: Any, max_len: int = 40) -> str:
+    text = str(value)
+    return text if len(text) <= max_len else f"{text[:max_len - 1]}..."
+
+
+def _trim_duplicate_column_phrase(value: str) -> str:
+    trimmed = _clean_instruction_part(value)
+    trimmed = re.sub(r"[?.,;:!]+$", "", trimmed).strip()
+    trimmed = re.split(
+        r"(?i)\b(?:from|for|with|and|or|where|that|which|please|dataset|file|values?|duplicates?|duplicate)\b",
+        trimmed,
+        maxsplit=1,
+    )[0].strip()
+    return _clean_instruction_part(trimmed)
+
+
+def _extract_explicit_duplicate_column_label(request_text: str) -> str | None:
+    text = (request_text or "").strip()
+    if not text:
+        return None
+
+    quoted = re.search(r"`(?P<col>[^`]+)`", text)
+    if quoted:
+        candidate = _trim_duplicate_column_phrase(quoted.group("col"))
+        if candidate:
+            return candidate
+
+    patterns = [
+        re.compile(r"\bcolumn(?:\s+name)?\s*(?:is|=|:)?\s*(?P<col>[A-Za-z0-9_][A-Za-z0-9_ ./-]*)", re.IGNORECASE),
+        re.compile(r"\bin\s+column(?:\s+name)?\s*(?:is|=|:)?\s*(?P<col>[A-Za-z0-9_][A-Za-z0-9_ ./-]*)", re.IGNORECASE),
+        re.compile(r"\bfor\s+column(?:\s+name)?\s*(?:is|=|:)?\s*(?P<col>[A-Za-z0-9_][A-Za-z0-9_ ./-]*)", re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        candidate = _trim_duplicate_column_phrase(match.group("col"))
+        if candidate:
+            return candidate
+    return None
+
+
+def _closest_duplicate_column_candidates(df, requested_label: str, limit: int = 5) -> list[str]:
+    columns = [str(col) for col in df.columns]
+    if not columns:
+        return []
+
+    normalized_to_column: dict[str, str] = {}
+    for col in columns:
+        key = _normalize_file_key(col)
+        if key and key not in normalized_to_column:
+            normalized_to_column[key] = col
+
+    requested_key = _normalize_file_key(requested_label)
+    candidates: list[str] = []
+
+    if requested_key:
+        close_keys = difflib.get_close_matches(
+            requested_key,
+            list(normalized_to_column.keys()),
+            n=limit,
+            cutoff=0.35,
+        )
+        for key in close_keys:
+            col = normalized_to_column[key]
+            if col not in candidates:
+                candidates.append(col)
+
+    if len(candidates) < limit:
+        target_tokens = set(re.findall(r"[a-z0-9]+", requested_label.lower()))
+        scored: list[tuple[int, str]] = []
+        for col in columns:
+            col_tokens = set(re.findall(r"[a-z0-9]+", col.lower()))
+            overlap = len(target_tokens & col_tokens)
+            if overlap > 0:
+                scored.append((overlap, col))
+        for _score, col in sorted(scored, key=lambda item: (-item[0], item[1])):
+            if col not in candidates:
+                candidates.append(col)
+            if len(candidates) >= limit:
+                break
+
+    return candidates[:limit]
+
+
+def _extract_deduplicate_column_label(request_text: str) -> str | None:
+    explicit = _extract_explicit_duplicate_column_label(request_text)
+    if explicit:
+        return explicit
+
+    text = (request_text or "").strip()
+    if not text:
+        return None
+
+    patterns = [
+        re.compile(r"\b(?:by|using|on)\s+(?:column(?:\s+name)?\s*)?(?P<col>[A-Za-z0-9_][A-Za-z0-9_ ./-]*)", re.IGNORECASE),
+        re.compile(r"\bfrom\s+(?:column(?:\s+name)?\s*)?(?P<col>[A-Za-z0-9_][A-Za-z0-9_ ./-]*)", re.IGNORECASE),
+        re.compile(r"\bin\s+(?:column(?:\s+name)?\s*)?(?P<col>[A-Za-z0-9_][A-Za-z0-9_ ./-]*)", re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        candidate = _trim_duplicate_column_phrase(match.group("col"))
+        if not candidate:
+            continue
+        lower_candidate = candidate.lower()
+        if lower_candidate in {"file", "the file", "dataset", "the dataset", "this file", "this dataset"}:
+            continue
+        return candidate
+    return None
+
+
+def _apply_deduplicate_instruction(
+    df,
+    line: str,
+    alias_map: dict[str, str],
+) -> dict[str, Any] | None:
+    text = (line or "").strip()
+    if not text:
+        return None
+
+    if not (_DEDUPE_ACTION_PATTERN.search(text) and _DUPLICATE_INTENT_PATTERN.search(text)):
+        return None
+
+    requested_column = _extract_deduplicate_column_label(text)
+    if requested_column:
+        target_col = _resolve_instruction_column(df, requested_column, alias_map, allow_create=False)
+        if target_col is None or target_col not in df.columns:
+            suggestions = _closest_duplicate_column_candidates(df, requested_column)
+            note = f"Dedup skipped: column `{requested_column}` was not found."
+            if suggestions:
+                note += " Closest columns: " + ", ".join(f"`{col}`" for col in suggestions) + "."
+            return {
+                "description": note,
+                "rows_affected": 0,
+                "columns_touched": [],
+            }
+
+        before = int(len(df))
+        df.drop_duplicates(subset=[target_col], keep="first", inplace=True, ignore_index=True)
+        removed = max(0, before - int(len(df)))
+        return {
+            "description": f"removed duplicate rows by `{target_col}` (removed {removed})",
+            "rows_affected": removed,
+            "columns_touched": [target_col],
+        }
+
+    before = int(len(df))
+    df.drop_duplicates(keep="first", inplace=True, ignore_index=True)
+    removed = max(0, before - int(len(df)))
+    return {
+        "description": f"removed fully duplicate rows across all columns (removed {removed})",
+        "rows_affected": removed,
+        "columns_touched": [],
+    }
+
+
+def _resolve_duplicate_target_column(
+    df,
+    request_text: str,
+    alias_map: dict[str, str],
+    explicit_column_label: str | None = None,
+) -> str | None:
+    if explicit_column_label:
+        return _resolve_instruction_column(df, explicit_column_label, alias_map, allow_create=False)
+
+    lowered = (request_text or "").strip().lower()
+
+    preferred_labels: list[str] = []
+    if "claim" in lowered:
+        preferred_labels.extend([
+            "claim values",
+            "claim amount",
+            "claims cost",
+            "claim",
+        ])
+    if "brand" in lowered:
+        preferred_labels.extend(["brand", "article brand", "item brand"])
+    if "premium" in lowered:
+        preferred_labels.extend(["gross premium", "earned premium", "zopper earned premium"])
+    if "quantity" in lowered or "count" in lowered:
+        preferred_labels.extend(["quantity", "count", "units sold"])
+
+    for label in preferred_labels:
+        column = _resolve_instruction_column(df, label, alias_map, allow_create=False)
+        if column is not None:
+            return column
+
+    # If no explicit signal is found, pick the column with the highest duplicate footprint.
+    best_column: str | None = None
+    best_duplicate_rows = -1
+    for col in df.columns:
+        series = df[col]
+        text_series = series.astype(str).str.strip()
+        mask = ~series.isna() & ~text_series.str.lower().isin({"", "nan", "none", "null", "na"})
+        filtered = text_series[mask]
+        if filtered.empty:
+            continue
+        counts = filtered.value_counts()
+        duplicate_rows = int(counts[counts > 1].sum())
+        if duplicate_rows > best_duplicate_rows:
+            best_duplicate_rows = duplicate_rows
+            best_column = str(col)
+
+    if best_column is not None:
+        return best_column
+    return str(df.columns[0]) if len(df.columns) else None
+
+
+def _analyze_duplicate_instruction(
+    df,
+    request_text: str,
+    alias_map: dict[str, str],
+) -> dict[str, Any] | None:
+    if not _DUPLICATE_INTENT_PATTERN.search(request_text or ""):
+        return None
+
+    explicit_column_label = _extract_explicit_duplicate_column_label(request_text)
+    target_col = _resolve_duplicate_target_column(
+        df,
+        request_text,
+        alias_map,
+        explicit_column_label=explicit_column_label,
+    )
+
+    if explicit_column_label and (not target_col or target_col not in df.columns):
+        suggestions = _closest_duplicate_column_candidates(df, explicit_column_label)
+        summary = f"Duplicate scan skipped: column `{explicit_column_label}` was not found in the uploaded file."
+        if suggestions:
+            summary += " Closest columns: " + ", ".join(f"`{col}`" for col in suggestions) + "."
+        return {
+            "summary": summary,
+            "rows_affected": 0,
+            "columns_touched": [],
+        }
+
+    if not target_col or target_col not in df.columns:
+        return None
+
+    series = df[target_col]
+    text_series = series.astype(str).str.strip()
+    mask = ~series.isna() & ~text_series.str.lower().isin({"", "nan", "none", "null", "na"})
+    filtered = text_series[mask]
+
+    if filtered.empty:
+        summary = f"Duplicate scan in `{target_col}`: no non-empty values were available to evaluate."
+        return {
+            "summary": summary,
+            "rows_affected": 0,
+            "columns_touched": [target_col],
+        }
+
+    counts = filtered.value_counts()
+    duplicate_counts = counts[counts > 1]
+    duplicate_rows = int(duplicate_counts.sum())
+
+    if duplicate_counts.empty:
+        summary = f"Duplicate scan in `{target_col}`: no duplicate values found."
+    else:
+        preview = ", ".join(
+            f"{_truncate_transform_preview(value)} ({int(count)}x)"
+            for value, count in duplicate_counts.head(12).items()
+        )
+        summary = (
+            f"Duplicate scan in `{target_col}`: found {len(duplicate_counts)} duplicate value(s) "
+            f"across {duplicate_rows} row(s). Top duplicates: {preview}."
+        )
+
+    return {
+        "summary": summary,
+        "rows_affected": duplicate_rows,
+        "columns_touched": [target_col],
+    }
+
+
+def _build_file_alias_map(df, source: str | None, dataset_type: str | None) -> dict[str, str]:
+    alias_map = dict(_FILE_COLUMN_ALIAS_TARGETS)
+    for col in df.columns:
+        alias_map[_normalize_file_key(col)] = str(col)
+
+    src = _normalize_source_key(source or "") if source else ""
+    ds = (dataset_type or "sales").strip().lower()
+    if ds not in {"sales", "claims"}:
+        ds = "sales"
+
+    if src:
+        try:
+            suggestions = suggest_reverse_mapping(df, source=src, dataset_type=ds)
+            for item in suggestions.get("mappings", []):
+                field_key = _normalize_file_key(str(item.get("field") or ""))
+                suggested = item.get("suggested_column")
+                if not field_key or not isinstance(suggested, str) or suggested not in df.columns:
+                    continue
+                if not bool(item.get("found")):
+                    continue
+
+                try:
+                    confidence = float(item.get("confidence") or 0.0)
+                except Exception:
+                    confidence = 0.0
+                required = bool(item.get("required"))
+                min_confidence = 0.55 if required else 0.72
+                if confidence < min_confidence:
+                    continue
+
+                default_target = _FILE_COLUMN_ALIAS_TARGETS.get(field_key)
+                if default_target and default_target in df.columns and default_target != suggested:
+                    continue
+
+                alias_map[field_key] = suggested
+        except Exception:
+            logger.exception("File transform alias generation failed source=%s dataset=%s", src, ds)
+
+    return alias_map
+
+
+def _resolve_instruction_column(df, label: str, alias_map: dict[str, str], *, allow_create: bool = False) -> str | None:
+    cleaned = _clean_instruction_part(label)
+    if not cleaned:
+        return None
+
+    normalized = _normalize_file_key(cleaned)
+    if not normalized:
+        return None
+
+    alias_hit = alias_map.get(normalized)
+    if alias_hit and alias_hit in df.columns:
+        return alias_hit
+
+    normalized_cols: dict[str, str] = {}
+    for col in df.columns:
+        key = _normalize_file_key(str(col))
+        if key and key not in normalized_cols:
+            normalized_cols[key] = str(col)
+    if normalized in normalized_cols:
+        return normalized_cols[normalized]
+
+    for key, col in normalized_cols.items():
+        if normalized in key or key in normalized:
+            return col
+
+    label_tokens = set(re.findall(r"[a-z0-9]+", cleaned.lower()))
+    best_col = None
+    best_score = 0
+    for col in df.columns:
+        col_tokens = set(re.findall(r"[a-z0-9]+", str(col).lower()))
+        score = len(label_tokens & col_tokens)
+        if score > best_score:
+            best_score = score
+            best_col = str(col)
+    if best_col is not None and best_score >= 2:
+        return best_col
+
+    if not allow_create:
+        return None
+
+    preferred = alias_map.get(normalized)
+    if preferred:
+        return preferred
+
+    if "_" in cleaned:
+        candidate = cleaned
+    else:
+        candidate = " ".join(token.capitalize() for token in cleaned.split())
+    candidate = candidate.strip() or "New Column"
+    return candidate
+
+
+def _resolve_target_column(df, label: str, alias_map: dict[str, str]) -> str | None:
+    cleaned = _clean_instruction_part(label)
+    if not cleaned:
+        return None
+
+    normalized = _normalize_file_key(cleaned)
+    if not normalized:
+        return None
+
+    normalized_cols: dict[str, str] = {}
+    for col in df.columns:
+        key = _normalize_file_key(str(col))
+        if key and key not in normalized_cols:
+            normalized_cols[key] = str(col)
+    if normalized in normalized_cols:
+        return normalized_cols[normalized]
+
+    for key, col in normalized_cols.items():
+        if normalized in key or key in normalized:
+            return col
+
+    label_tokens = set(re.findall(r"[a-z0-9]+", cleaned.lower()))
+    best_col = None
+    best_score = 0
+    for col in df.columns:
+        col_tokens = set(re.findall(r"[a-z0-9]+", str(col).lower()))
+        score = len(label_tokens & col_tokens)
+        if score > best_score:
+            best_score = score
+            best_col = str(col)
+    if best_col is not None and best_score >= 2:
+        return best_col
+
+    canonical = _FILE_COLUMN_ALIAS_TARGETS.get(normalized)
+    if canonical:
+        return canonical
+
+    alias_hit = alias_map.get(normalized)
+    if alias_hit and alias_hit in df.columns:
+        return alias_hit
+
+    if "_" in cleaned:
+        candidate = cleaned
+    else:
+        candidate = " ".join(token.capitalize() for token in cleaned.split())
+    candidate = candidate.strip() or "New Column"
+    return candidate
+
+
+def _apply_copy_instruction(
+    df,
+    *,
+    source_label: str,
+    target_label: str,
+    alias_map: dict[str, str],
+    only_missing: bool,
+) -> dict[str, Any] | None:
+    source_col = _resolve_instruction_column(df, source_label, alias_map, allow_create=False)
+    if source_col is None:
+        return None
+    target_col = _resolve_target_column(df, target_label, alias_map)
+    if target_col is None:
+        return None
+    if target_col not in df.columns:
+        df[target_col] = None
+
+    if only_missing:
+        mask = _missing_mask(df[target_col])
+        df.loc[mask, target_col] = df.loc[mask, source_col]
+        rows = int(mask.sum())
+    else:
+        df[target_col] = df[source_col]
+        rows = int(len(df))
+
+    alias_map[_normalize_file_key(target_label)] = target_col
+    alias_map[_normalize_file_key(target_col)] = target_col
+
+    mode = "filled missing" if only_missing else "copied"
+    return {
+        "description": f"{mode} `{target_col}` from `{source_col}`",
+        "rows_affected": rows,
+        "columns_touched": [target_col],
+    }
+
+
+def _apply_constant_instruction(
+    df,
+    *,
+    target_label: str,
+    value_text: str,
+    alias_map: dict[str, str],
+    only_missing: bool,
+) -> dict[str, Any] | None:
+    target_col = _resolve_target_column(df, target_label, alias_map)
+    if target_col is None:
+        return None
+    if target_col not in df.columns:
+        df[target_col] = None
+
+    source_col = _resolve_instruction_column(df, value_text, alias_map, allow_create=False)
+    treat_as_column = source_col is not None and _normalize_file_key(value_text) != ""
+
+    if treat_as_column:
+        return _apply_copy_instruction(
+            df,
+            source_label=source_col,
+            target_label=target_col,
+            alias_map=alias_map,
+            only_missing=only_missing,
+        )
+
+    value = _parse_constant_value(value_text)
+    if only_missing:
+        mask = _missing_mask(df[target_col])
+        df.loc[mask, target_col] = value
+        rows = int(mask.sum())
+        mode = "filled missing"
+    else:
+        df[target_col] = value
+        rows = int(len(df))
+        mode = "set"
+
+    alias_map[_normalize_file_key(target_label)] = target_col
+    alias_map[_normalize_file_key(target_col)] = target_col
+    return {
+        "description": f"{mode} `{target_col}` = {repr(value)}",
+        "rows_affected": rows,
+        "columns_touched": [target_col],
+    }
+
+
+def _apply_instruction_line(df, line: str, alias_map: dict[str, str]) -> dict[str, Any] | None:
+    text = line.strip()
+    if not text:
+        return None
+
+    dedupe_result = _apply_deduplicate_instruction(df, text, alias_map)
+    if dedupe_result is not None:
+        return dedupe_result
+
+    for pattern in _COPY_INSTRUCTION_PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        groups = match.groupdict()
+        source = _clean_instruction_part(groups.get("source", ""))
+        target = _clean_instruction_part(groups.get("target", ""))
+        if not source or not target:
+            return None
+        return _apply_copy_instruction(
+            df,
+            source_label=source,
+            target_label=target,
+            alias_map=alias_map,
+            only_missing=False,
+        )
+
+    set_match = _SET_INSTRUCTION_PATTERN.match(text)
+    if set_match:
+        groups = set_match.groupdict()
+        target = _clean_instruction_part(groups.get("target", ""))
+        value = groups.get("value", "")
+        scope = (groups.get("scope") or "").strip().lower()
+        only_missing = scope in {"missing", "blank", "empty", "null"}
+        if not target or not value.strip():
+            return None
+        return _apply_constant_instruction(
+            df,
+            target_label=target,
+            value_text=value,
+            alias_map=alias_map,
+            only_missing=only_missing,
+        )
+
+    fallback_match = _IS_INSTRUCTION_PATTERN.match(text)
+    if fallback_match:
+        groups = fallback_match.groupdict()
+        target = _clean_instruction_part(groups.get("target", ""))
+        value = groups.get("value", "")
+        if not target or not value.strip():
+            return None
+
+        normalized_target = _normalize_file_key(target)
+        if normalized_target and (
+            normalized_target in alias_map
+            or any(word in target.lower() for word in ["column", "field", "price", "premium", "brand", "amount", "date", "category", "plan"])
+        ):
+            return _apply_constant_instruction(
+                df,
+                target_label=target,
+                value_text=value,
+                alias_map=alias_map,
+                only_missing=False,
+            )
+
+        source_col = _resolve_instruction_column(df, value, alias_map, allow_create=False)
+        if source_col is not None:
+            return _apply_copy_instruction(
+                df,
+                source_label=source_col,
+                target_label=target,
+                alias_map=alias_map,
+                only_missing=False,
+            )
+
+    return None
+
+
+def _resolve_output_extension(input_ext: str, requested: str | None) -> str:
+    preferred = (requested or "").strip().lower()
+    if preferred in {"csv", "xlsx"}:
+        return preferred
+    if input_ext in {"csv", "xlsx"}:
+        return input_ext
+    return "csv"
+
+
+@app.post("/chatbot/file-transform")
+async def chatbot_file_transform(
+    file: UploadFile = File(...),
+    instruction: str = Form(...),
+    source: str | None = Form(None),
+    dataset_type: str | None = Form(None),
+    output_format: str | None = Form(None),
+    current_user = Depends(get_current_user),
+):
+    request_text = (instruction or "").strip()
+    if not request_text:
+        raise HTTPException(status_code=400, detail="Instruction is required.")
+
+    df, input_ext = _parse_file_transform_dataframe(file)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file has no rows.")
+
+    resolved_source = _normalize_source_key(source or "")
+    if not resolved_source:
+        resolved_source = _normalize_source_key(_detect_source_from_text(request_text) or "")
+
+    resolved_dataset = (dataset_type or "").strip().lower()
+    if resolved_dataset not in {"sales", "claims"}:
+        inferred_dataset = _detect_dataset_from_text(request_text)
+        resolved_dataset = inferred_dataset if inferred_dataset in {"sales", "claims"} else "sales"
+
+    alias_map = _build_file_alias_map(
+        df,
+        source=resolved_source or None,
+        dataset_type=resolved_dataset,
+    )
+    instructions = _split_file_instructions(request_text)
+    if not instructions:
+        raise HTTPException(status_code=400, detail="No valid instruction found.")
+
+    applied_ops: list[dict[str, Any]] = []
+    skipped_ops: list[str] = []
+    for line in instructions:
+        result = _apply_instruction_line(df, line, alias_map)
+        if result is None:
+            skipped_ops.append(line)
+            continue
+        applied_ops.append(result)
+
+    analysis_result: dict[str, Any] | None = None
+    if not applied_ops:
+        analysis_result = _analyze_duplicate_instruction(df, request_text, alias_map)
+        if analysis_result is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not parse the instruction. Use formats like: "
+                    "'fill Brand with Samsung', 'copy Article_Brand to Brand', "
+                    "'Plan Price will be Total Billing Amount', or 'remove duplicates from column Item_Serial_Number'."
+                ),
+            )
+        skipped_ops = []
+
+    output_ext = _resolve_output_extension(input_ext, output_format)
+    output_filename = _safe_transform_filename(file.filename or "chatbot_file", output_ext)
+
+    if output_ext == "xlsx":
+        out_buf = BytesIO()
+        df.to_excel(out_buf, index=False)
+        payload = out_buf.getvalue()
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        payload = df.to_csv(index=False).encode("utf-8")
+        media_type = "text/csv"
+
+    if analysis_result is not None:
+        total_rows_affected = int(analysis_result.get("rows_affected") or 0)
+        columns_touched = sorted(
+            {str(col) for col in (analysis_result.get("columns_touched") or []) if str(col).strip()}
+        )
+        summary = str(analysis_result.get("summary") or "Duplicate scan completed.")
+        operations_count = 0
+        skipped_count = 0
+    else:
+        total_rows_affected = int(sum(int(op.get("rows_affected") or 0) for op in applied_ops))
+        columns_touched = sorted(
+            {str(col) for op in applied_ops for col in (op.get("columns_touched") or []) if str(col).strip()}
+        )
+        short_descriptions = [str(op.get("description") or "").strip() for op in applied_ops[:3] if str(op.get("description") or "").strip()]
+        summary_parts = [
+            f"Applied {len(applied_ops)} instruction(s)",
+            f"row updates: {total_rows_affected}",
+            f"columns touched: {len(columns_touched)}",
+        ]
+        if short_descriptions:
+            summary_parts.append("changes: " + "; ".join(short_descriptions))
+        if skipped_ops:
+            summary_parts.append(f"skipped {len(skipped_ops)} line(s)")
+        summary = " | ".join(summary_parts)
+        operations_count = len(applied_ops)
+        skipped_count = len(skipped_ops)
+
+    return StreamingResponse(
+        iter([payload]),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{output_filename}"',
+            "X-Transform-Summary": _sanitize_header_value(summary),
+            "X-Transform-Operations": str(operations_count),
+            "X-Transform-Rows-Affected": str(total_rows_affected),
+            "X-Transform-Columns-Touched": str(len(columns_touched)),
+            "X-Transform-Skipped": str(skipped_count),
+        },
+    )
 
 # ==================================================
 # GRAPH INSIGHTS (LLM)
@@ -421,8 +1320,7 @@ DEFAULT_CHATBOT_SYSTEM_PROMPT = (
     "For greetings, acknowledgements, or short conversational messages, respond naturally and invite a data question. "
     "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, "
     "samsung/overview/overall/ -> Samsung Overview, samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma. "
-    "When Samsung model codes are mentioned (for example A06, S24, Fold7), map them to the provided Samsung device-plan category mapping in context. "
-    "Use Samsung plan abbreviations consistently: ADLD = Accidental Damage and Liquid Damage, EW = Extended Warranty, SP/SPP = Screen Protection Plan, CPP = Comprehensive Protection Plan, Combo = ADLD + EW. "
+    "Apply source-specific taxonomy and mappings; use Samsung-specific model mapping or Samsung plan abbreviations only when the selected source is Samsung. "
     "Write in a clear executive tone with concise, evidence-backed reasoning. "
     "Lead with the direct answer, then support it with key metrics, trend direction, and business impact. "
     "Vary phrasing and structure across turns; avoid repeating identical templates or sentence openings. "
@@ -3935,20 +4833,38 @@ def chatbot_message(
         or os.getenv("CHATBOT_SYSTEM_PROMPT", "").strip()
         or DEFAULT_CHATBOT_SYSTEM_PROMPT
     )
+    selected_source_key = _normalize_source_key(str(context_payload.get("source") or ""))
+    mentioned_source_key = _normalize_source_key(_detect_source_from_text(payload.message) or "")
+    include_samsung_rules = _is_samsung_source(selected_source_key) or _is_samsung_source(mentioned_source_key)
+    hard_constraints = [
+        "Use the Analytics context block and conversation turns as primary evidence.",
+        "Never invent entities or numbers that are not supported by available context.",
+        "If key context is missing, state the gap and provide the closest defensible answer with explicit assumptions.",
+        "Give a direct answer first, then supporting evidence and implications.",
+        "Prefer precise metrics and avoid generic statements.",
+        "Do not re-introduce AI Sahyogi unless the user explicitly asks.",
+        "End with a complete final sentence and close any opened bracket.",
+        "For forecasting questions, estimate next-month values only from monthly history in context and mark it as directional.",
+        "Avoid repetitive templates across turns; vary phrasing while keeping the answer concise and factual.",
+        (
+            "Apply source-specific taxonomy and mappings. Do not use Samsung glossary, Samsung fixed price matrix, "
+            "or Samsung model-code mapping unless the selected source is Samsung."
+        ),
+    ]
+    if include_samsung_rules:
+        hard_constraints.extend(
+            [
+                "If Samsung model codes appear (A06/F15/A16/A17/F17/A26/A35/A36/F55/A56/S24/S25/Fold6/Fold7/Flip7), use the mapping provided in context to infer device category.",
+                "Use Samsung plan abbreviations consistently: ADLD=Accidental Damage and Liquid Damage, EW=Extended Warranty, SP/SPP=Screen Protection Plan, CPP=Comprehensive Protection Plan, Combo=ADLD + EW.",
+            ]
+        )
+    hard_constraints_text = "\n".join(
+        f"{idx}) {constraint}" for idx, constraint in enumerate(hard_constraints, start=1)
+    )
     system_prompt = (
         f"{base_system_prompt}\n\n"
         "Hard constraints:\n"
-        "1) Use the Analytics context block and conversation turns as primary evidence.\n"
-        "2) Never invent entities or numbers that are not supported by available context.\n"
-        "3) If key context is missing, state the gap and provide the closest defensible answer with explicit assumptions.\n"
-        "4) Give a direct answer first, then supporting evidence and implications.\n"
-        "5) Prefer precise metrics and avoid generic statements.\n"
-        "6) Do not re-introduce AI Sahyogi unless the user explicitly asks.\n"
-        "7) End with a complete final sentence and close any opened bracket.\n"
-        "8) For forecasting questions, estimate next-month values only from monthly history in context and mark it as directional.\n"
-        "9) Avoid repetitive templates across turns; vary phrasing while keeping the answer concise and factual.\n"
-        "10) If Samsung model codes appear (A06/F15/A16/A17/F17/A26/A35/A36/F55/A56/S24/S25/Fold6/Fold7/Flip7), use the mapping provided in context to infer device category.\n"
-        "11) Use Samsung plan abbreviations consistently: ADLD=Accidental Damage and Liquid Damage, EW=Extended Warranty, SP/SPP=Screen Protection Plan, CPP=Comprehensive Protection Plan, Combo=ADLD + EW.\n"
+        f"{hard_constraints_text}\n"
     )
     model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
     temperature = payload.temperature if payload.temperature is not None else _env_float("CHATBOT_TEMPERATURE", 0.15)

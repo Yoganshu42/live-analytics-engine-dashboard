@@ -1,18 +1,24 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Maximize2 } from "lucide-react"
+import { ChevronDown, Maximize2 } from "lucide-react"
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion"
 import {
+  Area,
+  AreaChart,
+  CartesianGrid,
   Cell,
+  Legend,
   Pie,
   PieChart,
   ResponsiveContainer,
   Sector,
   Tooltip as RechartsTooltip,
+  XAxis,
+  YAxis,
 } from "recharts"
 
-import GraphView, { prefetchGraphData } from "@/components/GraphView"
+import GraphView, { fetchGraphRows } from "@/components/GraphView"
 import DateRangePicker from "@/components/DateRangePicker"
 import type { GraphChartType, GraphDataSnapshot } from "@/components/GraphView"
 import {
@@ -54,24 +60,10 @@ type FullscreenGraph = {
   bucket?: "day" | "week" | "month"
   chartType?: GraphChartType
   tooltipMetricOverride?: string
+  sectionGroup?: string
+  sectionMode?: SectionMainChartMode
+  isComposite?: boolean
 } | null
-
-type NavigableGraph = {
-  group: string
-  sectionTitle: string
-  metric: string
-  dimension: string
-  bucket?: "day" | "week" | "month"
-  chartType?: GraphChartType
-  tooltipMetricOverride?: string
-}
-
-type GraphQueueItem = {
-  dimension: string
-  metric: string
-  bucket?: "day" | "week" | "month"
-  chartType?: GraphChartType
-}
 
 type SamsungOverviewCard = {
   id: string
@@ -89,6 +81,24 @@ type SamsungOverviewCard = {
   bucket?: "day" | "week" | "month"
   chartType: GraphChartType
   size: "main" | "small"
+  tooltipMetricOverride?: string
+}
+
+type PartnerSideCard = {
+  id: string
+  title: string
+  subtitle: string
+  dimension: string
+  metric:
+    | "gross_premium"
+    | "earned_premium"
+    | "zopper_earned_premium"
+    | "quantity"
+    | "claims"
+    | "net_claims"
+    | "loss_ratio"
+  bucket?: "day" | "week" | "month"
+  chartType: GraphChartType
   tooltipMetricOverride?: string
 }
 
@@ -136,6 +146,27 @@ type StateComparisonMix = {
   deviceMessage?: string
 }
 
+type RegionalCategoryDimension =
+  | "plan_category"
+  | "device_plan_category"
+  | "article_brand"
+  | "brand"
+  | "channel"
+  | "product_category"
+
+type RegionalCategoryDescriptor = {
+  dimension: RegionalCategoryDimension
+  label: string
+  sectionTitle: string
+  missingText: string
+}
+
+type RegionalMapFilterDescriptor = {
+  dimension: RegionalCategoryDimension
+  label: string
+  allLabel: string
+}
+
 type PieSizing = {
   height: number
   innerRadius: number
@@ -150,6 +181,14 @@ type StateComparisonLayout = {
 type StateComparisonRow = {
   state: string
   value: number
+}
+
+type SectionMergedRow = Record<string, string | number>
+
+type SectionMergedState = {
+  loading: boolean
+  error: string | null
+  rows: SectionMergedRow[]
 }
 
 const CITY_PIE_COLORS = [
@@ -298,6 +337,111 @@ const formatMetricValue = (value: number, metric: string) => {
   return `Rs ${value.toLocaleString()}`
 }
 
+const formatAxisCompact = (value: number, metric: string) => {
+  const m = metric.toLowerCase()
+  if (m.includes("loss_ratio")) return `${value.toFixed(1)}%`
+  if (m.includes("quantity") || m.includes("count")) {
+    return new Intl.NumberFormat("en-IN", {
+      notation: "compact",
+      maximumFractionDigits: 1,
+    }).format(value)
+  }
+  const abs = Math.abs(value)
+  if (abs >= 1e7) return `${(value / 1e7).toFixed(1)}Cr`
+  if (abs >= 1e5) return `${(value / 1e5).toFixed(1)}L`
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(1)}K`
+  return `${Math.round(value)}`
+}
+
+const normalizeMonthKey = (value: unknown) => {
+  const raw = String(value ?? "").trim()
+  if (!raw) return ""
+
+  if (/^\d{4}-\d{2}(-\d{2})?$/.test(raw)) {
+    return raw.length === 7 ? `${raw}-01` : raw.slice(0, 10)
+  }
+
+  const shortMatch = raw.match(/^([A-Za-z]{3})[-/\s](\d{2}|\d{4})$/)
+  if (shortMatch) {
+    const monthMap: Record<string, number> = {
+      jan: 1,
+      feb: 2,
+      mar: 3,
+      apr: 4,
+      may: 5,
+      jun: 6,
+      jul: 7,
+      aug: 8,
+      sep: 9,
+      oct: 10,
+      nov: 11,
+      dec: 12,
+    }
+    const month = monthMap[shortMatch[1].toLowerCase()]
+    if (month) {
+      const rawYear = Number(shortMatch[2])
+      const year = shortMatch[2].length === 2 ? 2000 + rawYear : rawYear
+      return `${year}-${String(month).padStart(2, "0")}-01`
+    }
+  }
+
+  const parsed = new Date(raw)
+  if (!Number.isNaN(parsed.getTime())) {
+    const year = parsed.getFullYear()
+    const month = String(parsed.getMonth() + 1).padStart(2, "0")
+    return `${year}-${month}-01`
+  }
+  return raw
+}
+
+const monthSortValue = (value: string) => {
+  const normalized = normalizeMonthKey(value)
+  const parsed = new Date(normalized).getTime()
+  if (!Number.isNaN(parsed)) return parsed
+  return Number.MAX_SAFE_INTEGER
+}
+
+const formatMonthLabel = (value: string) => {
+  const normalized = normalizeMonthKey(value)
+  const parsed = new Date(normalized)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString("en-US", {
+    month: "short",
+    year: "2-digit",
+  })
+}
+
+const LOG_PLOT_SUFFIX = "__log_plot"
+
+const isTemporalDimensionKey = (value: string) => {
+  const key = (value || "").trim().toLowerCase()
+  return key.includes("month") || key.includes("date")
+}
+
+const toLogPlotKey = (metric: string) => `${metric}${LOG_PLOT_SUFFIX}`
+
+const toOriginalMetricKey = (dataKey: string) => (
+  dataKey.endsWith(LOG_PLOT_SUFFIX)
+    ? dataKey.slice(0, -LOG_PLOT_SUFFIX.length)
+    : dataKey
+)
+
+const toLogSafeValue = (value: unknown) => {
+  const numeric = asNumber(value)
+  return numeric > 0 ? numeric : 1
+}
+
+const buildLogScaledRows = (
+  rows: SectionMergedRow[],
+  metrics: readonly string[]
+): SectionMergedRow[] => rows.map((row) => {
+  const next: SectionMergedRow = { ...row }
+  metrics.forEach((metric) => {
+    next[toLogPlotKey(metric)] = toLogSafeValue(row[metric])
+  })
+  return next
+})
+
 const buildInsightsRows = (snapshot: GraphDataSnapshot) => {
   const rows = snapshot.rows.slice(0, 80)
   const dimKey = snapshot.dimensionKey
@@ -317,7 +461,6 @@ const buildInsightsRows = (snapshot: GraphDataSnapshot) => {
   }))
 }
 
-/* ---- metrics ---- */
 const SALES_METRICS = [
   "earned_premium",
   "gross_premium",
@@ -332,7 +475,6 @@ const CLAIMS_METRICS = [
   "quantity",
 ]
 
-/* ---- section titles ---- */
 const GROUP_TITLES: Record<string, string> = {
   time: "Time Trend Desk",
   region: "Regional Signal Board",
@@ -340,10 +482,7 @@ const GROUP_TITLES: Record<string, string> = {
   device_category: "Device Segment Pulse",
 }
 
-/* ---- order of sections ---- */
 const GROUP_ORDER = ["time", "region", "category", "device_category"]
-const FAST_LOAD_COUNT = 4
-const DEFER_STEP_MS = 120
 
 const GODREJ_SALES_PRESETS: Preset[] = [
   {
@@ -398,6 +537,23 @@ const GODREJ_GROUP_TITLES: Record<string, string> = {
   product: "Product Category Pulse",
 }
 
+const METRIC_LINE_COLORS: Record<string, string> = {
+  gross_premium: "#2563eb",
+  earned_premium: "#06b6d4",
+  zopper_earned_premium: "#d97706",
+  quantity: "#8b5cf6",
+  claims: "#ef4444",
+  net_claims: "#f97316",
+  loss_ratio: "#14b8a6",
+}
+
+const SOURCE_FALLBACK_METRIC_KEYS: Record<string, string[]> = {
+  samsung_vs: ["samsung_vs"],
+  samsung_croma: ["samsung_croma"],
+  reliance: ["reliance", "reliance_resq"],
+  godrej: ["godrej"],
+}
+
 const getMetricLabel = (metric: string) => {
   const m = metric.toLowerCase()
   if (m.includes("zopper")) return "Zopper Earned Premium"
@@ -414,6 +570,7 @@ const getDimensionLabel = (dimension: string, source?: string) => {
   const d = dimension.toLowerCase()
   if (d.includes("month") || d.includes("date")) return "Month"
   if (d.includes("state")) return source === "godrej" ? "Region" : "State"
+  if (d === "article_brand" || d === "brand") return "Brand Category"
   if (d.includes("channel")) return "Channel"
   if (d.includes("product_category")) return "Product Category"
   if (d.includes("device_plan_category")) return source === "reliance" ? "Brand Category" : "Device Segment"
@@ -429,12 +586,111 @@ const getGraphTitle = (
   return `${getMetricLabel(metric)} by ${getDimensionLabel(dimension, source)}`
 }
 
+const getSourceMetricValue = (
+  row: Record<string, unknown>,
+  metric: string,
+  source: string
+) => {
+  const metricValue = row[metric]
+  if (metricValue != null) return asNumber(metricValue)
+
+  const fallbackKeys = SOURCE_FALLBACK_METRIC_KEYS[source] || []
+  for (const key of fallbackKeys) {
+    if (row[key] != null) return asNumber(row[key])
+  }
+  return 0
+}
+
 const toGraphKey = (
   dimension: string,
   metric: string,
   bucket?: "day" | "week" | "month",
   chartType?: GraphChartType
 ) => `${dimension}|${metric}|${bucket || ""}|${chartType || "bar"}`
+
+type SectionMainChartMode = "line" | "dense_heatmap" | "metric_strips"
+
+const SECTION_HEATMAP_MAX_ROWS = 16
+const SECTION_METRIC_STRIP_MAX_ROWS = 12
+
+const truncateCategoryLabel = (value: string, maxLength = 18) => {
+  const clean = String(value || "").trim()
+  if (!clean) return "Unknown"
+  if (clean.length <= maxLength) return clean
+  return `${clean.slice(0, Math.max(1, maxLength - 1))}...`
+}
+
+const isUnknownLikeLabel = (value: unknown) => {
+  const label = String(value ?? "").trim().toLowerCase()
+  return label === "" || label === "unknown" || label === "nan" || label === "none"
+}
+
+const toFilterOptionLabels = (rows: CategoryPercentageRow[]) => {
+  const seen = new Set<string>()
+  const labels: string[] = []
+  for (const row of normalizeCategoryRows(rows)) {
+    const label = String(row.label || "").trim()
+    if (!label || isUnknownLikeLabel(label)) continue
+    const normalized = label.toLowerCase()
+    if (seen.has(normalized)) continue
+    seen.add(normalized)
+    labels.push(label)
+  }
+  return labels
+}
+
+const hexToRgb = (hex: string) => {
+  const clean = hex.replace("#", "")
+  const normalized = clean.length === 3
+    ? clean.split("").map((ch) => `${ch}${ch}`).join("")
+    : clean
+  const num = Number.parseInt(normalized, 16)
+  if (Number.isNaN(num)) return { r: 37, g: 99, b: 235 }
+  return {
+    r: (num >> 16) & 255,
+    g: (num >> 8) & 255,
+    b: num & 255,
+  }
+}
+
+const mixColorWithWhite = (hex: string, amount: number) => {
+  const { r, g, b } = hexToRgb(hex)
+  const clamped = Math.max(0, Math.min(1, amount))
+  const mix = (channel: number) => Math.round(channel + (255 - channel) * clamped)
+  return `#${[mix(r), mix(g), mix(b)].map((v) => v.toString(16).padStart(2, "0")).join("")}`
+}
+
+const getHeatCellColor = (metric: string, intensity: number) => {
+  const base = METRIC_LINE_COLORS[metric] || "#2563eb"
+  const clamped = Math.max(0, Math.min(1, intensity))
+  return mixColorWithWhite(base, 0.9 - clamped * 0.68)
+}
+
+const getSectionMainChartMode = (
+  source: string,
+  dimension: string
+): SectionMainChartMode => {
+  const sourceKey = (source || "").trim().toLowerCase()
+  const dimKey = (dimension || "").trim().toLowerCase()
+
+  if (
+    (sourceKey === "godrej" && (dimKey === "channel" || dimKey === "plan_category"))
+    || (sourceKey === "reliance" && dimKey === "plan_category")
+    || ((sourceKey === "samsung_vs" || sourceKey === "samsung_croma") && dimKey === "plan_category")
+  ) {
+    return "dense_heatmap"
+  }
+
+  if (
+    ((sourceKey === "samsung_vs" || sourceKey === "samsung_croma") && dimKey === "device_plan_category")
+    || (sourceKey === "reliance" && (dimKey === "article_brand" || dimKey === "brand"))
+    || (sourceKey === "godrej" && dimKey === "product_category")
+  ) {
+    return "metric_strips"
+  }
+
+  return "line"
+}
 
 export default function MultiGraphView({
   source,
@@ -447,9 +703,11 @@ export default function MultiGraphView({
   onDateRangeApply,
 }: Props) {
   const prefersReducedMotion = useReducedMotion()
-  const isGodrej = source === "godrej"
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return window.innerWidth < 640
+  })
   const isSamsungOverview = source === "samsung"
-  const isGodrejClaims = isGodrej && datasetType === "claims"
   const samsungOverviewCards = useMemo<SamsungOverviewCard[]>(
     () => {
       if (datasetType === "claims") {
@@ -520,6 +778,8 @@ export default function MultiGraphView({
     },
     [datasetType]
   )
+  const isGodrej = source === "godrej"
+  const isGodrejClaims = isGodrej && datasetType === "claims"
   const activeGroupOrder = useMemo(
     () => (
       isGodrej
@@ -536,9 +796,91 @@ export default function MultiGraphView({
     ),
     [isGodrej, isGodrejClaims]
   )
+  const sideCardMetric = datasetType === "sales" ? "quantity" : "claims"
+  const partnerSideCards = useMemo<PartnerSideCard[]>(() => {
+    if (isSamsungOverview) return []
+
+    if (source === "godrej") {
+      return [
+        {
+          id: "godrej-channel-distribution",
+          title: datasetType === "sales" ? "Channel Distribution" : "Channel Claims Distribution",
+          subtitle:
+            datasetType === "sales"
+              ? "Share of total volume by channel."
+              : "Share of claims cost by channel.",
+          dimension: "channel",
+          metric: sideCardMetric,
+          chartType: "pie",
+        },
+        {
+          id: "godrej-product-distribution",
+          title: datasetType === "sales" ? "Product Distribution Radar" : "Product Claims Radar",
+          subtitle:
+            datasetType === "sales"
+              ? "Relative distribution across product categories."
+              : "Relative claims concentration by product category.",
+          dimension: "product_category",
+          metric: sideCardMetric,
+          chartType: "radar",
+        },
+      ]
+    }
+
+    if (source === "reliance") {
+      return [
+        {
+          id: "reliance-plan-distribution",
+          title: datasetType === "sales" ? "Plan Category Distribution" : "Plan Category Claims Split",
+          subtitle:
+            datasetType === "sales"
+              ? "Volume spread across plan categories."
+              : "Claims spread across plan categories.",
+          dimension: "plan_category",
+          metric: sideCardMetric,
+          chartType: "pie",
+        },
+        {
+          id: "reliance-brand-distribution",
+          title: datasetType === "sales" ? "Brand Distribution Radar" : "Brand Claims Radar",
+          subtitle:
+            datasetType === "sales"
+              ? "Brand-level distribution based on ARTICLE_BRAND."
+              : "Brand-level claims pattern.",
+          dimension: "article_brand",
+          metric: sideCardMetric,
+          chartType: "radar",
+        },
+      ]
+    }
+
+    return [
+      {
+        id: `${source}-plan-distribution`,
+        title: datasetType === "sales" ? "Plan Category Distribution" : "Plan Category Claims Split",
+        subtitle:
+          datasetType === "sales"
+            ? "Volume split across plan categories."
+            : "Claims split across plan categories.",
+        dimension: "plan_category",
+        metric: sideCardMetric,
+        chartType: "pie",
+      },
+      {
+        id: `${source}-device-distribution`,
+        title: datasetType === "sales" ? "Device Plan Category Radar" : "Device Plan Claims Radar",
+        subtitle:
+          datasetType === "sales"
+            ? "Relative distribution across device plan categories."
+            : "Relative claims concentration across device plan categories.",
+        dimension: "device_plan_category",
+        metric: sideCardMetric,
+        chartType: "radar",
+      },
+    ]
+  }, [datasetType, isSamsungOverview, sideCardMetric, source])
 
   const [fullscreen, setFullscreen] = useState<FullscreenGraph>(null)
-  const [zoom, setZoom] = useState(1)
   const [fullscreenFromDate, setFullscreenFromDate] = useState(fromDate || "")
   const [fullscreenToDate, setFullscreenToDate] = useState(toDate || "")
   const [openedGraphData, setOpenedGraphData] = useState<GraphDataSnapshot | null>(null)
@@ -551,13 +893,18 @@ export default function MultiGraphView({
   const [cityBreakdownLoading, setCityBreakdownLoading] = useState(false)
   const [cityBreakdownError, setCityBreakdownError] = useState<string | null>(null)
   const [activeCityName, setActiveCityName] = useState("")
-  const [compareDropdownOpen, setCompareDropdownOpen] = useState(false)
   const [selectedComparisonStates, setSelectedComparisonStates] = useState<string[]>([])
   const [stateComparisonMixRows, setStateComparisonMixRows] = useState<StateComparisonMix[]>([])
   const [stateComparisonMixLoading, setStateComparisonMixLoading] = useState(false)
   const [stateComparisonMixError, setStateComparisonMixError] = useState<string | null>(null)
+  const [regionalMapPrimaryValue, setRegionalMapPrimaryValue] = useState("")
+  const [regionalMapSecondaryValue, setRegionalMapSecondaryValue] = useState("")
+  const [regionalMapPrimaryOptions, setRegionalMapPrimaryOptions] = useState<string[]>([])
+  const [regionalMapSecondaryOptions, setRegionalMapSecondaryOptions] = useState<string[]>([])
+  const [regionalMapFiltersLoading, setRegionalMapFiltersLoading] = useState(false)
+  const [isRegionFilterCardCollapsed, setIsRegionFilterCardCollapsed] = useState(false)
+  const [sectionMergedMap, setSectionMergedMap] = useState<Record<string, SectionMergedState>>({})
   const lastInsightsKeyRef = useRef("")
-  const compareDropdownRef = useRef<HTMLDivElement | null>(null)
   const isStateFullscreen = Boolean(fullscreen && fullscreen.dimension.toLowerCase().includes("state"))
   const geographyLabel = "Region"
   const geographyLabelPlural = "Regions"
@@ -628,10 +975,206 @@ export default function MultiGraphView({
     () => getPieSizing(activeComparisonStates.length),
     [activeComparisonStates.length]
   )
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const onResize = () => setIsMobileViewport(window.innerWidth < 640)
+    window.addEventListener("resize", onResize)
+    return () => {
+      window.removeEventListener("resize", onResize)
+    }
+  }, [])
   const isBreakdownMetricSupported = useMemo(() => {
     const metricKey = (fullscreen?.metric || "").trim().toLowerCase()
     return metricKey !== "loss_ratio"
   }, [fullscreen])
+  useEffect(() => {
+    if (!isStateFullscreen) {
+      setIsRegionFilterCardCollapsed(false)
+    }
+  }, [isStateFullscreen])
+  const regionalCategoryConfig = useMemo(() => {
+    if (source === "reliance") {
+      return {
+        primary: {
+          dimension: "plan_category",
+          label: "Plan Category",
+          sectionTitle: "Plan Category Division",
+          missingText: "No plan-category data found.",
+        } as RegionalCategoryDescriptor,
+        secondary: {
+          dimension: "article_brand",
+          label: "Brand Category",
+          sectionTitle: "Brand Category Division",
+          missingText: "No brand-category data found.",
+        } as RegionalCategoryDescriptor,
+      }
+    }
+
+    if (source === "godrej") {
+      return {
+        primary: {
+          dimension: "channel",
+          label: "Channel Distribution",
+          sectionTitle: "Channel Distribution",
+          missingText: "No channel-distribution data found.",
+        } as RegionalCategoryDescriptor,
+        secondary: {
+          dimension: "product_category",
+          label: "Product Distribution",
+          sectionTitle: "Product Distribution",
+          missingText: "No product-distribution data found.",
+        } as RegionalCategoryDescriptor,
+      }
+    }
+
+    return {
+      primary: {
+        dimension: "plan_category",
+        label: "Plan Category",
+        sectionTitle: "Plan Category Division",
+        missingText: "No plan-category data found.",
+      } as RegionalCategoryDescriptor,
+      secondary: {
+        dimension: "device_plan_category",
+        label: "Device Plan Category",
+        sectionTitle: "Device Plan Category Division",
+        missingText: "No device-category data found.",
+      } as RegionalCategoryDescriptor,
+    }
+  }, [source])
+  const activeRegionalPrimaryDescriptor = regionalCategoryConfig.primary
+  const activeRegionalSecondaryDescriptor = regionalCategoryConfig.secondary
+  const regionalMapFilterConfig = useMemo(() => {
+    if (source === "godrej") {
+      return {
+        primary: {
+          dimension: "channel",
+          label: "Channel",
+          allLabel: "All Channels",
+        } as RegionalMapFilterDescriptor,
+        secondary: {
+          dimension: "product_category",
+          label: "Product",
+          allLabel: "All Products",
+        } as RegionalMapFilterDescriptor,
+      }
+    }
+    if (source === "reliance") {
+      return {
+        primary: {
+          dimension: "plan_category",
+          label: "Plan Category",
+          allLabel: "All Plan Categories",
+        } as RegionalMapFilterDescriptor,
+        secondary: {
+          dimension: "product_category",
+          label: "Product Category",
+          allLabel: "All Product Categories",
+        } as RegionalMapFilterDescriptor,
+      }
+    }
+    return {
+      primary: {
+        dimension: "plan_category",
+        label: "Plan Category",
+        allLabel: "All Plan Categories",
+      } as RegionalMapFilterDescriptor,
+      secondary: {
+        dimension: "device_plan_category",
+        label: "Device Plan Category",
+        allLabel: "All Device Plan Categories",
+      } as RegionalMapFilterDescriptor,
+    }
+  }, [source])
+  const activeRegionalMapFilters = useMemo(() => {
+    const filters: Array<{ dimension: RegionalCategoryDimension; values: string[] }> = []
+    if (regionalMapPrimaryValue) {
+      filters.push({
+        dimension: regionalMapFilterConfig.primary.dimension,
+        values: [regionalMapPrimaryValue],
+      })
+    }
+    if (regionalMapSecondaryValue) {
+      filters.push({
+        dimension: regionalMapFilterConfig.secondary.dimension,
+        values: [regionalMapSecondaryValue],
+      })
+    }
+    return filters
+  }, [
+    regionalMapPrimaryValue,
+    regionalMapSecondaryValue,
+    regionalMapFilterConfig.primary.dimension,
+    regionalMapFilterConfig.secondary.dimension,
+  ])
+  useEffect(() => {
+    if (!isStateFullscreen) {
+      setRegionalMapPrimaryValue("")
+      setRegionalMapSecondaryValue("")
+      return
+    }
+
+    let active = true
+    setRegionalMapFiltersLoading(true)
+
+    const baseParams = {
+      source,
+      dataset_type: datasetType,
+      metric: "quantity",
+      job_id: jobId || undefined,
+      from_date: fromDate || undefined,
+      to_date: toDate || undefined,
+      limit: 200,
+    } as const
+
+    Promise.all([
+      fetchCategoryPercentage({
+        ...baseParams,
+        dimension: regionalMapFilterConfig.primary.dimension,
+      }),
+      fetchCategoryPercentage({
+        ...baseParams,
+        dimension: regionalMapFilterConfig.secondary.dimension,
+      }),
+    ])
+      .then(([primaryRes, secondaryRes]) => {
+        if (!active) return
+        const nextPrimary = toFilterOptionLabels((primaryRes.rows as CategoryOption[]) || [])
+        const nextSecondary = toFilterOptionLabels((secondaryRes.rows as CategoryOption[]) || [])
+        setRegionalMapPrimaryOptions(nextPrimary)
+        setRegionalMapSecondaryOptions(nextSecondary)
+        setRegionalMapPrimaryValue((prev) => (
+          prev && nextPrimary.includes(prev) ? prev : ""
+        ))
+        setRegionalMapSecondaryValue((prev) => (
+          prev && nextSecondary.includes(prev) ? prev : ""
+        ))
+      })
+      .catch(() => {
+        if (!active) return
+        setRegionalMapPrimaryOptions([])
+        setRegionalMapSecondaryOptions([])
+        setRegionalMapPrimaryValue("")
+        setRegionalMapSecondaryValue("")
+      })
+      .finally(() => {
+        if (!active) return
+        setRegionalMapFiltersLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [
+    isStateFullscreen,
+    source,
+    datasetType,
+    jobId,
+    fromDate,
+    toDate,
+    regionalMapFilterConfig.primary.dimension,
+    regionalMapFilterConfig.secondary.dimension,
+  ])
   const getSectionTitle = useCallback((group: string) => {
     if (isGodrej) return GODREJ_GROUP_TITLES[group] || group
     if (group === "device_category" && source === "reliance") return "Brand Segment Pulse"
@@ -644,37 +1187,25 @@ export default function MultiGraphView({
         const presets = activePresets.filter((p: Preset) => p.group === group)
         const entries = presets
           .map((preset: Preset) => {
+            const resolvedDimension =
+              source === "reliance" && group === "device_category"
+                ? "article_brand"
+                : preset.dimension
             const visibleMetrics =
               datasetType === "sales"
                 ? preset.metrics.filter((m: string) => SALES_METRICS.includes(m))
                 : preset.metrics.filter((m: string) => CLAIMS_METRICS.includes(m))
-            return { preset, visibleMetrics }
+            return {
+              preset: { ...preset, dimension: resolvedDimension },
+              visibleMetrics,
+              mergedMetrics: visibleMetrics.slice(0, 4),
+            }
           })
           .filter(entry => entry.visibleMetrics.length > 0)
         return { group, entries }
       })
       .filter(section => section.entries.length > 0)
-  }, [isSamsungOverview, activeGroupOrder, activePresets, datasetType])
-
-  const graphQueue = useMemo<GraphQueueItem[]>(() => {
-    if (isSamsungOverview) {
-      return samsungOverviewCards.map((card) => ({
-        dimension: card.dimension,
-        metric: card.metric,
-        bucket: card.bucket,
-        chartType: card.chartType,
-      }))
-    }
-    return sectionConfigs.flatMap(section =>
-      section.entries.flatMap(entry =>
-        entry.visibleMetrics.map(metric => ({
-          dimension: entry.preset.dimension,
-          metric,
-          bucket: entry.preset.bucket,
-        }))
-      )
-    )
-  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs])
+  }, [isSamsungOverview, activeGroupOrder, activePresets, datasetType, source])
 
   const navigableGraphs = useMemo(() => {
     if (isSamsungOverview) {
@@ -688,24 +1219,18 @@ export default function MultiGraphView({
         tooltipMetricOverride: card.tooltipMetricOverride,
       }))
     }
-    const out: NavigableGraph[] = []
-    sectionConfigs.forEach(({ group, entries }) => {
-      const sectionTitle = getSectionTitle(group)
-      entries.forEach(({ preset, visibleMetrics }) => {
-        visibleMetrics.forEach((metric: string) => {
-          out.push({
-            group,
-            sectionTitle,
-            metric,
-            dimension: preset.dimension,
-            bucket: preset.bucket,
-            chartType: "bar",
-          })
-        })
-      })
-    })
-    return out
-  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs, getSectionTitle, datasetType])
+    const fallbackSection = sectionConfigs[0]?.group || "time"
+    const sectionTitle = getSectionTitle(fallbackSection)
+    return partnerSideCards.map((card) => ({
+      group: fallbackSection,
+      sectionTitle,
+      metric: card.metric,
+      dimension: card.dimension,
+      bucket: card.bucket,
+      chartType: card.chartType,
+      tooltipMetricOverride: card.tooltipMetricOverride,
+    }))
+  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs, getSectionTitle, partnerSideCards, datasetType])
 
   const fullscreenGraphIndex = useMemo(() => {
     if (!fullscreen) return -1
@@ -720,35 +1245,184 @@ export default function MultiGraphView({
   const canGoToPreviousGraph = fullscreenGraphIndex > 0
   const canGoToNextGraph =
     fullscreenGraphIndex >= 0 && fullscreenGraphIndex < navigableGraphs.length - 1
-
-  const graphOrderIndex = useMemo(() => {
-    const map = new Map<string, number>()
-    graphQueue.forEach((item, idx) => {
-      map.set(toGraphKey(item.dimension, item.metric, item.bucket, item.chartType), idx)
-    })
-    return map
-  }, [graphQueue])
+  const fullscreenGraphHeightClass = isStateFullscreen
+    ? "h-[72vh] sm:h-[74vh] lg:h-[76vh]"
+    : "h-[62vh] sm:h-[66vh] lg:h-[70vh]"
 
   useEffect(() => {
-    const topGraphs = graphQueue.slice(0, FAST_LOAD_COUNT)
-    if (!topGraphs.length) return
-    Promise.allSettled(
-      topGraphs.map(item =>
-        prefetchGraphData({
-          source,
-          dimension: item.dimension,
-          metric: item.metric,
-          datasetType,
-          bucket: item.bucket,
-          jobId,
-          from_date: fromDate,
-          to_date: toDate,
+    if (isSamsungOverview || !sectionConfigs.length) return
+
+    let active = true
+    const timer = setTimeout(() => {
+      if (!active) return
+
+      const loadingState: Record<string, SectionMergedState> = {}
+      sectionConfigs.forEach(({ group }) => {
+        loadingState[group] = { loading: true, error: null, rows: [] }
+      })
+      setSectionMergedMap((prev) => ({ ...prev, ...loadingState }))
+
+      Promise.all(
+        sectionConfigs.map(async ({ group, entries }): Promise<[string, SectionMergedState]> => {
+          const firstEntry = entries[0]
+          if (!firstEntry) {
+            return [group, { loading: false, error: "No section preset available.", rows: [] }]
+          }
+
+          const dimension = firstEntry.preset.dimension
+          const bucket = firstEntry.preset.bucket
+          const mergedMetrics = firstEntry.mergedMetrics
+          const dimKey = dimension.toLowerCase()
+
+          try {
+            const metricResponses = await Promise.allSettled(
+              mergedMetrics.map((metric) =>
+                fetchGraphRows({
+                  source,
+                  dimension,
+                  metric,
+                  datasetType,
+                  bucket,
+                  jobId,
+                  from_date: fromDate,
+                  to_date: toDate,
+                })
+              )
+            )
+
+            const merged = new Map<string, SectionMergedRow>()
+            let successCount = 0
+
+            metricResponses.forEach((response, idx) => {
+              const metric = mergedMetrics[idx]
+              if (response.status !== "fulfilled") return
+              successCount += 1
+
+              for (const row of response.value.data || []) {
+                const rawDim = row[dimKey]
+                const dimValue = String(rawDim ?? "").trim()
+                if (!dimValue) continue
+
+                if (!merged.has(dimValue)) {
+                  const seed: SectionMergedRow = { [dimKey]: dimValue }
+                  mergedMetrics.forEach((m) => {
+                    seed[m] = 0
+                  })
+                  merged.set(dimValue, seed)
+                }
+
+                const target = merged.get(dimValue)
+                if (!target) continue
+                target[metric] = Math.max(0, getSourceMetricValue(row, metric, source))
+              }
+            })
+
+            if (successCount === 0) {
+              return [group, { loading: false, error: "Unable to load section graph data.", rows: [] }]
+            }
+
+            const rows = Array.from(merged.values())
+            if (dimKey.includes("month") || dimKey.includes("date")) {
+              rows.sort((a, b) => monthSortValue(String(a[dimKey] || "")) - monthSortValue(String(b[dimKey] || "")))
+            } else {
+              rows.sort((a, b) => String(a[dimKey] || "").localeCompare(String(b[dimKey] || "")))
+            }
+
+            return [group, { loading: false, error: rows.length ? null : "No data available in selected range.", rows }]
+          } catch {
+            return [group, { loading: false, error: "Unable to load section graph data.", rows: [] }]
+          }
         })
       )
-    ).catch(() => {
-      // Prefetch failures should not block rendering.
+        .then((results) => {
+          if (!active) return
+          const nextState: Record<string, SectionMergedState> = {}
+          results.forEach(([group, state]) => {
+            nextState[group] = state
+          })
+          setSectionMergedMap((prev) => ({ ...prev, ...nextState }))
+        })
+    }, 0)
+
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [isSamsungOverview, sectionConfigs, source, datasetType, jobId, fromDate, toDate])
+
+  const fullscreenCompositeData = useMemo(() => {
+    if (!fullscreen?.isComposite || !fullscreen.sectionGroup) return null
+    const section = sectionConfigs.find((item) => item.group === fullscreen.sectionGroup)
+    const entry = section?.entries[0]
+    if (!section || !entry) return null
+
+    const dimKey = entry.preset.dimension || fullscreen.dimension
+    const mergedMetrics = entry.mergedMetrics || []
+    const sectionData = sectionMergedMap[section.group] || { loading: false, error: null, rows: [] }
+    const sectionChartMode = fullscreen.sectionMode || getSectionMainChartMode(source, dimKey)
+    const isRelianceBrandSection =
+      source === "reliance" && (dimKey === "article_brand" || dimKey === "brand")
+    const sectionRows = isRelianceBrandSection
+      ? sectionData.rows.filter((row) => !isUnknownLikeLabel(row[dimKey]))
+      : sectionData.rows
+    const dominantMetric = mergedMetrics[0] || (datasetType === "sales" ? "gross_premium" : "claims")
+    const rankedRows = sectionRows.length
+      ? [...sectionRows].sort((a, b) => asNumber(b[dominantMetric]) - asNumber(a[dominantMetric]))
+      : []
+    const displayRows = sectionChartMode === "line"
+      ? sectionRows
+      : rankedRows.slice(
+          0,
+          sectionChartMode === "dense_heatmap"
+            ? SECTION_HEATMAP_MAX_ROWS
+            : SECTION_METRIC_STRIP_MAX_ROWS
+        )
+    const metricMaxima = mergedMetrics.reduce((acc, metric) => {
+      acc[metric] = displayRows.reduce((max, row) => Math.max(max, asNumber(row[metric])), 0)
+      return acc
+    }, {} as Record<string, number>)
+
+    return {
+      group: section.group,
+      dimKey,
+      mergedMetrics,
+      sectionData,
+      sectionChartMode,
+      displayRows,
+      metricMaxima,
+    }
+  }, [fullscreen, sectionConfigs, sectionMergedMap, source, datasetType])
+
+  const fullscreenCompositeUseLogScale = false
+
+  const fullscreenCompositeChartRows = useMemo(() => (
+    fullscreenCompositeData?.displayRows || []
+  ), [fullscreenCompositeData])
+
+  useEffect(() => {
+    if (!fullscreen?.isComposite) return
+    if (
+      !fullscreenCompositeData
+      || fullscreenCompositeData.sectionData.loading
+      || Boolean(fullscreenCompositeData.sectionData.error)
+      || !fullscreenCompositeData.displayRows.length
+    ) {
+      setOpenedGraphData(null)
+      return
+    }
+
+    const fallbackMetric = datasetType === "sales" ? "gross_premium" : "claims"
+    const insightMetric = String(
+      fullscreen.metric || fullscreenCompositeData.mergedMetrics[0] || fallbackMetric
+    )
+
+    setOpenedGraphData({
+      rows: fullscreenCompositeData.displayRows,
+      measure: insightMetric,
+      dimensionKey: fullscreenCompositeData.dimKey,
+      compareMode: false,
     })
-  }, [graphQueue, source, datasetType, jobId, fromDate, toDate])
+  }, [fullscreen, fullscreenCompositeData, datasetType])
 
   useEffect(() => {
     if (!INSIGHTS_ENABLED) return
@@ -937,18 +1611,18 @@ export default function MultiGraphView({
             const [planRes, deviceRes] = await Promise.all([
               fetchCategoryPercentage({
                 ...baseParams,
-                dimension: "plan_category",
+                dimension: activeRegionalPrimaryDescriptor.dimension,
                 state: stateLabel,
               }),
               fetchCategoryPercentage({
                 ...baseParams,
-                dimension: "device_plan_category",
+                dimension: activeRegionalSecondaryDescriptor.dimension,
                 state: stateLabel,
               }),
             ])
 
-            const planRows = normalizeCategoryRows(planRes.rows || [])
-            const deviceRows = normalizeCategoryRows(deviceRes.rows || [])
+            const planRows = normalizeCategoryRows((planRes.rows as CategoryOption[]) || [])
+            const deviceRows = normalizeCategoryRows((deviceRes.rows as CategoryOption[]) || [])
 
             return {
               state: stateLabel,
@@ -957,10 +1631,10 @@ export default function MultiGraphView({
               deviceRows,
               planMessage: planRows.length
                 ? undefined
-                : (planRes.message || `No plan-category data for ${stateLabel}.`),
+                : ((planRes.message as string) || `No ${activeRegionalPrimaryDescriptor.label.toLowerCase()} data for ${stateLabel}.`),
               deviceMessage: deviceRows.length
                 ? undefined
-                : (deviceRes.message || `No device-category data for ${stateLabel}.`),
+                : ((deviceRes.message as string) || `No ${activeRegionalSecondaryDescriptor.label.toLowerCase()} data for ${stateLabel}.`),
             } satisfies StateComparisonMix
           } catch (err) {
             const message =
@@ -984,7 +1658,9 @@ export default function MultiGraphView({
           setStateComparisonMixRows(sortedRows)
 
           const noDataStates = sortedRows
-            .filter((row) => !row.planRows.length && !row.deviceRows.length)
+            .filter((row) => {
+              return !row.planRows.length && !row.deviceRows.length
+            })
             .map((row) => row.state)
           if (noDataStates.length) {
             setStateComparisonMixError(
@@ -1022,30 +1698,11 @@ export default function MultiGraphView({
     activeComparisonStates,
     stateMetricMap,
     isBreakdownMetricSupported,
+    activeRegionalPrimaryDescriptor.dimension,
+    activeRegionalPrimaryDescriptor.label,
+    activeRegionalSecondaryDescriptor.dimension,
+    activeRegionalSecondaryDescriptor.label,
   ])
-
-  useEffect(() => {
-    if (!compareDropdownOpen) return
-    const onPointerDown = (event: MouseEvent) => {
-      const target = event.target as Node | null
-      if (!target) return
-      if (compareDropdownRef.current && !compareDropdownRef.current.contains(target)) {
-        setCompareDropdownOpen(false)
-      }
-    }
-    document.addEventListener("mousedown", onPointerDown)
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown)
-    }
-  }, [compareDropdownOpen])
-
-  const toggleComparisonState = (stateLabel: string) => {
-    setSelectedComparisonStates((prev) => (
-      prev.includes(stateLabel)
-        ? prev.filter((state) => state !== stateLabel)
-        : [...prev, stateLabel]
-    ))
-  }
 
   const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
   const pickerMaxDate = useMemo(() => {
@@ -1094,7 +1751,6 @@ export default function MultiGraphView({
   }
 
   const handleOpenFullscreen = (item: NonNullable<FullscreenGraph>) => {
-    setZoom(1)
     setFullscreenFromDate(fromDate || "")
     setFullscreenToDate(toDate || "")
     setFullscreen(item)
@@ -1108,11 +1764,11 @@ export default function MultiGraphView({
     setCityBreakdownLoading(false)
     setCityBreakdownError(null)
     setActiveCityName("")
-    setCompareDropdownOpen(false)
     setSelectedComparisonStates([])
     setStateComparisonMixRows([])
     setStateComparisonMixLoading(false)
     setStateComparisonMixError(null)
+    setIsRegionFilterCardCollapsed(false)
     lastInsightsKeyRef.current = ""
   }
 
@@ -1128,7 +1784,6 @@ export default function MultiGraphView({
     setCityBreakdownLoading(false)
     setCityBreakdownError(null)
     setActiveCityName("")
-    setCompareDropdownOpen(false)
     setSelectedComparisonStates([])
     setStateComparisonMixRows([])
     setStateComparisonMixLoading(false)
@@ -1170,13 +1825,6 @@ export default function MultiGraphView({
     card: SamsungOverviewCard,
     layout: "main" | "small"
   ) => {
-    const queueKey = toGraphKey(card.dimension, card.metric, card.bucket, card.chartType)
-    const queueIndex = graphOrderIndex.get(queueKey) ?? 0
-    const fetchDelayMs =
-      queueIndex < FAST_LOAD_COUNT
-        ? 0
-        : Math.min((queueIndex - FAST_LOAD_COUNT + 1) * DEFER_STEP_MS, 1400)
-
     return (
       <motion.div
         key={card.id}
@@ -1197,37 +1845,102 @@ export default function MultiGraphView({
                 {card.subtitle}
               </div>
             </div>
-            <button
-              className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
-              onClick={() => {
-                handleOpenFullscreen({
-                  metric: card.metric,
-                  dimension: card.dimension,
-                  bucket: card.bucket,
-                  chartType: card.chartType,
-                  tooltipMetricOverride: card.tooltipMetricOverride,
-                })
-              }}
-            >
-              <Maximize2 size={16} />
-            </button>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
+                onClick={() => {
+                  handleOpenFullscreen({
+                    metric: card.metric,
+                    dimension: card.dimension,
+                    bucket: card.bucket,
+                    chartType: card.chartType,
+                    tooltipMetricOverride: card.tooltipMetricOverride,
+                  })
+                }}
+              >
+                <Maximize2 size={16} />
+              </button>
+            </div>
           </div>
 
-          <GraphView
-            source={source}
-            dimension={card.dimension}
-            metric={card.metric}
-            datasetType={datasetType}
-            bucket={card.bucket}
-            jobId={jobId}
-            fromDate={fromDate}
-            toDate={toDate}
-            fetchDelayMs={fetchDelayMs}
-            deferUntilVisible={queueIndex >= FAST_LOAD_COUNT}
-            chartType={card.chartType}
-            tooltipMetricOverride={card.tooltipMetricOverride}
-            heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
-          />
+          <div>
+            <GraphView
+              source={source}
+              dimension={card.dimension}
+              metric={card.metric}
+              datasetType={datasetType}
+              bucket={card.bucket}
+              jobId={jobId}
+              fromDate={fromDate}
+              toDate={toDate}
+              chartType={card.chartType}
+              tooltipMetricOverride={card.tooltipMetricOverride}
+              heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
+            />
+          </div>
+        </div>
+      </motion.div>
+    )
+  }
+
+  const renderPartnerSideCard = (
+    card: PartnerSideCard,
+    keyPrefix: string
+  ) => {
+    return (
+      <motion.div
+        key={`${keyPrefix}-${card.id}`}
+        initial={prefersReducedMotion ? false : { opacity: 0, y: 16 }}
+        animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
+        transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
+        whileHover={prefersReducedMotion ? undefined : { y: -4 }}
+        className="smooth-surface relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-3 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-4"
+      >
+        <div className="pointer-events-none absolute -top-16 right-[-58px] h-28 w-28 rounded-full bg-cyan-100/60 blur-2xl" />
+        <div className="relative">
+          <div className="mb-2 flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-bold leading-snug text-slate-800">
+                {card.title}
+              </div>
+            </div>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
+                onClick={() => {
+                  handleOpenFullscreen({
+                    metric: card.metric,
+                    dimension: card.dimension,
+                    bucket: card.bucket,
+                    chartType: card.chartType,
+                    tooltipMetricOverride: card.tooltipMetricOverride,
+                  })
+                }}
+              >
+                <Maximize2 size={16} />
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <GraphView
+              source={source}
+              dimension={card.dimension}
+              metric={card.metric}
+              datasetType={datasetType}
+              bucket={card.bucket}
+              jobId={jobId}
+              fromDate={fromDate}
+              toDate={toDate}
+              chartType={card.chartType}
+              tooltipMetricOverride={card.tooltipMetricOverride}
+              heightClassName={
+                card.chartType === "pie"
+                  ? "h-[230px] sm:h-[260px]"
+                  : "h-[180px] sm:h-[210px]"
+              }
+            />
+          </div>
         </div>
       </motion.div>
     )
@@ -1242,12 +1955,70 @@ export default function MultiGraphView({
             .map((card) => renderSamsungCard(card, "main"))}
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {samsungOverviewCards
-              .filter((card) => card.size === "small")
-              .map((card) => renderSamsungCard(card, "small"))}
+            .filter((card) => card.size === "small")
+            .map((card) => renderSamsungCard(card, "small"))}
           </div>
         </div>
-      ) : sectionConfigs.map(({ group, entries }) => {
+      ) : (
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(300px,1fr)] xl:items-start">
+          <div className="space-y-2">
+            {sectionConfigs.map(({ group, entries }) => {
         const sectionTitle = getSectionTitle(group)
+        const entry = entries[0]
+        const dimKey = entry?.preset.dimension || "month"
+        const mergedMetrics = entry?.mergedMetrics || []
+        const sectionData = sectionMergedMap[group] || { loading: false, error: null, rows: [] }
+        const isRegionalSection = group === "region"
+        const sectionChartMode = isRegionalSection
+          ? "line"
+          : getSectionMainChartMode(source, dimKey)
+        const isRelianceBrandSection =
+          source === "reliance" && (dimKey === "article_brand" || dimKey === "brand")
+        const sectionRows = isRelianceBrandSection
+          ? sectionData.rows.filter((row) => !isUnknownLikeLabel(row[dimKey]))
+          : sectionData.rows
+        const dominantMetric = mergedMetrics[0] || (datasetType === "sales" ? "gross_premium" : "claims")
+        const rankedSectionRows = sectionRows.length
+          ? [...sectionRows].sort((a, b) => (
+              asNumber(b[dominantMetric]) - asNumber(a[dominantMetric])
+            ))
+          : []
+        const sectionDisplayRows = sectionChartMode === "line"
+          ? sectionRows
+          : rankedSectionRows.slice(
+              0,
+              sectionChartMode === "dense_heatmap"
+                ? SECTION_HEATMAP_MAX_ROWS
+                : SECTION_METRIC_STRIP_MAX_ROWS
+            )
+        const sectionUseLogScale = false
+        const sectionChartRows = sectionDisplayRows
+        const sectionMetricMaxima = mergedMetrics.reduce((acc, metric) => {
+          acc[metric] = sectionDisplayRows.reduce(
+            (max, row) => Math.max(max, asNumber(row[metric])),
+            0
+          )
+          return acc
+        }, {} as Record<string, number>)
+        const mainChartTitle = isRegionalSection
+          ? `${sectionTitle} Geographic Heatmap`
+          : sectionChartMode === "dense_heatmap"
+            ? `${sectionTitle} Dense Heatmap`
+            : sectionChartMode === "metric_strips"
+              ? `${sectionTitle} 1D Heatmaps`
+              : `${sectionTitle} Combined Trend`
+        const mainChartSubtitle = isRegionalSection
+          ? "Click on a legend to highlight the state on map, and click a state on map to highlight it in legends."
+          : sectionChartMode === "dense_heatmap"
+            ? `Dense heatmap of ${mergedMetrics.map(getMetricLabel).join(", ")} by ${getDimensionLabel(dimKey, source)}. Darker cells indicate stronger contribution within each metric.`
+            : sectionChartMode === "metric_strips"
+              ? `One-dimensional heatmaps by metric (${mergedMetrics.map(getMetricLabel).join(", ")}). Each strip shows category intensity for that metric.`
+              : `Merged view of ${mergedMetrics.map(getMetricLabel).join(", ")} by ${getDimensionLabel(dimKey, source)}.`
+        const expandedChartType = isRegionalSection
+          ? "india_map"
+          : sectionChartMode === "line"
+            ? "line"
+            : "bar"
         return (
           <div
             key={group}
@@ -1263,9 +2034,11 @@ export default function MultiGraphView({
                     {sectionTitle}
                   </h2>
                   <p className="mt-1 text-xs text-slate-500">
-                    {datasetType === "sales"
-                      ? "Track premium movement and volume contribution across this lens."
-                      : "Track claims cost, ratio pressure, and volume contribution across this lens."}
+                    {isRegionalSection
+                      ? `State and UT heatmap based on ${getMetricLabel(sideCardMetric)}.`
+                      : datasetType === "sales"
+                        ? "Combined 4-metric trend: Gross, Earned, Zopper Earned Premium, and Quantity."
+                        : "Combined 4-metric trend: Claims, Net Claims, Loss Ratio, and Quantity."}
                   </p>
                 </div>
                 <div className="rounded-full border border-slate-200 bg-white/90 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
@@ -1273,91 +2046,301 @@ export default function MultiGraphView({
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-                {entries.map(({ preset, visibleMetrics }) => {
-                  return visibleMetrics.map((metric: string) => {
-                    const queueKey = toGraphKey(preset.dimension, metric, preset.bucket, "bar")
-                    const queueIndex = graphOrderIndex.get(queueKey) ?? 0
-                    const fetchDelayMs =
-                      queueIndex < FAST_LOAD_COUNT
-                        ? 0
-                        : Math.min((queueIndex - FAST_LOAD_COUNT + 1) * DEFER_STEP_MS, 1400)
-                    const hasPrevGraph = queueIndex > 0
-                    const hasNextGraph = queueIndex < navigableGraphs.length - 1
-                    return (
-                    <motion.div
-                      key={`${preset.dimension}-${metric}`}
-                      initial={prefersReducedMotion ? false : { opacity: 0, y: 16 }}
-                      animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
-                      transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
-                      whileHover={prefersReducedMotion ? undefined : { y: -6, scale: 1.01 }}
-                      className="smooth-surface group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-3 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-4"
-                    >
-                      <div className="pointer-events-none absolute -top-14 right-[-52px] h-32 w-32 rounded-full bg-cyan-100/60 blur-2xl" />
-                      <div className="relative">
-                        <div className="mb-3 flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="text-sm font-bold leading-snug text-slate-800">
-                              {getGraphTitle(metric, preset.dimension, source)}
-                            </div>
-                            <div className="mt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">
-                              {getDimensionLabel(preset.dimension, source)}
-                            </div>
-                          </div>
-
-                          <button
-                            className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
-                            onClick={() => {
-                              handleOpenFullscreen({
-                                metric,
-                                dimension: preset.dimension,
-                                bucket: preset.bucket,
-                                chartType: "bar",
-                              })
-                            }}
-                          >
-                            <Maximize2 size={16} />
-                          </button>
+              <div className="grid grid-cols-1 gap-4">
+                <motion.div
+                  initial={prefersReducedMotion ? false : { opacity: 0, y: 16 }}
+                  animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
+                  transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
+                  className="smooth-surface relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm sm:p-5"
+                >
+                  <div className="pointer-events-none absolute -top-16 right-[-58px] h-32 w-32 rounded-full bg-cyan-100/60 blur-2xl" />
+                  <div className="relative">
+                    <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-bold leading-snug text-slate-800 sm:text-base">
+                          {mainChartTitle}
                         </div>
-                        <div className="mb-3 flex items-center gap-2">
-                          <button
-                            className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                            disabled={!hasPrevGraph}
-                            onClick={() => handleTraverseGraphFromIndex(queueIndex, -1)}
-                          >
-                            Previous
-                          </button>
-                          <button
-                            className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                            disabled={!hasNextGraph}
-                            onClick={() => handleTraverseGraphFromIndex(queueIndex, 1)}
-                          >
-                            Next
-                          </button>
+                        <div className="mt-1 text-[11px] text-slate-500">
+                          {mainChartSubtitle}
                         </div>
-
-                    <GraphView
-                      source={source}
-                      dimension={preset.dimension}
-                      metric={metric}
-                      datasetType={datasetType}
-                      bucket={preset.bucket}
-                      jobId={jobId}
-                      fromDate={fromDate}
-                      toDate={toDate}
-                      fetchDelayMs={fetchDelayMs}
-                      deferUntilVisible={queueIndex >= FAST_LOAD_COUNT}
-                    />
                       </div>
-                    </motion.div>
-                    )
-                  })
-                })}
+                      <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+                        <button
+                          className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
+                          onClick={() => {
+                            const expandedMetric = (
+                              isRegionalSection
+                                ? sideCardMetric
+                                : (mergedMetrics[0] || sideCardMetric)
+                            ) as NonNullable<FullscreenGraph>["metric"]
+                            handleOpenFullscreen({
+                              metric: expandedMetric,
+                              dimension: isRegionalSection ? "state" : dimKey,
+                              bucket: entry?.preset.bucket,
+                              chartType: expandedChartType,
+                              sectionGroup: group,
+                              sectionMode: sectionChartMode,
+                              isComposite: !isRegionalSection,
+                            })
+                          }}
+                        >
+                          <Maximize2 size={16} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="h-[340px] sm:h-[410px]">
+                      {isRegionalSection ? (
+                        <GraphView
+                          source={source}
+                          dimension="state"
+                          metric={sideCardMetric}
+                          datasetType={datasetType}
+                          bucket={entry?.preset.bucket}
+                          jobId={jobId}
+                          fromDate={fromDate}
+                          toDate={toDate}
+                          chartType="india_map"
+                          heightClassName="h-full"
+                        />
+                      ) : sectionData.loading ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                          Loading section view...
+                        </div>
+                      ) : sectionData.error ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                          {sectionData.error}
+                        </div>
+                      ) : !sectionDisplayRows.length ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                          No data available for this section.
+                        </div>
+                      ) : sectionChartMode === "dense_heatmap" ? (
+                        <div className="h-full overflow-auto pr-1">
+                          <div className="mb-2 flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            <span>{`Top ${sectionDisplayRows.length} ${getDimensionLabel(dimKey, source)}`}</span>
+                            <span>Darker = Higher Within Metric</span>
+                          </div>
+                          <table className="w-full min-w-[620px] border-separate border-spacing-y-1.5 text-[11px]">
+                            <thead>
+                              <tr>
+                                <th className="px-2 py-1 text-left font-bold uppercase tracking-[0.12em] text-slate-500">
+                                  {getDimensionLabel(dimKey, source)}
+                                </th>
+                                {mergedMetrics.map((metric) => (
+                                  <th
+                                    key={`${group}-heat-head-${metric}`}
+                                    className="px-2 py-1 text-right font-bold uppercase tracking-[0.12em] text-slate-500"
+                                  >
+                                    {getMetricLabel(metric)}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {sectionDisplayRows.map((row, rowIndex) => {
+                                const label = String(row[dimKey] ?? "Unknown").trim() || "Unknown"
+                                return (
+                                  <tr key={`${group}-heat-${label}-${rowIndex}`}>
+                                    <td className="rounded-md bg-slate-100/70 px-2 py-2 font-semibold text-slate-700">
+                                      <span title={label}>{truncateCategoryLabel(label, 30)}</span>
+                                    </td>
+                                    {mergedMetrics.map((metric) => {
+                                      const value = asNumber(row[metric])
+                                      const maxValue = sectionMetricMaxima[metric] || 0
+                                      const intensity = maxValue > 0 ? value / maxValue : 0
+                                      return (
+                                        <td
+                                          key={`${group}-heat-${label}-${metric}`}
+                                          className="rounded-md px-2 py-2 text-right font-semibold text-slate-800"
+                                          style={{
+                                            backgroundColor: getHeatCellColor(metric, intensity),
+                                          }}
+                                          title={`${getMetricLabel(metric)}: ${formatMetricValue(value, metric)}`}
+                                        >
+                                          {formatMetricValue(value, metric)}
+                                        </td>
+                                      )
+                                    })}
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : sectionChartMode === "metric_strips" ? (
+                        <div className="h-full overflow-auto pr-1">
+                          <div className="mb-2 flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            <span>{`Top ${sectionDisplayRows.length} ${getDimensionLabel(dimKey, source)}`}</span>
+                            <span>Darker = Higher Within Metric</span>
+                          </div>
+                          <div className="space-y-2.5">
+                            {mergedMetrics.map((metric) => {
+                              const metricMax = sectionMetricMaxima[metric] || 0
+                              return (
+                                <div key={`${group}-strip-${metric}`} className="rounded-lg border border-slate-200/80 bg-white/80 p-2">
+                                  <div className="mb-1 flex items-center justify-between text-[11px] font-semibold text-slate-700">
+                                    <span>{getMetricLabel(metric)}</span>
+                                    <span className="text-[10px] text-slate-500">
+                                      Peak: {formatMetricValue(metricMax, metric)}
+                                    </span>
+                                  </div>
+                                  <div className="flex gap-1 overflow-x-auto pb-1">
+                                    {sectionDisplayRows.map((row, rowIndex) => {
+                                      const label = String(row[dimKey] ?? "Unknown").trim() || "Unknown"
+                                      const value = asNumber(row[metric])
+                                      const intensity = metricMax > 0 ? value / metricMax : 0
+                                      return (
+                                        <div
+                                          key={`${group}-strip-${metric}-${label}-${rowIndex}`}
+                                          className="min-w-[112px] rounded-md px-2 py-1.5 text-slate-800"
+                                          style={{ backgroundColor: getHeatCellColor(metric, intensity) }}
+                                          title={`${label} | ${getMetricLabel(metric)}: ${formatMetricValue(value, metric)}`}
+                                        >
+                                          <div className="truncate text-[10px] font-semibold">
+                                            {truncateCategoryLabel(label, 18)}
+                                          </div>
+                                          <div className="mt-0.5 text-[10px] font-medium text-slate-700">
+                                            {formatAxisCompact(value, metric)}
+                                          </div>
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      ) : (
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart
+                            data={sectionChartRows}
+                            margin={
+                              isMobileViewport
+                                ? { top: 8, right: 6, left: 2, bottom: 4 }
+                                : { top: 12, right: 12, left: 18, bottom: 8 }
+                            }
+                          >
+                            <defs>
+                              {mergedMetrics.map((metric) => {
+                                const color = METRIC_LINE_COLORS[metric] || "#2563eb"
+                                const gid = `section-${group}-${metric}`
+                                return (
+                                  <linearGradient key={gid} id={gid} x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor={color} stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor={color} stopOpacity={0.02} />
+                                  </linearGradient>
+                                )
+                              })}
+                            </defs>
+                            <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
+                            <XAxis
+                              dataKey={dimKey}
+                              tick={{ fontSize: isMobileViewport ? 10 : 11 }}
+                              minTickGap={isMobileViewport ? 8 : 12}
+                              tickFormatter={(value) =>
+                                isTemporalDimensionKey(dimKey)
+                                  ? formatMonthLabel(String(value || ""))
+                                  : String(value || "")
+                              }
+                            />
+                            <YAxis
+                              scale="auto"
+                              domain={[0, "auto"]}
+                              width={isMobileViewport ? 52 : 76}
+                              tickMargin={isMobileViewport ? 4 : 6}
+                              tick={{ fontSize: isMobileViewport ? 10 : 11 }}
+                              tickFormatter={(value) => formatAxisCompact(asNumber(value), mergedMetrics[0] || "quantity")}
+                            />
+                            <RechartsTooltip
+                              allowEscapeViewBox={{ x: false, y: false }}
+                              wrapperStyle={{
+                                maxWidth: isMobileViewport ? "calc(100vw - 40px)" : "320px",
+                                zIndex: 30,
+                              }}
+                              content={({ active, payload, label }) => {
+                                if (!active || !payload?.length) return null
+                                return (
+                                  <div className={`rounded-lg border bg-white shadow ${isMobileViewport ? "p-2.5" : "p-3"}`}>
+                                    <p className={`${isMobileViewport ? "text-[11px]" : "text-xs"} font-bold text-gray-400`}>
+                                      {isTemporalDimensionKey(dimKey)
+                                        ? formatMonthLabel(String(label || ""))
+                                        : String(label || "")}
+                                    </p>
+                                    <div className={`${isMobileViewport ? "mt-1 space-y-0.5" : "mt-1 space-y-1"}`}>
+                                      {payload.map((entry) => {
+                                        const rawDataKey = String(entry.dataKey || "")
+                                        const metric = toOriginalMetricKey(rawDataKey)
+                                        const rawValue = asNumber(entry.value)
+                                        return (
+                                          <div
+                                            key={rawDataKey}
+                                            className={`flex items-center gap-2 font-semibold ${isMobileViewport ? "text-[11px]" : "text-sm"}`}
+                                          >
+                                            <span
+                                              className="inline-block h-2.5 w-2.5 rounded-full"
+                                              style={{ backgroundColor: entry.color || "#64748b" }}
+                                            />
+                                            <span className="text-slate-700">
+                                              {getMetricLabel(metric)}
+                                            </span>
+                                            <span className="ml-auto text-slate-900">
+                                              {formatMetricValue(rawValue, metric)}
+                                            </span>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+                                )
+                              }}
+                            />
+                            <Legend
+                              verticalAlign="top"
+                              align="left"
+                              wrapperStyle={{ fontSize: "11px", paddingBottom: "8px", color: "#475569" }}
+                              formatter={(value) => getMetricLabel(String(value || ""))}
+                            />
+                            {mergedMetrics.map((metric) => {
+                              const color = METRIC_LINE_COLORS[metric] || "#2563eb"
+                              const gid = `section-${group}-${metric}`
+                              return (
+                                <Area
+                                  key={`${group}-${metric}`}
+                                  type="monotone"
+                                  dataKey={metric}
+                                  name={metric}
+                                  stroke={color}
+                                  fill={`url(#${gid})`}
+                                  strokeWidth={2.2}
+                                  fillOpacity={1}
+                                  isAnimationActive={!prefersReducedMotion}
+                                  dot={false}
+                                />
+                              )
+                            })}
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      )}
+                    </div>
+                  </div>
+                </motion.div>
               </div>
             </div>
           </div>
         )
       })}
+          </div>
+          {!!partnerSideCards.length && (
+            <div className="xl:sticky xl:top-4">
+              <div className="grid grid-cols-1 gap-3">
+                {partnerSideCards.map((card) => renderPartnerSideCard(card, "frozen-side-rail"))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* FULLSCREEN */}
       <AnimatePresence>
@@ -1407,127 +2390,425 @@ export default function MultiGraphView({
                   </div>
                 </div>
 
-                <div className="sticky top-[116px] z-10 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur sm:top-[73px] sm:px-4 md:px-6">
-                  <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
+                <div className="sticky top-[116px] z-30 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur sm:top-[73px] sm:px-4 md:px-6">
+                  <div className="flex items-center justify-between gap-3">
                     <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
                       Date Window
                     </div>
-                    <div className="w-full max-w-[360px]">
-                      <DateRangePicker
-                        draftFromDate={fullscreenFromDate}
-                        draftToDate={fullscreenToDate}
-                        minDate={resetFromDate || fromDate || undefined}
-                        maxDate={pickerMaxDate}
-                        compact
-                        onDraftChange={(from, to) => {
-                          setFullscreenFromDate(from)
-                          setFullscreenToDate(to)
-                        }}
-                        onApply={handleApplyFullscreenDateRange}
-                        onReset={handleResetFullscreenDateRange}
-                      />
-                    </div>
-                    <div className="flex w-full flex-wrap items-center gap-2 sm:ml-auto sm:w-auto sm:justify-end">
-                      {isStateFullscreen && (
-                        <div className="flex w-full items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 sm:w-auto">
-                          <span className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
-                            {`Focus ${geographyLabel}`}
-                          </span>
-                          <select
-                            value={activeSelectedState}
-                            onChange={(e) => {
-                              setSelectedState(e.target.value)
-                              setActiveCityName("")
-                            }}
-                            className="w-full min-w-0 rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700 sm:min-w-[180px]"
-                          >
-                            <option value="">{`Choose ${geographyLabel}`}</option>
-                            {stateOptions.map((stateOption) => (
-                              <option key={stateOption} value={stateOption}>
-                                {stateOption}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
                     {isStateFullscreen && (
-                      <div ref={compareDropdownRef} className="relative">
-                        <button
-                          className="text-xs font-bold px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
-                          onClick={() => setCompareDropdownOpen((open) => !open)}
-                        >
-                          {`Compare ${geographyLabelPlural} (${activeComparisonStates.length})`}
-                        </button>
-                        {compareDropdownOpen && (
-                          <div className="absolute right-0 z-30 mt-2 w-[min(18rem,calc(100vw-2.5rem))] rounded-xl border border-slate-200 bg-white p-3 shadow-lg">
-                            <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400 mb-2">
-                              {`Pick ${geographyLabelPlural} To Compare`}
+                      <button
+                        type="button"
+                        onClick={() => setIsRegionFilterCardCollapsed((prev) => !prev)}
+                        className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[10px] font-black uppercase tracking-[0.12em] text-slate-600 hover:bg-slate-50"
+                        aria-expanded={!isRegionFilterCardCollapsed}
+                        aria-label={isRegionFilterCardCollapsed ? "Expand region filters" : "Collapse region filters"}
+                      >
+                        <ChevronDown
+                          size={13}
+                          className={`transition-transform ${isRegionFilterCardCollapsed ? "-rotate-90" : ""}`}
+                        />
+                        {isRegionFilterCardCollapsed ? "Expand Filters" : "Collapse Filters"}
+                      </button>
+                    )}
+                  </div>
+                  {(!isStateFullscreen || !isRegionFilterCardCollapsed) && (
+                    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-5">
+                      <div className="w-full max-w-[360px] xl:max-w-none">
+                        <DateRangePicker
+                          draftFromDate={fullscreenFromDate}
+                          draftToDate={fullscreenToDate}
+                          minDate={resetFromDate || fromDate || undefined}
+                          maxDate={pickerMaxDate}
+                          compact
+                          align="left"
+                          onDraftChange={(from, to) => {
+                            setFullscreenFromDate(from)
+                            setFullscreenToDate(to)
+                          }}
+                          onApply={handleApplyFullscreenDateRange}
+                          onReset={handleResetFullscreenDateRange}
+                        />
+                      </div>
+
+                      {isStateFullscreen && (
+                        <>
+                          <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                            <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                              {`Focus ${geographyLabel}`}
                             </div>
-                            <div className="max-h-56 overflow-y-auto space-y-2 pr-1">
-                              {stateOptions.map((stateLabel) => (
-                                <label key={stateLabel} className="flex items-center gap-2 text-xs text-slate-700">
-                                  <input
-                                    type="checkbox"
-                                    checked={activeComparisonStates.includes(stateLabel)}
-                                    onChange={() => toggleComparisonState(stateLabel)}
-                                  />
-                                  <span>{stateLabel}</span>
-                                </label>
+                            <select
+                              value={activeSelectedState}
+                              onChange={(e) => {
+                                setSelectedState(e.target.value)
+                                setActiveCityName("")
+                              }}
+                              className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
+                            >
+                              <option value="">{`Choose ${geographyLabel}`}</option>
+                              {stateOptions.map((stateOption) => (
+                                <option key={stateOption} value={stateOption}>
+                                  {stateOption}
+                                </option>
                               ))}
+                            </select>
+                          </div>
+
+                          <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                            <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                              {regionalMapFilterConfig.primary.label}
                             </div>
-                            <div className="mt-3 flex items-center justify-between gap-2">
-                              <button
-                                className="text-[11px] font-semibold text-slate-500 hover:text-slate-700"
-                                onClick={() => setSelectedComparisonStates([])}
+                            <select
+                              value={regionalMapPrimaryValue}
+                              onChange={(e) => setRegionalMapPrimaryValue(e.target.value)}
+                              className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
+                            >
+                              <option value="">{regionalMapFilterConfig.primary.allLabel}</option>
+                              {regionalMapPrimaryOptions.map((option) => (
+                                <option
+                                  key={`regional-map-primary-value-${option}`}
+                                  value={option}
+                                >
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                            <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                              {regionalMapFilterConfig.secondary.label}
+                            </div>
+                            <select
+                              value={regionalMapSecondaryValue}
+                              onChange={(e) => setRegionalMapSecondaryValue(e.target.value)}
+                              className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
+                            >
+                              <option value="">{regionalMapFilterConfig.secondary.allLabel}</option>
+                              {regionalMapSecondaryOptions.map((option) => (
+                                <option
+                                  key={`regional-map-secondary-value-${option}`}
+                                  value={option}
+                                >
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                            <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                              {`Compare ${geographyLabelPlural}`}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <select
+                                value=""
+                                onChange={(event) => {
+                                  const picked = event.target.value
+                                  if (!picked) return
+                                  setSelectedComparisonStates((prev) => (
+                                    prev.includes(picked)
+                                      ? prev.filter((state) => state !== picked)
+                                      : [...prev, picked]
+                                  ))
+                                }}
+                                className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
                               >
-                                Clear
-                              </button>
-                              <button
-                                className="text-[11px] font-semibold text-slate-500 hover:text-slate-700"
-                                onClick={() => setCompareDropdownOpen(false)}
-                              >
-                                Done
-                              </button>
+                                <option value="">
+                                  {`Select ${geographyLabel} (${activeComparisonStates.length})`}
+                                </option>
+                                {stateOptions.map((stateLabel) => (
+                                  <option key={`state-compare-option-${stateLabel}`} value={stateLabel}>
+                                    {activeComparisonStates.includes(stateLabel)
+                                      ? `${stateLabel} (Selected)`
+                                      : stateLabel}
+                                  </option>
+                                ))}
+                              </select>
+                              {!!activeComparisonStates.length && (
+                                <button
+                                  className="rounded-lg border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                                  onClick={() => setSelectedComparisonStates([])}
+                                >
+                                  Clear
+                                </button>
+                              )}
                             </div>
                           </div>
-                        )}
-                      </div>
-                    )}
-                    <button
-                      className="text-xs font-bold px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
-                      onClick={() => setZoom(z => Math.max(0.7, Number((z - 0.1).toFixed(2))))}
-                    >
-                      Zoom Out
-                    </button>
-                    <button
-                      className="text-xs font-bold px-3 py-2 rounded-xl bg-slate-900 text-white hover:bg-slate-800 transition-colors"
-                      onClick={() => setZoom(z => Math.min(1.6, Number((z + 0.1).toFixed(2))))}
-                    >
-                      Zoom In
-                    </button>
-                  </div>
-                </div>
-              </div>
 
-              <div className="flex min-h-[64vh] items-center justify-center px-3 py-4 sm:min-h-[70vh] sm:px-6 sm:py-6">
-                <div
-                  className="w-full max-w-6xl origin-center transition-transform"
-                  style={{ transform: `scale(${zoom})` }}
-                >
-                  <GraphView
-                    source={source}
-                    dimension={fullscreen.dimension}
-                    metric={fullscreen.metric}
-                    datasetType={datasetType}
-                    bucket={fullscreen.bucket}
-                    jobId={jobId}
-                    fromDate={fromDate}
-                    toDate={toDate}
-                    chartType={fullscreen.chartType}
-                    tooltipMetricOverride={fullscreen.tooltipMetricOverride}
-                    heightClassName={isSamsungOverview ? "h-[56vh]" : undefined}
-                    onDataReady={setOpenedGraphData}
-                  />
+                          {regionalMapFiltersLoading && (
+                            <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400 sm:col-span-2 xl:col-span-5">
+                              Loading Filters...
+                            </div>
+                          )}
+
+                          {!!activeComparisonStates.length && (
+                            <div className="flex flex-wrap items-center gap-1.5 sm:col-span-2 xl:col-span-5">
+                              {activeComparisonStates.map((stateLabel) => (
+                                <button
+                                  key={`selected-compare-state-${stateLabel}`}
+                                  className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-slate-100"
+                                  onClick={() => setSelectedComparisonStates((prev) => prev.filter((state) => state !== stateLabel))}
+                                  title={`Remove ${stateLabel}`}
+                                >
+                                  {`${stateLabel} x`}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+              <div
+                className={`flex min-h-[70vh] justify-center px-3 py-4 sm:min-h-[74vh] sm:px-6 sm:py-6 ${
+                  isStateFullscreen ? "items-start" : "items-center"
+                }`}
+              >
+                <div className="w-full max-w-6xl">
+                  {fullscreenCompositeData ? (
+                    <div className={fullscreenGraphHeightClass}>
+                      {fullscreenCompositeData.sectionData.loading ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                          Loading section view...
+                        </div>
+                      ) : fullscreenCompositeData.sectionData.error ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                          {fullscreenCompositeData.sectionData.error}
+                        </div>
+                      ) : !fullscreenCompositeData.displayRows.length ? (
+                        <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                          No data available for this section.
+                        </div>
+                      ) : fullscreenCompositeData.sectionChartMode === "dense_heatmap" ? (
+                        <div className="h-full overflow-auto pr-1">
+                          <div className="mb-2 flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            <span>{`Top ${fullscreenCompositeData.displayRows.length} ${getDimensionLabel(fullscreenCompositeData.dimKey, source)}`}</span>
+                            <span>Darker = Higher Within Metric</span>
+                          </div>
+                          <table className="w-full min-w-[620px] border-separate border-spacing-y-1.5 text-[11px]">
+                            <thead>
+                              <tr>
+                                <th className="px-2 py-1 text-left font-bold uppercase tracking-[0.12em] text-slate-500">
+                                  {getDimensionLabel(fullscreenCompositeData.dimKey, source)}
+                                </th>
+                                {fullscreenCompositeData.mergedMetrics.map((metric) => (
+                                  <th
+                                    key={`fullscreen-heat-head-${metric}`}
+                                    className="px-2 py-1 text-right font-bold uppercase tracking-[0.12em] text-slate-500"
+                                  >
+                                    {getMetricLabel(metric)}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {fullscreenCompositeData.displayRows.map((row, rowIndex) => {
+                                const label = String(row[fullscreenCompositeData.dimKey] ?? "Unknown").trim() || "Unknown"
+                                return (
+                                  <tr key={`fullscreen-heat-${label}-${rowIndex}`}>
+                                    <td className="rounded-md bg-slate-100/70 px-2 py-2 font-semibold text-slate-700">
+                                      <span title={label}>{truncateCategoryLabel(label, 30)}</span>
+                                    </td>
+                                    {fullscreenCompositeData.mergedMetrics.map((metric) => {
+                                      const value = asNumber(row[metric])
+                                      const maxValue = fullscreenCompositeData.metricMaxima[metric] || 0
+                                      const intensity = maxValue > 0 ? value / maxValue : 0
+                                      return (
+                                        <td
+                                          key={`fullscreen-heat-${label}-${metric}`}
+                                          className="rounded-md px-2 py-2 text-right font-semibold text-slate-800"
+                                          style={{
+                                            backgroundColor: getHeatCellColor(metric, intensity),
+                                          }}
+                                          title={`${getMetricLabel(metric)}: ${formatMetricValue(value, metric)}`}
+                                        >
+                                          {formatMetricValue(value, metric)}
+                                        </td>
+                                      )
+                                    })}
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : fullscreenCompositeData.sectionChartMode === "metric_strips" ? (
+                        <div className="h-full overflow-auto pr-1">
+                          <div className="mb-2 flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                            <span>{`Top ${fullscreenCompositeData.displayRows.length} ${getDimensionLabel(fullscreenCompositeData.dimKey, source)}`}</span>
+                            <span>Darker = Higher Within Metric</span>
+                          </div>
+                          <div className="space-y-2.5">
+                            {fullscreenCompositeData.mergedMetrics.map((metric) => {
+                              const metricMax = fullscreenCompositeData.metricMaxima[metric] || 0
+                              return (
+                                <div key={`fullscreen-strip-${metric}`} className="rounded-lg border border-slate-200/80 bg-white/80 p-2">
+                                  <div className="mb-1 flex items-center justify-between text-[11px] font-semibold text-slate-700">
+                                    <span>{getMetricLabel(metric)}</span>
+                                    <span className="text-[10px] text-slate-500">
+                                      Peak: {formatMetricValue(metricMax, metric)}
+                                    </span>
+                                  </div>
+                                  <div className="flex gap-1 overflow-x-auto pb-1">
+                                    {fullscreenCompositeData.displayRows.map((row, rowIndex) => {
+                                      const label = String(row[fullscreenCompositeData.dimKey] ?? "Unknown").trim() || "Unknown"
+                                      const value = asNumber(row[metric])
+                                      const intensity = metricMax > 0 ? value / metricMax : 0
+                                      return (
+                                        <div
+                                          key={`fullscreen-strip-${metric}-${label}-${rowIndex}`}
+                                          className="min-w-[112px] rounded-md px-2 py-1.5 text-slate-800"
+                                          style={{ backgroundColor: getHeatCellColor(metric, intensity) }}
+                                          title={`${label} | ${getMetricLabel(metric)}: ${formatMetricValue(value, metric)}`}
+                                        >
+                                          <div className="truncate text-[10px] font-semibold">
+                                            {truncateCategoryLabel(label, 18)}
+                                          </div>
+                                          <div className="mt-0.5 text-[10px] font-medium text-slate-700">
+                                            {formatAxisCompact(value, metric)}
+                                          </div>
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      ) : (
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart
+                            data={fullscreenCompositeChartRows}
+                            margin={
+                              isMobileViewport
+                                ? { top: 8, right: 6, left: 2, bottom: 4 }
+                                : { top: 12, right: 12, left: 18, bottom: 8 }
+                            }
+                          >
+                            <defs>
+                              {fullscreenCompositeData.mergedMetrics.map((metric) => {
+                                const color = METRIC_LINE_COLORS[metric] || "#2563eb"
+                                const gid = `fullscreen-section-${fullscreenCompositeData.group}-${metric}`
+                                return (
+                                  <linearGradient key={gid} id={gid} x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor={color} stopOpacity={0.35} />
+                                    <stop offset="100%" stopColor={color} stopOpacity={0.02} />
+                                  </linearGradient>
+                                )
+                              })}
+                            </defs>
+                            <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
+                            <XAxis
+                              dataKey={fullscreenCompositeData.dimKey}
+                              tick={{ fontSize: isMobileViewport ? 10 : 11 }}
+                              minTickGap={isMobileViewport ? 8 : 12}
+                              tickFormatter={(value) =>
+                                isTemporalDimensionKey(fullscreenCompositeData.dimKey)
+                                  ? formatMonthLabel(String(value || ""))
+                                  : String(value || "")
+                              }
+                            />
+                            <YAxis
+                              scale="auto"
+                              domain={[0, "auto"]}
+                              width={isMobileViewport ? 52 : 76}
+                              tickMargin={isMobileViewport ? 4 : 6}
+                              tick={{ fontSize: isMobileViewport ? 10 : 11 }}
+                              tickFormatter={(value) => formatAxisCompact(asNumber(value), fullscreenCompositeData.mergedMetrics[0] || "quantity")}
+                            />
+                            <RechartsTooltip
+                              allowEscapeViewBox={{ x: false, y: false }}
+                              wrapperStyle={{
+                                maxWidth: isMobileViewport ? "calc(100vw - 40px)" : "320px",
+                                zIndex: 30,
+                              }}
+                              content={({ active, payload, label }) => {
+                                if (!active || !payload?.length) return null
+                                return (
+                                  <div className={`rounded-lg border bg-white shadow ${isMobileViewport ? "p-2.5" : "p-3"}`}>
+                                    <p className={`${isMobileViewport ? "text-[11px]" : "text-xs"} font-bold text-gray-400`}>
+                                      {isTemporalDimensionKey(fullscreenCompositeData.dimKey)
+                                        ? formatMonthLabel(String(label || ""))
+                                        : String(label || "")}
+                                    </p>
+                                    <div className={`${isMobileViewport ? "mt-1 space-y-0.5" : "mt-1 space-y-1"}`}>
+                                      {payload.map((entry) => {
+                                        const rawDataKey = String(entry.dataKey || "")
+                                        const metric = toOriginalMetricKey(rawDataKey)
+                                        const rawValue = asNumber(entry.value)
+                                        return (
+                                          <div
+                                            key={rawDataKey}
+                                            className={`flex items-center gap-2 font-semibold ${isMobileViewport ? "text-[11px]" : "text-sm"}`}
+                                          >
+                                            <span
+                                              className="inline-block h-2.5 w-2.5 rounded-full"
+                                              style={{ backgroundColor: entry.color || "#64748b" }}
+                                            />
+                                            <span className="text-slate-700">
+                                              {getMetricLabel(metric)}
+                                            </span>
+                                            <span className="ml-auto text-slate-900">
+                                              {formatMetricValue(rawValue, metric)}
+                                            </span>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+                                )
+                              }}
+                            />
+                            <Legend
+                              verticalAlign="top"
+                              align="left"
+                              wrapperStyle={{ fontSize: "11px", paddingBottom: "8px", color: "#475569" }}
+                              formatter={(value) => getMetricLabel(String(value || ""))}
+                            />
+                            {fullscreenCompositeData.mergedMetrics.map((metric) => {
+                              const color = METRIC_LINE_COLORS[metric] || "#2563eb"
+                              const gid = `fullscreen-section-${fullscreenCompositeData.group}-${metric}`
+                              return (
+                                <Area
+                                  key={`fullscreen-section-${fullscreenCompositeData.group}-${metric}`}
+                                  type="monotone"
+                                  dataKey={metric}
+                                  name={metric}
+                                  stroke={color}
+                                  fill={`url(#${gid})`}
+                                  strokeWidth={2.2}
+                                  fillOpacity={1}
+                                  isAnimationActive={!prefersReducedMotion}
+                                  dot={false}
+                                />
+                              )
+                            })}
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      )}
+                    </div>
+                  ) : (
+                    <div className={fullscreenGraphHeightClass}>
+                      <GraphView
+                        source={source}
+                        dimension={fullscreen.dimension}
+                        metric={fullscreen.metric}
+                        datasetType={datasetType}
+                        bucket={fullscreen.bucket}
+                        jobId={jobId}
+                        fromDate={fromDate}
+                        toDate={toDate}
+                        chartType={fullscreen.chartType}
+                        tooltipMetricOverride={fullscreen.tooltipMetricOverride}
+                        categoryFilters={isStateFullscreen ? activeRegionalMapFilters : undefined}
+                        heightClassName="h-full"
+                        onDataReady={setOpenedGraphData}
+                      />
+                    </div>
+                  )}
                   {isStateFullscreen && (
                     <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
                       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -1652,7 +2933,7 @@ export default function MultiGraphView({
                             {`${geographyLabel} Compare Mix`}
                           </h4>
                           <div className="text-[11px] text-slate-500 mt-1">
-                            {`For every selected ${geographyLabel.toLowerCase()} in Compare ${geographyLabelPlural}, view gradient pie splits for Plan Category and Device Plan Category.`}
+                            {`For every selected ${geographyLabel.toLowerCase()} in Compare ${geographyLabelPlural}, view gradient pie splits for ${activeRegionalPrimaryDescriptor.label} and ${activeRegionalSecondaryDescriptor.label}.`}
                           </div>
                         </div>
                       </div>
@@ -1701,7 +2982,7 @@ export default function MultiGraphView({
                                   <div className="grid grid-cols-1 gap-3">
                                     <div className="rounded-xl border border-slate-200 bg-white p-3">
                                       <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
-                                        Plan Category Division
+                                        {activeRegionalPrimaryDescriptor.sectionTitle}
                                       </div>
                                       {planSlices.length ? (
                                         <div className="mt-2 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(170px,1fr)] gap-3 items-center">
@@ -1775,14 +3056,14 @@ export default function MultiGraphView({
                                         </div>
                                       ) : (
                                         <div className="mt-2 text-xs text-slate-500">
-                                          {mixRow.planMessage || "No plan-category data found."}
+                                          {mixRow.planMessage || activeRegionalPrimaryDescriptor.missingText}
                                         </div>
                                       )}
                                     </div>
 
                                     <div className="rounded-xl border border-slate-200 bg-white p-3">
                                       <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
-                                        Device Plan Category Division
+                                        {activeRegionalSecondaryDescriptor.sectionTitle}
                                       </div>
                                       {deviceSlices.length ? (
                                         <div className="mt-2 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(170px,1fr)] gap-3 items-center">
@@ -1856,7 +3137,7 @@ export default function MultiGraphView({
                                         </div>
                                       ) : (
                                         <div className="mt-2 text-xs text-slate-500">
-                                          {mixRow.deviceMessage || "No device-category data found."}
+                                          {mixRow.deviceMessage || activeRegionalSecondaryDescriptor.missingText}
                                         </div>
                                       )}
                                     </div>
@@ -1892,7 +3173,11 @@ export default function MultiGraphView({
                       )}
                     </div>
                   )}
-                  <div className="mt-6 rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/50 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                  <div
+                    className={`rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/50 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5 ${
+                      isStateFullscreen ? "mt-6" : "mt-4"
+                    }`}
+                  >
                     <div className="flex items-center justify-between gap-3 mb-3">
                       <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
                         Sahyogi Insights
@@ -1933,4 +3218,3 @@ export default function MultiGraphView({
     </>
   )
 }
-

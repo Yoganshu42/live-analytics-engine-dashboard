@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronRight,
   House,
-  LayoutDashboard,
   PanelLeftClose,
   PanelLeftOpen,
   Shield,
@@ -19,8 +18,8 @@ import AdminFileAccess from "@/components/AdminFileAccess"
 type Props = {
   brand: string
   onChange: (brand: string) => void
-  currentView: "home" | "dashboard"
-  onViewChange: (view: "home" | "dashboard") => void
+  currentView: "home" | "master" | "dashboard"
+  onViewChange: (view: "home" | "master" | "dashboard") => void
   authRole: "admin" | "employee" | null
   collapsed?: boolean
   onToggleCollapse?: () => void
@@ -73,21 +72,21 @@ export default function Sidebar({
       <div className="rounded-2xl border border-slate-200 bg-white p-2.5 shadow-sm sm:p-3">
         <div className="grid grid-cols-2 gap-2 md:grid-cols-1">
         <button
-          onClick={() => onViewChange("dashboard")}
-          title="Dashboard"
-          className={`${railLinkBase} ${collapsed ? "md:justify-center md:px-2" : ""} ${currentView === "dashboard" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
-        >
-          <LayoutDashboard size={16} />
-          <span className={collapsed ? "md:hidden" : ""}>Dashboard</span>
-        </button>
-
-        <button
           onClick={() => onViewChange("home")}
           title="Home"
           className={`${railLinkBase} ${collapsed ? "md:justify-center md:px-2" : ""} ${currentView === "home" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
         >
           <House size={16} />
           <span className={collapsed ? "md:hidden" : ""}>Home</span>
+        </button>
+
+        <button
+          onClick={() => onViewChange("master")}
+          title="Master Dashboard"
+          className={`${railLinkBase} ${collapsed ? "md:justify-center md:px-2" : ""} ${currentView === "master" ? "bg-[#1f6fe5] text-white" : "text-slate-700 hover:bg-slate-100"}`}
+        >
+          <ChartNoAxesColumn size={16} />
+          <span className={collapsed ? "md:hidden" : ""}>Master Dashboard</span>
         </button>
         </div>
       </div>

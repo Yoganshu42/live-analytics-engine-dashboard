@@ -13,7 +13,7 @@ export default function Tabs({ value, onChange, disableClaims }: Props) {
     desktopLabel: string
   }> = [
     { key: "sales", mobileLabel: "Sales", desktopLabel: "SALES ANALYSIS" },
-    { key: "claims", mobileLabel: "Claims", desktopLabel: "CLAIMS ANALYSIS" },
+    { key: "claims", mobileLabel: "", desktopLabel: "CLAIMS ANALYSIS" },
   ]
 
   return (

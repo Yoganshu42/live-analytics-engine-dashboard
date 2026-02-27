@@ -7,14 +7,15 @@ from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
 
 VALUATION_DATE = pd.Timestamp("2025-12-31")
+LOSS_RATIO_CAP_PERCENT = 300.0
 logger = logging.getLogger(__name__)
 
 REVENUE_SPLIT = {
-    'D2D':     {'channel':0.25,'godrej':0.35,'zopper':0.40},
-    'POS':     {'channel':0.25,'godrej':0.35,'zopper':0.40},
-    'Calling Process': {'channel':0.30,'godrej':0.35,'zopper':0.35},
-    'POD':     {'channel':0.20,'godrej':0.35,'zopper':0.45},
-    'Amazon':  {'channel':0.40,'godrej':0.35,'zopper':0.25},
+    "D2D": {"Channel": 0.25, "Godrej": 0.35, "Zopper": 0.40},
+    "POS": {"Channel": 0.25, "Godrej": 0.35, "Zopper": 0.40},
+    "Calling Process": {"Channel": 0.30, "Godrej": 0.35, "Zopper": 0.35},
+    "POD": {"Channel": 0.20, "Godrej": 0.35, "Zopper": 0.45},
+    "Amazon": {"Channel": 0.40, "Godrej": 0.35, "Zopper": 0.25},
 }
 
 class GodrejAnalyticsEngine(BaseAnalyticsEngine):
@@ -220,10 +221,11 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             df.loc[missing_start, "Earned_Premium"] = 0
             df.loc[missing_start, "Unearned_Premium"] = df.loc[missing_start, "Customer Premium"]
 
+        df["Channel"] = self._canonical_sales_channel(df["Channel"])
         split_df = pd.DataFrame(df["Channel"].map(REVENUE_SPLIT).tolist(), index=df.index).fillna(0)
-        zopper_share = split_df.get("zopper", 0)
-        godrej_share = split_df.get("godrej", 0)
-        channel_share = split_df.get("channel", 0)
+        zopper_share = split_df.get("Zopper", split_df.get("zopper", 0))
+        godrej_share = split_df.get("Godrej", split_df.get("godrej", 0))
+        channel_share = split_df.get("Channel", split_df.get("channel", 0))
 
         df["Zopper_Share_EP"] = df["Earned_Premium"] * zopper_share
         df["Zopper_Unearned"] = df["Unearned_Premium"] * zopper_share
@@ -278,6 +280,20 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             .str.replace(r"\s+", " ", regex=True)
         )
         return normalized.map(cls.CLAIM_CHANNEL_MAP).fillna("Unknown")
+
+    @classmethod
+    def _canonical_sales_channel(cls, series: pd.Series) -> pd.Series:
+        normalized = (
+            series
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace("_", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+        mapped = normalized.map(cls.CLAIM_CHANNEL_MAP)
+        original = series.astype(str).str.strip()
+        return mapped.where(mapped.notna(), original)
 
     @classmethod
     def _canonical_state(cls, series: pd.Series) -> pd.Series:
@@ -587,25 +603,28 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                     parsed = parsed_try
                     break
 
+        # Do not infer year from ambiguous month-only labels (e.g. "Jun", "6").
+        ambiguous_month_only = cleaned.str.fullmatch(r"[A-Za-z]{3,9}") | cleaned.str.fullmatch(r"\d{1,2}")
+        parsed = parsed.where(~ambiguous_month_only, pd.NaT)
+
         if parsed.notna().any():
-            base_year = (
-                self.report_start.year
-                if self.report_start is not None and self.report_start is not pd.NaT
-                else pd.Timestamp.today().year
-            )
             bad_year = parsed.dt.year < 2000
             if bad_year.any():
-                parsed = parsed.where(
-                    ~bad_year,
-                    pd.to_datetime(
-                        {
-                            "year": base_year,
-                            "month": parsed.dt.month.clip(1, 12),
-                            "day": 1,
-                        },
-                        errors="coerce",
-                    ),
-                )
+                if self.report_start is not None and self.report_start is not pd.NaT:
+                    base_year = int(self.report_start.year)
+                    parsed = parsed.where(
+                        ~bad_year,
+                        pd.to_datetime(
+                            {
+                                "year": base_year,
+                                "month": parsed.dt.month.clip(1, 12),
+                                "day": 1,
+                            },
+                            errors="coerce",
+                        ),
+                    )
+                else:
+                    parsed = parsed.where(~bad_year, pd.NaT)
 
         return parsed
 
@@ -636,17 +655,14 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             "Payment Date",
         ]
         month_candidates_claims = [
-            "Month",
-            "Month Name",
-            "Month_Name",
-            "Payment_date",
-            "Payment Date",
+            "Date",
             "Claim Date",
             "Claim_Date",
+            "Payment_date",
+            "Payment Date",
             "Day of Call_Date",
             "Call_Date",
             "Call Date",
-            "Date",
             "Date of Claim",
             "Invoice_Date_",
             "Invoice Date",
@@ -656,6 +672,9 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             "Warranty Start_Date",
             "Start Date",
             "Start_Date",
+            "Month",
+            "Month Name",
+            "Month_Name",
         ]
 
         dim_map = {
@@ -744,14 +763,30 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 break
 
         if dim_key == "month":
-            if dim_col is None:
-                return df, None
             df = df.copy()
-            month_series = self._parse_month_series(df[dim_col])
-            if month_series.isna().all():
-                return df, None
-            df["_month_key"] = month_series.dt.to_period("M").dt.to_timestamp()
-            return df, "_month_key"
+            tried_columns: set[str] = set()
+            best_month: pd.Series | None = None
+            best_valid = -1
+            best_years = -1
+            for candidate in candidates:
+                key = _normalize_key(candidate)
+                matched_col = normalized.get(key)
+                if matched_col is None or matched_col in tried_columns:
+                    continue
+                tried_columns.add(matched_col)
+                month_series = self._parse_month_series(df[matched_col])
+                valid = int(month_series.notna().sum())
+                if valid <= 0:
+                    continue
+                years = int(month_series.dropna().dt.year.nunique())
+                if valid > best_valid or (valid == best_valid and years > best_years):
+                    best_month = month_series
+                    best_valid = valid
+                    best_years = years
+            if best_month is not None:
+                df["_month_key"] = best_month.dt.to_period("M").dt.to_timestamp()
+                return df, "_month_key"
+            return df, None
 
         return df, dim_col
 
@@ -864,6 +899,165 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         sales_df = self._apply_date_filter(sales_df, "sales")
         claims_df = self._apply_date_filter(claims_df, "claims")
 
+        if dimension == "month":
+            def _pick_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+                normalized = {self._normalize_col_key(c): c for c in df.columns}
+                for candidate in candidates:
+                    key = self._normalize_col_key(candidate)
+                    if key in normalized:
+                        return normalized[key]
+                return None
+
+            def _pick_month_key(df: pd.DataFrame, candidates: list[str]) -> pd.Series | None:
+                month_like = {
+                    self._normalize_col_key("Month"),
+                    self._normalize_col_key("Month Name"),
+                    self._normalize_col_key("Month_Name"),
+                }
+                best_key: pd.Series | None = None
+                best_valid = -1
+                best_years = -1
+                for candidate in candidates:
+                    col = _pick_column(df, [candidate])
+                    if col is None:
+                        continue
+                    norm_col = self._normalize_col_key(col)
+                    if norm_col in month_like:
+                        parsed = self._parse_month_series(df[col])
+                    else:
+                        parsed = pd.to_datetime(df[col], errors="coerce")
+                    month_key = parsed.dt.to_period("M").dt.to_timestamp()
+                    valid = int(month_key.notna().sum())
+                    if valid <= 0:
+                        continue
+                    years = int(month_key.dropna().dt.year.nunique())
+                    if valid > best_valid or (valid == best_valid and years > best_years):
+                        best_key = month_key
+                        best_valid = valid
+                        best_years = years
+                return best_key
+
+            claims_df = claims_df.copy()
+            claims_df["_claims"] = self._claim_amount_series(claims_df)
+            claims_df = claims_df[claims_df["_claims"] > 0]
+            if claims_df.empty:
+                return []
+
+            claim_month = _pick_month_key(
+                claims_df,
+                [
+                    "Date",
+                    "Claim Date",
+                    "Claim_Date",
+                    "Payment_date",
+                    "Payment Date",
+                    "Day of Call_Date",
+                    "Call_Date",
+                    "Call Date",
+                    "Date of Claim",
+                    "Month",
+                    "Month Name",
+                    "Month_Name",
+                ],
+            )
+            if claim_month is None:
+                return []
+            claims_df["_month"] = claim_month
+            claims_df = claims_df[claims_df["_month"].notna()].copy()
+            if claims_df.empty:
+                return []
+
+            claims_out = (
+                claims_df
+                .groupby("_month", dropna=False)["_claims"]
+                .sum()
+                .reset_index()
+                .rename(columns={"_month": "month"})
+            )
+            month_index = pd.DatetimeIndex(sorted(pd.to_datetime(claims_out["month"], errors="coerce").dropna().unique()))
+            if month_index.empty:
+                return []
+
+            sales_df = sales_df.copy()
+            start_col = _pick_column(
+                sales_df,
+                ["Warranty Start Date", "Warranty Purchase Date", "Product Purchased Date", "Start Date", "Start_Date"],
+            )
+            if start_col is None:
+                return []
+
+            start_dt = pd.to_datetime(sales_df[start_col], errors="coerce")
+            end_col = _pick_column(sales_df, ["Warranty End Date", "Warranty End_Date", "End Date", "End_Date"])
+            end_dt = pd.to_datetime(sales_df[end_col], errors="coerce") if end_col is not None else pd.Series(pd.NaT, index=sales_df.index)
+            coverage_days = pd.to_numeric(sales_df.get("Coverage_Days", 0), errors="coerce").fillna(0)
+            computed_end = start_dt + pd.to_timedelta((coverage_days - 1).clip(lower=0), unit="D")
+            end_dt = end_dt.where(end_dt.notna(), computed_end)
+            policy_days = (end_dt - start_dt).dt.days + 1
+
+            channel_series = (
+                self._canonical_sales_channel(sales_df.get("Channel", pd.Series("", index=sales_df.index)))
+                if "Channel" in sales_df.columns
+                else pd.Series("", index=sales_df.index)
+            )
+            zopper_share = channel_series.map(lambda ch: float((REVENUE_SPLIT.get(ch) or {}).get("Zopper", 0.0)))
+            customer_premium = pd.to_numeric(sales_df.get("Customer Premium", 0), errors="coerce").fillna(0.0)
+            zopper_total = customer_premium * zopper_share.fillna(0.0)
+
+            valid = start_dt.notna() & end_dt.notna() & policy_days.gt(0) & zopper_total.ne(0)
+            sales_monthly = pd.Series(0.0, index=month_index, dtype="float64")
+            for month_start in month_index:
+                month_start = pd.Timestamp(month_start)
+                month_end = (month_start + pd.offsets.MonthEnd(1)).normalize()
+                overlap_start = start_dt.clip(lower=month_start)
+                overlap_end = end_dt.clip(upper=month_end)
+                overlap_days = (overlap_end - overlap_start).dt.days + 1
+                overlap_days = overlap_days.clip(lower=0)
+                accrued = (
+                    zopper_total
+                    * (overlap_days / policy_days.where(policy_days.gt(0), pd.NA))
+                ).fillna(0.0)
+                sales_monthly.loc[month_start] = float(accrued[valid].sum())
+
+            invalid = (~valid) & zopper_total.ne(0)
+            if invalid.any():
+                fallback_month = _pick_month_key(
+                    sales_df.loc[invalid],
+                    ["Warranty Purchase Date", "Payment_date", "Date", "Month", "Warranty Start Date"],
+                )
+                if fallback_month is not None:
+                    fallback_df = pd.DataFrame(
+                        {
+                            "month": pd.to_datetime(fallback_month, errors="coerce"),
+                            "_zp": zopper_total.loc[invalid],
+                        }
+                    )
+                    fallback_df = fallback_df[fallback_df["month"].notna()]
+                    if not fallback_df.empty:
+                        fallback_g = fallback_df.groupby("month", dropna=False)["_zp"].sum()
+                        for month_key, value in fallback_g.items():
+                            if month_key in sales_monthly.index:
+                                sales_monthly.loc[month_key] += float(value or 0.0)
+
+            sales_out = (
+                sales_monthly
+                .rename("_zp")
+                .reset_index()
+                .rename(columns={"index": "month"})
+            )
+
+            merged = claims_out.merge(sales_out, on="month", how="left")
+            merged["_claims"] = pd.to_numeric(merged["_claims"], errors="coerce").fillna(0.0)
+            merged["_zp"] = pd.to_numeric(merged["_zp"], errors="coerce").fillna(0.0)
+            merged["loss_ratio"] = (
+                merged["_claims"] / merged["_zp"].replace(0, pd.NA) * 100
+            ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
+
+            out = merged[["month", "loss_ratio"]].copy()
+            out = out.sort_values("month")
+            out["month"] = pd.to_datetime(out["month"], errors="coerce").dt.strftime("%b-%y")
+            out = out[out["month"].notna()]
+            return out.to_dict(orient="records")
+
         sales_df, sales_dim = self._resolve_dimension(sales_df, dimension, "sales")
         claims_df, claims_dim = self._resolve_dimension(claims_df, dimension, "claims")
         if sales_dim is None or claims_dim is None:
@@ -920,22 +1114,15 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         claims_out["_k"] = _norm_dim(claims_out["_dim_claims"])
         sales_out["_k"] = _norm_dim(sales_out["_dim_sales"])
 
-        merged = claims_out.merge(sales_out, on="_k", how="left").fillna(0)
+        merged = claims_out.merge(sales_out, on="_k", how="left")
+        merged["_claims"] = pd.to_numeric(merged["_claims"], errors="coerce").fillna(0.0)
+        merged["_zp"] = pd.to_numeric(merged["_zp"], errors="coerce").fillna(0.0)
         merged["loss_ratio"] = (
-            merged["_claims"] / merged["_zp"] * 100
-        ).replace([float("inf"), float("-inf")], 0).fillna(0)
+            merged["_claims"] / merged["_zp"].replace(0, pd.NA) * 100
+        ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
 
         out = merged[["_dim_claims", "loss_ratio"]].rename(columns={"_dim_claims": dimension})
-
-        if dimension == "month" and "month" in out.columns:
-            month_series = pd.to_datetime(out["month"], errors="coerce")
-            out = out[month_series.notna()].copy()
-            out["_month_sort"] = month_series[month_series.notna()]
-            out["month"] = out["_month_sort"].dt.strftime("%b-%y")
-            out = out.sort_values("_month_sort").drop(columns=["_month_sort"])
-        else:
-            out = self._drop_noise_buckets(out, dimension)
-
+        out = self._drop_noise_buckets(out, dimension)
         return out.to_dict(orient="records")
 
     # --------------------------------------------------

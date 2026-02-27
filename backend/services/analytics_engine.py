@@ -318,6 +318,30 @@ def get_date_bounds(
 def _parse_datetime_series(series: pd.Series) -> pd.Series:
     raw = series.astype(str).str.strip()
     cleaned = raw.str.replace(r"\.0$", "", regex=True)
+    parsed = pd.Series(pd.NaT, index=cleaned.index, dtype="datetime64[ns]")
+
+    month_map = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    month_year = cleaned.str.extract(r"^(?:\d{1,2}[-/\s])?(?P<mon>[A-Za-z]{3,9})[-/\s](?P<yr>\d{2}|\d{4})$")
+    month_num = month_year["mon"].str.lower().str.slice(0, 3).map(month_map)
+    year_text = month_year["yr"]
+    year_num = pd.to_numeric(year_text, errors="coerce")
+    is_two_digit = year_text.fillna("").str.len().eq(2)
+    year_num = year_num.where(~is_two_digit, year_num + 2000)
+    explicit_month = pd.to_datetime({"year": year_num, "month": month_num, "day": 1}, errors="coerce")
+    parsed = parsed.fillna(explicit_month)
 
     yyyymm_mask = cleaned.str.fullmatch(r"\d{6}")
     yyyymm_normalized = cleaned.where(
@@ -326,25 +350,21 @@ def _parse_datetime_series(series: pd.Series) -> pd.Series:
     )
 
     try:
-        parsed = pd.to_datetime(yyyymm_normalized, format="mixed", errors="coerce")
+        parsed_try = pd.to_datetime(yyyymm_normalized, format="mixed", errors="coerce")
     except TypeError:
-        parsed = pd.to_datetime(yyyymm_normalized, errors="coerce")
+        parsed_try = pd.to_datetime(yyyymm_normalized, errors="coerce")
+    parsed_try = parsed_try.where(parsed_try.dt.year >= 2000)
+    parsed = parsed.fillna(parsed_try)
 
     if parsed.isna().any():
         try:
             parsed_try = pd.to_datetime(cleaned, format="mixed", errors="coerce")
         except TypeError:
             parsed_try = pd.to_datetime(cleaned, errors="coerce")
+        parsed_try = parsed_try.where(parsed_try.dt.year >= 2000)
         parsed = parsed.fillna(parsed_try)
 
-    if parsed.isna().all():
-        for fmt in ["%b-%y", "%b-%Y", "%m-%Y", "%Y-%m", "%Y-%m-%d", "%d-%b-%Y", "%d-%b-%y"]:
-            parsed_try = pd.to_datetime(cleaned, format=fmt, errors="coerce")
-            if parsed_try.notna().any():
-                parsed = parsed_try
-                break
-
-    return parsed
+    return parsed.where(parsed.dt.year >= 2000)
 
 
 def _coalesce_datetime_candidates(df: pd.DataFrame, candidates: list[str]) -> pd.Series:

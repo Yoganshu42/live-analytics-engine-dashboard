@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import {
   Bot,
+  Download,
+  FileUp,
   Loader2,
   Maximize2,
   MessageCircle,
@@ -11,7 +13,11 @@ import {
   Send,
   X,
 } from "lucide-react"
-import { sendChatbotMessage, type ChatbotTurn } from "@/app/lib/api"
+import {
+  sendChatbotMessage,
+  transformChatbotFile,
+  type ChatbotTurn,
+} from "@/app/lib/api"
 
 type ChatMessage = {
   role: "user" | "assistant"
@@ -29,8 +35,15 @@ type AssistantBlock =
 
 const INITIAL_ASSISTANT_MESSAGE: ChatMessage = {
   role: "assistant",
-  content: "AI Sahyogi is ready. Ask about trends, anomalies, or actions from your dashboard data.",
+  content: "AI Sahyogi is ready. Ask dashboard questions, or upload a CSV/XLS/XLSX file and tell me what to fill.",
 }
+
+const FILE_INSTRUCTION_EXAMPLES = [
+  "Plan Price will be Total Billing Amount",
+  "Brand is Article_Brand",
+  "fill missing Plan Category with ADLD",
+  "remove duplicates from column Item_Serial_Number",
+]
 
 const normalizeDate = (value: string) => {
   const cleaned = (value || "").trim()
@@ -44,6 +57,20 @@ const normalizeJobId = (value: string) => {
     return ""
   }
   return cleaned
+}
+
+const normalizeSource = (value: string) => {
+  const key = (value || "").trim().toLowerCase()
+  if (!key) return ""
+  if (key === "goodrej" || key === "goddrej") return "godrej"
+  if (key === "reliance resq" || key === "reliance_resq" || key === "reliance-resq" || key === "resq") {
+    return "reliance"
+  }
+  return key
+}
+
+const normalizeDatasetType = (value: string) => {
+  return (value || "").trim().toLowerCase() === "claims" ? "claims" : "sales"
 }
 
 const splitToSentences = (text: string) =>
@@ -149,10 +176,16 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_ASSISTANT_MESSAGE])
   const [input, setInput] = useState("")
   const [isSending, setIsSending] = useState(false)
+  const [isTransforming, setIsTransforming] = useState(false)
+  const [transformFile, setTransformFile] = useState<File | null>(null)
+  const [downloadUrl, setDownloadUrl] = useState("")
+  const [downloadName, setDownloadName] = useState("")
+  const [transformSummary, setTransformSummary] = useState("")
 
   const cardListRef = useRef<HTMLDivElement | null>(null)
   const panelListRef = useRef<HTMLDivElement | null>(null)
   const fullListRef = useRef<HTMLDivElement | null>(null)
+  const contextKeyRef = useRef("")
 
   useEffect(() => {
     setIsMounted(true)
@@ -184,6 +217,54 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [isExpanded])
 
+  useEffect(() => {
+    return () => {
+      if (downloadUrl) {
+        URL.revokeObjectURL(downloadUrl)
+      }
+    }
+  }, [downloadUrl])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+
+    const readContextKey = () => {
+      const source = normalizeSource(localStorage.getItem("dashboard_brand") || "")
+      const datasetType = normalizeDatasetType(localStorage.getItem("dashboard_mode") || "")
+      return `${source}|${datasetType}`
+    }
+
+    const resetForContextShift = () => {
+      const nextKey = readContextKey()
+      if (!contextKeyRef.current) {
+        contextKeyRef.current = nextKey
+        return
+      }
+      if (contextKeyRef.current === nextKey) return
+
+      contextKeyRef.current = nextKey
+      setMessages([INITIAL_ASSISTANT_MESSAGE])
+      setInput("")
+      setTransformFile(null)
+      setTransformSummary("")
+      setDownloadName("")
+      setDownloadUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev)
+        return ""
+      })
+    }
+
+    contextKeyRef.current = readContextKey()
+    window.addEventListener("dashboard-context-changed", resetForContextShift as EventListener)
+    // Fallback for any context changes that do not dispatch the custom event.
+    const pollId = window.setInterval(resetForContextShift, 1000)
+
+    return () => {
+      window.removeEventListener("dashboard-context-changed", resetForContextShift as EventListener)
+      window.clearInterval(pollId)
+    }
+  }, [])
+
   const history: ChatbotTurn[] = useMemo(
     () =>
       messages
@@ -199,20 +280,28 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
     setIsExpanded(true)
   }
 
-  const send = async () => {
+  const appendAssistantMessage = (content: string) => {
+    setMessages((prev) => [...prev, { role: "assistant", content }])
+  }
+
+  const getAuthToken = () =>
+    typeof window !== "undefined" ? (localStorage.getItem("auth_token") || "").trim() : ""
+
+  const ensureAuthorized = () => {
+    const token = getAuthToken()
+    if (token) return token
+    appendAssistantMessage("Sign in first to use the chatbot.")
+    return ""
+  }
+
+  const sendChatMessage = async () => {
     const text = input.trim()
-    if (!text || isSending) return
+    if (!text || isSending || isTransforming) return
 
     setInput("")
     setMessages((prev) => [...prev, { role: "user", content: text }])
 
-    const token =
-      typeof window !== "undefined" ? (localStorage.getItem("auth_token") || "").trim() : ""
-    if (!token) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Sign in first to use the chatbot." },
-      ])
+    if (!ensureAuthorized()) {
       return
     }
 
@@ -232,33 +321,86 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
       const toDate = normalizeDate(
         typeof window !== "undefined" ? localStorage.getItem("dashboard_to_date") || "" : ""
       )
+      const source = normalizeSource(
+        typeof window !== "undefined" ? localStorage.getItem("dashboard_brand") || "" : ""
+      )
+      const datasetType = normalizeDatasetType(
+        typeof window !== "undefined" ? localStorage.getItem("dashboard_mode") || "" : ""
+      )
 
       const result = await sendChatbotMessage({
         message: text,
         history,
         temperature: 0.14,
         max_tokens: maxTokens,
+        source: source || undefined,
+        dataset_type: datasetType,
         job_id: jobId || undefined,
         from_date: fromDate || undefined,
         to_date: toDate || undefined,
       })
       const reply = (result.response || "").trim() || "No response generated."
-      setMessages((prev) => [...prev, { role: "assistant", content: reply }])
+      appendAssistantMessage(reply)
     } catch (err) {
       const detail =
         err instanceof Error
           ? err.message
           : "Chatbot is unavailable right now. Check Sarvam service configuration."
-      setMessages((prev) => [...prev, { role: "assistant", content: detail }])
+      appendAssistantMessage(detail)
     } finally {
       setIsSending(false)
+    }
+  }
+
+  const applyFileInstruction = async () => {
+    const instruction = input.trim()
+    if (!transformFile || !instruction || isTransforming || isSending) return
+
+    setMessages((prev) => [...prev, { role: "user", content: `File task: ${instruction}` }])
+    setInput("")
+
+    if (!ensureAuthorized()) {
+      return
+    }
+
+    const source = normalizeSource(
+      typeof window !== "undefined" ? localStorage.getItem("dashboard_brand") || "" : ""
+    )
+    const datasetType = normalizeDatasetType(
+      typeof window !== "undefined" ? localStorage.getItem("dashboard_mode") || "" : ""
+    )
+
+    setIsTransforming(true)
+    try {
+      const result = await transformChatbotFile({
+        file: transformFile,
+        instruction,
+        source: source || undefined,
+        dataset_type: datasetType,
+      })
+
+      if (downloadUrl) {
+        URL.revokeObjectURL(downloadUrl)
+      }
+      const nextUrl = URL.createObjectURL(result.blob)
+      setDownloadUrl(nextUrl)
+      setDownloadName(result.filename)
+      setTransformSummary(result.summary || "File updated successfully.")
+      appendAssistantMessage(
+        `${result.summary || "File updated."} Download is ready below as ${result.filename}.`
+      )
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Failed to update the uploaded file."
+      appendAssistantMessage(detail)
+    } finally {
+      setIsTransforming(false)
     }
   }
 
   const onInputKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault()
-      void send()
+      void sendChatMessage()
     }
   }
 
@@ -422,30 +564,125 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
               </div>
             </div>
           )}
+          {isTransforming && (
+            <div className="flex w-full justify-start">
+              <div className="flex items-end gap-2">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-cyan-100 bg-cyan-50 text-cyan-700">
+                  <FileUp size={14} />
+                </span>
+                <div className="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm">
+                  <Loader2 size={14} className="animate-spin" />
+                  Updating file...
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className={`border-t border-slate-200/80 bg-white/95 ${isFullMode ? "p-3 sm:p-4" : "p-3"}`}>
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50">
+              <FileUp size={13} />
+              {transformFile ? "Change File" : "Upload File"}
+              <input
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                className="hidden"
+                onChange={(event) => {
+                  const next = event.target.files?.[0] || null
+                  setTransformFile(next)
+                  setDownloadName("")
+                  setTransformSummary("")
+                  if (downloadUrl) {
+                    URL.revokeObjectURL(downloadUrl)
+                    setDownloadUrl("")
+                  }
+                }}
+              />
+            </label>
+            {transformFile && (
+              <button
+                type="button"
+                onClick={() => {
+                  setTransformFile(null)
+                  setDownloadName("")
+                  setTransformSummary("")
+                  if (downloadUrl) {
+                    URL.revokeObjectURL(downloadUrl)
+                    setDownloadUrl("")
+                  }
+                }}
+                className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+              >
+                Clear
+              </button>
+            )}
+            {transformFile && (
+              <span className="truncate text-[11px] text-slate-500" title={transformFile.name}>
+                {transformFile.name}
+              </span>
+            )}
+          </div>
+          {transformFile && (
+            <div className="mb-2 flex flex-wrap gap-1.5">
+              {FILE_INSTRUCTION_EXAMPLES.map((example) => (
+                <button
+                  key={example}
+                  type="button"
+                  onClick={() => setInput(example)}
+                  className="rounded-full border border-cyan-200 bg-cyan-50 px-2 py-1 text-[10px] font-semibold text-cyan-800 hover:bg-cyan-100"
+                  title={example}
+                >
+                  {example}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="flex items-end gap-2">
             <textarea
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onInputKeyDown}
               rows={isFullMode ? 3 : 2}
-              placeholder="Ask about dashboard insights..."
+              placeholder={transformFile ? "Describe what to fill in the uploaded file..." : "Ask about dashboard insights..."}
               className="min-h-[44px] flex-1 resize-none rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none ring-indigo-500 transition focus:border-indigo-300 focus:ring-2"
             />
             <button
               type="button"
-              onClick={() => void send()}
-              disabled={!input.trim() || isSending}
+              onClick={() => void sendChatMessage()}
+              disabled={!input.trim() || isSending || isTransforming}
               className={`flex items-center justify-center rounded-xl bg-indigo-600 text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 ${isFullMode ? "h-11 w-11" : "h-10 w-10"}`}
               aria-label="Send message"
             >
               <Send size={15} />
             </button>
+            <button
+              type="button"
+              onClick={() => void applyFileInstruction()}
+              disabled={!transformFile || !input.trim() || isSending || isTransforming}
+              className={`flex items-center justify-center rounded-xl bg-cyan-600 px-3 text-white transition hover:bg-cyan-700 disabled:cursor-not-allowed disabled:opacity-50 ${isFullMode ? "h-11" : "h-10"}`}
+              aria-label="Apply instruction to file"
+              title="Apply instruction to uploaded file"
+            >
+              <FileUp size={14} />
+            </button>
           </div>
+          {downloadUrl && downloadName && (
+            <a
+              href={downloadUrl}
+              download={downloadName}
+              className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
+            >
+              <Download size={13} />
+              Download Updated File
+            </a>
+          )}
+          {transformSummary && (
+            <p className="mt-2 text-[11px] font-medium text-slate-500">{transformSummary}</p>
+          )}
           <p className="mt-2 text-[11px] font-medium text-slate-400">
-            Press Enter to send, Shift+Enter for a new line.
+            Press Enter to send chat. Upload a file and click the cyan button to apply your fill instruction.
           </p>
         </div>
       </aside>

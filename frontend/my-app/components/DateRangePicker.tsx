@@ -267,7 +267,7 @@ export default function DateRangePicker({
   }
 
   return (
-    <div ref={pickerRef} className="relative">
+    <div ref={pickerRef} className="relative z-[120]">
       <button
         ref={triggerRef}
         type="button"
@@ -295,7 +295,7 @@ export default function DateRangePicker({
 
       {open && (
         <div
-          className={`absolute z-[90] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[0_30px_65px_-38px_rgba(15,23,42,0.6)] ${
+          className={`absolute z-[140] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[0_30px_65px_-38px_rgba(15,23,42,0.6)] ${
             panelSide === "left" ? "left-0" : "right-0"
           } ${
             panelVertical === "down" ? "top-[calc(100%+10px)]" : "bottom-[calc(100%+10px)]"

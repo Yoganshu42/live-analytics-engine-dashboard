@@ -1,7 +1,8 @@
 "use client"
 
-import { useEffect, useId, useRef, useState } from "react"
+import { type MouseEvent, type TouchEvent, useEffect, useId, useMemo, useRef, useState } from "react"
 import { useReducedMotion } from "framer-motion"
+import indiaSvgMap from "@svg-maps/india"
 import {
   Area,
   AreaChart,
@@ -25,7 +26,12 @@ import {
 } from "recharts"
 
 /* ---------- TYPES ---------- */
-export type GraphChartType = "bar" | "line" | "pie" | "radar"
+export type GraphChartType = "bar" | "line" | "pie" | "radar" | "india_map"
+
+export type GraphCategoryFilter = {
+  dimension: string
+  values: string[]
+}
 
 type Props = {
   source: string
@@ -41,6 +47,7 @@ type Props = {
   chartType?: GraphChartType
   tooltipMetricOverride?: string
   heightClassName?: string
+  categoryFilters?: GraphCategoryFilter[]
   onDataReady?: (snapshot: GraphDataSnapshot) => void
 }
 
@@ -63,6 +70,12 @@ const toSafeKey = (key: string) =>
 
 const prettyLabel = (key: string) =>
   key.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+
+const truncateLabel = (value: string, maxLength = 18) => {
+  const text = String(value || "").trim()
+  if (text.length <= maxLength) return text
+  return `${text.slice(0, maxLength - 1)}...`
+}
 
 /* ---------- FORMATTERS ---------- */
 const formatValue = (value: number, measure: string) => {
@@ -132,6 +145,58 @@ const normalizeDimValue = (value: unknown, dimKey: string) => {
       return `${year}-${month}-01`
     }
   }
+  if (dimKey.includes("product_category")) {
+    const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, "")
+    if (!compact) return "Unknown"
+
+    if (
+      compact.includes("aircondition") ||
+      compact.includes("aircondit") ||
+      compact === "ac" ||
+      compact.includes("splitac") ||
+      compact.includes("windowac")
+    ) {
+      return "Air Conditioner"
+    }
+    if (compact.includes("aircooler")) return "Air Cooler"
+    if (
+      compact.includes("refrigerator") ||
+      compact.includes("refrigrator") ||
+      compact.includes("refrigator") ||
+      compact.includes("frigerator") ||
+      compact.includes("fridge")
+    ) {
+      return "Refrigerator"
+    }
+    if (
+      compact.includes("washingmachine") ||
+      compact.includes("washmachine") ||
+      compact.includes("washer")
+    ) {
+      return "Washing Machine"
+    }
+    if (
+      compact.includes("microwave") ||
+      compact.includes("micowave") ||
+      compact.includes("microoven")
+    ) {
+      return "Microwave"
+    }
+    if (compact.includes("deepfreezer")) return "Deep Freezer"
+    if (
+      compact.includes("chestfreezer") ||
+      compact.includes("chestfreeze") ||
+      compact.includes("chestfreez")
+    ) {
+      return "Chest Freezer"
+    }
+
+    const cleaned = raw.replace(/[^a-zA-Z0-9\s/-]/g, " ").replace(/\s+/g, " ").trim()
+    if (!cleaned) return "Unknown"
+    return cleaned
+      .toLowerCase()
+      .replace(/\b\w/g, (c) => c.toUpperCase())
+  }
   return raw
 }
 
@@ -156,6 +221,43 @@ const pickDimensionValue = (row: Row, dimKey: string) => {
 const asNumber = (value: unknown) => {
   const n = Number(value ?? 0)
   return Number.isFinite(n) ? n : 0
+}
+
+const mergeRowsByDimension = (rows: Row[], dimKey: string): Row[] => {
+  const merged = new Map<string, Row>()
+  rows.forEach((row) => {
+    const bucket = String(row[dimKey] ?? "Unknown").trim() || "Unknown"
+    const existing = merged.get(bucket)
+    if (!existing) {
+      merged.set(bucket, { ...row, [dimKey]: bucket })
+      return
+    }
+    Object.entries(row).forEach(([key, value]) => {
+      if (key === dimKey) return
+      const numeric = Number(value)
+      if (Number.isFinite(numeric)) {
+        existing[key] = asNumber(existing[key]) + numeric
+      } else if ((existing[key] == null || existing[key] === "") && value != null) {
+        existing[key] = value
+      }
+    })
+  })
+  return Array.from(merged.values())
+}
+
+const LOG_PLOT_SUFFIX = "__log_plot"
+
+const toLogPlotKey = (key: string) => `${key}${LOG_PLOT_SUFFIX}`
+
+const toOriginalMetricKey = (key: string) => (
+  key.endsWith(LOG_PLOT_SUFFIX)
+    ? key.slice(0, -LOG_PLOT_SUFFIX.length)
+    : key
+)
+
+const toLogSafeValue = (value: unknown) => {
+  const numeric = asNumber(value)
+  return numeric > 0 ? numeric : 1
 }
 
 const toTimeValue = (value: unknown) => {
@@ -207,7 +309,7 @@ const sortTemporalRows = (rows: Row[], dimKey: string) =>
   })
 
 /* ---------- DATA FETCH ---------- */
-type FetchParams = {
+export type GraphFetchParams = {
   source: string
   dimension: string
   metric: string
@@ -216,6 +318,7 @@ type FetchParams = {
   jobId?: string | null
   from_date?: string
   to_date?: string
+  categoryFilters?: GraphCategoryFilter[]
 }
 
 type FetchRowsResult = {
@@ -315,7 +418,8 @@ const buildQuery = ({
   jobId,
   from_date,
   to_date,
-}: FetchParams) => {
+  categoryFilters,
+}: GraphFetchParams) => {
   let safeFrom = from_date
   let safeTo = to_date
   if (safeFrom && safeTo && safeFrom > safeTo) {
@@ -335,6 +439,22 @@ const buildQuery = ({
   if (bucket) query.set("bucket", bucket)
   if (safeFrom) query.set("from_date", safeFrom)
   if (safeTo) query.set("to_date", safeTo)
+  const activeFilters = (categoryFilters || [])
+    .map((filter) => ({
+      dimension: toSafeKey(String(filter.dimension || "")),
+      values: Array.isArray(filter.values)
+        ? filter.values
+            .map((value) => String(value || "").trim())
+            .filter(Boolean)
+        : [],
+    }))
+    .filter((filter) => Boolean(filter.dimension) && filter.values.length > 0)
+    .slice(0, 2)
+  activeFilters.forEach((filter, index) => {
+    const slot = index + 1
+    query.set(`filter_${slot}_dimension`, filter.dimension)
+    query.set(`filter_${slot}_values`, filter.values.join(","))
+  })
   return query.toString()
 }
 
@@ -354,7 +474,7 @@ class NoFallbackError extends Error {
   noFallback = true
 }
 
-const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
+const fetchRows = async (params: GraphFetchParams): Promise<FetchRowsResult> => {
   const query = buildQuery(params)
   const cacheKey = `${params.source}|${params.datasetType}|${query}`
   const now = Date.now()
@@ -406,7 +526,7 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
           return { ts: Date.now(), data: [], measure: metricKey, usedRangeFallback: false }
         }
 
-        const processed: Row[] = raw.map(row => {
+        let processed: Row[] = raw.map(row => {
           const out: Row = {}
           Object.entries(row).forEach(([k, v]) => {
             out[toSafeKey(k)] = v
@@ -414,6 +534,9 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
           out[dimKey] = normalizeDimValue(pickDimensionValue(out, dimKey), dimKey)
           return out
         })
+        if (dimKey.includes("product_category")) {
+          processed = mergeRowsByDimension(processed, dimKey)
+        }
 
         return {
           ts: Date.now(),
@@ -452,16 +575,20 @@ const fetchRows = async (params: FetchParams): Promise<FetchRowsResult> => {
   }
 }
 
-const fetchRowsWithRangeFallback = async (params: FetchParams): Promise<FetchRowsResult> => {
+const fetchRowsWithRangeFallback = async (params: GraphFetchParams): Promise<FetchRowsResult> => {
   return fetchRows(params)
 }
 
-export const prefetchGraphData = async (params: FetchParams) => {
+export const fetchGraphRows = async (params: GraphFetchParams) => {
+  return fetchRowsWithRangeFallback(params)
+}
+
+export const prefetchGraphData = async (params: GraphFetchParams) => {
   if (!params.source || !params.dimension || !params.metric) return
   await fetchRows(params)
 }
 
-export const hasGraphData = async (params: FetchParams): Promise<boolean> => {
+export const hasGraphData = async (params: GraphFetchParams): Promise<boolean> => {
   if (!params.source || !params.dimension || !params.metric) return false
   const result = await fetchRowsWithRangeFallback(params)
   return result.data.length > 0
@@ -511,6 +638,124 @@ const mixWithBlack = (hex: string, amount: number) => {
     .join("")}`
 }
 
+type IndiaMapLocation = {
+  id: string
+  name: string
+  path: string
+}
+
+const INDIA_MAP_LOCATIONS: IndiaMapLocation[] = (
+  indiaSvgMap.locations as Array<{ id: string; name: string; path: string }>
+).map((location) => ({
+  id: location.id,
+  name: location.name,
+  path: location.path,
+}))
+
+const normalizeStateLookupKey = (value: string) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "")
+
+const INDIA_STATE_KEY_TO_ID: Record<string, string> = INDIA_MAP_LOCATIONS.reduce(
+  (acc, location) => {
+    acc[normalizeStateLookupKey(location.name)] = location.id
+    return acc
+  },
+  {} as Record<string, string>
+)
+
+const STATE_NAME_ALIASES: Record<string, string> = {
+  orissa: "odisha",
+  pondicherry: "puducherry",
+  uttaranchal: "uttarakhand",
+  nctofdelhi: "delhi",
+  newdelhi: "delhi",
+  andamanandnicobar: "andamanandnicobarislands",
+  andamannicobar: "andamanandnicobarislands",
+  jandk: "jammuandkashmir",
+  jk: "jammuandkashmir",
+  up: "uttarpradesh",
+  wb: "westbengal",
+  telengana: "telangana",
+  del: "delhi",
+  delhincr: "delhi",
+  ncrdelhi: "delhi",
+  mumbai: "maharashtra",
+  navimumbai: "maharashtra",
+  pune: "maharashtra",
+  thane: "maharashtra",
+  bengaluru: "karnataka",
+  bangalore: "karnataka",
+  chennai: "tamilnadu",
+  hyderabad: "telangana",
+  kolkata: "westbengal",
+  ahmedabad: "gujarat",
+  surat: "gujarat",
+  jaipur: "rajasthan",
+  lucknow: "uttarpradesh",
+  noida: "uttarpradesh",
+  ghaziabad: "uttarpradesh",
+  gurgaon: "haryana",
+  gurugram: "haryana",
+  faridabad: "haryana",
+  kochi: "kerala",
+  trivandrum: "kerala",
+  thiruvananthapuram: "kerala",
+  bhubaneswar: "odisha",
+  visakhapatnam: "andhrapradesh",
+  vijayawada: "andhrapradesh",
+  indore: "madhyapradesh",
+  bhopal: "madhyapradesh",
+  patna: "bihar",
+  ranchi: "jharkhand",
+  chandigarh: "chandigarh",
+}
+
+Object.entries(STATE_NAME_ALIASES).forEach(([aliasKey, canonicalKey]) => {
+  const canonicalId = INDIA_STATE_KEY_TO_ID[canonicalKey]
+  if (canonicalId) INDIA_STATE_KEY_TO_ID[aliasKey] = canonicalId
+})
+
+const mapStateToIndiaStateId = (stateValue: string): string | null => {
+  const key = normalizeStateLookupKey(stateValue)
+  if (!key) return null
+  return INDIA_STATE_KEY_TO_ID[key] || null
+}
+
+const interpolateHex = (fromHex: string, toHex: string, t: number) => {
+  const clamped = Math.max(0, Math.min(1, t))
+  const from = hexToRgb(fromHex)
+  const to = hexToRgb(toHex)
+  const lerp = (a: number, b: number) => Math.round(a + (b - a) * clamped)
+  return `#${[lerp(from.r, to.r), lerp(from.g, to.g), lerp(from.b, to.b)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("")}`
+}
+
+const INDIA_HEATMAP_LOW = "#fee2e2"
+const INDIA_HEATMAP_HIGH = "#7f1d1d"
+
+type HoverDetailMetricKey =
+  | "gross_premium"
+  | "earned_premium"
+  | "zopper_earned_premium"
+  | "quantity"
+
+const HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
+  "gross_premium",
+  "earned_premium",
+  "zopper_earned_premium",
+  "quantity",
+]
+
+const HOVER_DETAIL_LABELS: Record<HoverDetailMetricKey, string> = {
+  gross_premium: "Gross Premium",
+  earned_premium: "Earned Premium",
+  zopper_earned_premium: "Zopper Earned Premium",
+  quantity: "Quantity",
+}
+
 const formatAxisCompact = (value: number, measure: string) => {
   const m = measure.toLowerCase()
   if (m.includes("loss_ratio")) return `${value.toFixed(1)}%`
@@ -558,15 +803,15 @@ const CustomTooltip = ({
     const vsMetric = asNumber(tooltipRow?.samsung_vs)
     const cromaMetric = asNumber(tooltipRow?.samsung_croma)
     return (
-      <div className="rounded-lg border bg-white p-3 shadow">
-        <p className="text-xs font-bold text-gray-400">{formattedLabel}</p>
+      <div className="max-w-[min(84vw,280px)] rounded-lg border bg-white p-2.5 shadow sm:p-3">
+        <p className="text-[11px] font-bold text-gray-400 sm:text-xs">{formattedLabel}</p>
         <div className="mt-2">
-          <div className="grid grid-cols-[minmax(120px,1fr)_auto_auto] items-center gap-x-4 gap-y-1 text-[11px] font-semibold text-slate-500">
+          <div className="grid grid-cols-[minmax(92px,1fr)_auto_auto] items-center gap-x-2 gap-y-1 text-[10px] font-semibold text-slate-500 sm:grid-cols-[minmax(120px,1fr)_auto_auto] sm:gap-x-4 sm:text-[11px]">
             <span />
             <span>Quantity</span>
             <span>{prettyLabel(measure)}</span>
           </div>
-          <div className="mt-1 grid grid-cols-[minmax(120px,1fr)_auto_auto] items-center gap-x-4 gap-y-2 text-sm font-semibold">
+          <div className="mt-1 grid grid-cols-[minmax(92px,1fr)_auto_auto] items-center gap-x-2 gap-y-1.5 text-[11px] font-semibold sm:grid-cols-[minmax(120px,1fr)_auto_auto] sm:gap-x-4 sm:gap-y-2 sm:text-sm">
             <span className="flex items-center gap-2 text-slate-700">
               <span className="inline-block h-2.5 w-2.5 rounded-full bg-[#f97316]" />
               Vijay Sales
@@ -586,25 +831,33 @@ const CustomTooltip = ({
   }
 
   return (
-    <div className="bg-white p-3 border shadow rounded-lg">
-      <p className="text-xs text-gray-400 font-bold">{formattedLabel}</p>
-      <div className="space-y-1">
+    <div className="max-w-[min(84vw,280px)] rounded-lg border bg-white p-2.5 shadow sm:p-3">
+      <p className="text-[11px] font-bold text-gray-400 sm:text-xs">{formattedLabel}</p>
+      <div className="space-y-0.5 sm:space-y-1">
         {payload.map((p) => (
-          <div key={p.dataKey} className="flex items-center gap-2 text-sm font-semibold">
-            <span
-              className="inline-block h-2.5 w-2.5 rounded-full"
-              style={{ backgroundColor: p.color || "#64748b" }}
-            />
-            <span className="text-slate-700">
-              {p.name || p.dataKey}
-            </span>
-            <span className="ml-auto text-slate-900">
-              {formatValue(asNumber(p.value), measure)}
-            </span>
-          </div>
+          (() => {
+            const metricKey = toOriginalMetricKey(String(p.dataKey || ""))
+            const metricValue = p.payload && metricKey in p.payload
+              ? asNumber(p.payload[metricKey])
+              : asNumber(p.value)
+            return (
+              <div key={p.dataKey} className="flex items-center gap-2 text-[11px] font-semibold sm:text-sm">
+                <span
+                  className="inline-block h-2.5 w-2.5 rounded-full"
+                  style={{ backgroundColor: p.color || "#64748b" }}
+                />
+                <span className="text-slate-700">
+                  {p.name || p.dataKey}
+                </span>
+                <span className="ml-auto text-slate-900">
+                  {formatValue(metricValue, measure)}
+                </span>
+              </div>
+            )
+          })()
         ))}
       </div>
-      <p className="text-[10px] text-indigo-500 font-semibold mt-2">
+      <p className="mt-1.5 text-[10px] font-semibold text-indigo-500 sm:mt-2">
         {prettyLabel(measure)}
       </p>
     </div>
@@ -626,6 +879,7 @@ export default function GraphView({
   chartType = "bar",
   tooltipMetricOverride,
   heightClassName = "h-72",
+  categoryFilters,
   onDataReady,
 }: Props) {
   const prefersReducedMotion = useReducedMotion()
@@ -636,9 +890,57 @@ export default function GraphView({
   const [compareMode, setCompareMode] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return window.innerWidth < 640
+  })
+  const [activeMapKey, setActiveMapKey] = useState<string | null>(null)
+  const [hoverDetailByStateId, setHoverDetailByStateId] = useState<
+    Record<string, Partial<Record<HoverDetailMetricKey, number>>>
+  >({})
+  const [hoverCard, setHoverCard] = useState<{
+    key: string
+    label: string
+    x: number
+    y: number
+    width: number
+    compact: boolean
+  } | null>(null)
+  const mapPanelRef = useRef<HTMLDivElement | null>(null)
   const requestIdRef = useRef(0)
   const gradientId = useId()
   const gradientIdAlt = useId()
+  const normalizedCategoryFilters = useMemo<GraphCategoryFilter[]>(() => (
+    (categoryFilters || [])
+      .map((filter) => ({
+        dimension: toSafeKey(String(filter.dimension || "")),
+        values: Array.isArray(filter.values)
+          ? filter.values
+              .map((value) => String(value || "").trim())
+              .filter(Boolean)
+          : [],
+      }))
+      .filter((filter) => Boolean(filter.dimension) && filter.values.length > 0)
+      .slice(0, 2)
+  ), [categoryFilters])
+  const categoryFiltersKey = useMemo(
+    () => JSON.stringify(normalizedCategoryFilters),
+    [normalizedCategoryFilters]
+  )
+
+  useEffect(() => {
+    setActiveMapKey(null)
+    setHoverCard(null)
+  }, [source, dimension, metric, datasetType, bucket, chartType, fromDate, toDate, jobId, categoryFiltersKey])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const onResize = () => setIsMobileViewport(window.innerWidth < 640)
+    window.addEventListener("resize", onResize)
+    return () => {
+      window.removeEventListener("resize", onResize)
+    }
+  }, [])
 
   useEffect(() => {
     if (!deferUntilVisible) {
@@ -690,6 +992,7 @@ export default function GraphView({
             jobId,
             from_date: fromDate,
             to_date: toDate,
+            categoryFilters: normalizedCategoryFilters,
           })
 
           let merged: Row[] = (combined.data || []).map(row => ({
@@ -708,6 +1011,7 @@ export default function GraphView({
               jobId,
               from_date: fromDate,
               to_date: toDate,
+              categoryFilters: normalizedCategoryFilters,
             })
 
             const tooltipMap = new Map<string, { samsung_vs: number; samsung_croma: number }>()
@@ -756,6 +1060,7 @@ export default function GraphView({
           jobId,
           from_date: fromDate,
           to_date: toDate,
+          categoryFilters: normalizedCategoryFilters,
         })
 
         if (!single.data.length) {
@@ -838,7 +1143,72 @@ export default function GraphView({
     return () => {
       if (timer) clearTimeout(timer)
     }
-  }, [source, dimension, metric, datasetType, bucket, jobId, fromDate, toDate, fetchDelayMs, onDataReady, deferUntilVisible, isVisible, tooltipMetricOverride])
+  }, [
+    source,
+    dimension,
+    metric,
+    datasetType,
+    bucket,
+    jobId,
+    fromDate,
+    toDate,
+    fetchDelayMs,
+    onDataReady,
+    deferUntilVisible,
+    isVisible,
+    tooltipMetricOverride,
+    categoryFiltersKey,
+    normalizedCategoryFilters,
+  ])
+
+  useEffect(() => {
+    let active = true
+    if (chartType !== "india_map" || !source) {
+      setHoverDetailByStateId({})
+      return () => {
+        active = false
+      }
+    }
+
+    const loadHoverDetails = async () => {
+      const aggregate: Record<string, Partial<Record<HoverDetailMetricKey, number>>> = {}
+      await Promise.all(
+        HOVER_DETAIL_METRICS.map(async (detailMetric) => {
+          try {
+            const result = await fetchGraphRows({
+              source,
+              dimension: "state",
+              metric: detailMetric,
+              datasetType: "sales",
+              bucket,
+              jobId,
+              from_date: fromDate,
+              to_date: toDate,
+              categoryFilters: normalizedCategoryFilters,
+            })
+            const measureKey = toSafeKey(result.measure || detailMetric)
+            ;(result.data || []).forEach((row) => {
+              const rawStateValue = String(row.state ?? row[toSafeKey("state")] ?? "").trim()
+              const stateId = mapStateToIndiaStateId(rawStateValue)
+              if (!stateId) return
+              const value = asNumber(row[measureKey] ?? row[detailMetric])
+              if (!aggregate[stateId]) aggregate[stateId] = {}
+              aggregate[stateId][detailMetric] = (aggregate[stateId][detailMetric] || 0) + value
+            })
+          } catch {
+            // ignore hover detail misses per metric and keep map interactive
+          }
+        })
+      )
+      if (!active) return
+      setHoverDetailByStateId(aggregate)
+    }
+
+    loadHoverDetails()
+    return () => {
+      active = false
+    }
+  }, [chartType, source, bucket, jobId, fromDate, toDate, datasetType, categoryFiltersKey, normalizedCategoryFilters])
 
   if (deferUntilVisible && !isVisible) {
     return (
@@ -883,32 +1253,62 @@ export default function GraphView({
   const showCompareQuantityTooltip =
     compareMode && toSafeKey(tooltipMetricOverride || "") === "quantity"
   const clampToZero = !isLossRatio || source === "reliance"
-  const chartData: Row[] = clampToZero
-    ? data.map((row) => {
-        const next: Row = { ...row }
-        if (compareMode) {
-          next.samsung_vs = Math.max(0, asNumber(row.samsung_vs))
-          next.samsung_croma = Math.max(0, asNumber(row.samsung_croma))
-          return next
-        }
-        next[measure] = Math.max(0, asNumber(row[measure]))
-        if (showEwCounts) {
-          next.ew_count = Math.max(0, asNumber(row.ew_count))
-        }
-        return next
-      })
-    : data
+  const useLogScale = false
+  const primaryPlotKey = useLogScale ? toLogPlotKey(measure) : measure
+  const ewCountPlotKey = useLogScale ? toLogPlotKey("ew_count") : "ew_count"
+  const samsungVsPlotKey = useLogScale ? toLogPlotKey("samsung_vs") : "samsung_vs"
+  const samsungCromaPlotKey = useLogScale ? toLogPlotKey("samsung_croma") : "samsung_croma"
+  const isSamsungSource = source === "samsung"
+  const isRelianceSource = source === "reliance"
+  const chartData: Row[] = data.map((row) => {
+    const next: Row = { ...row }
+    if (compareMode) {
+      if (clampToZero) {
+        next.samsung_vs = Math.max(0, asNumber(row.samsung_vs))
+        next.samsung_croma = Math.max(0, asNumber(row.samsung_croma))
+      }
+      if (useLogScale) {
+        next[samsungVsPlotKey] = toLogSafeValue(next.samsung_vs)
+        next[samsungCromaPlotKey] = toLogSafeValue(next.samsung_croma)
+      }
+      return next
+    }
+
+    if (clampToZero) {
+      next[measure] = Math.max(0, asNumber(row[measure]))
+      if (showEwCounts) {
+        next.ew_count = Math.max(0, asNumber(row.ew_count))
+      }
+    }
+    if (useLogScale) {
+      next[primaryPlotKey] = toLogSafeValue(next[measure])
+      if (showEwCounts) {
+        next[ewCountPlotKey] = toLogSafeValue(next.ew_count)
+      }
+    }
+    return next
+  })
   const shouldAnimateBars = !prefersReducedMotion && chartData.length <= 36
   const barAnimationDuration = shouldAnimateBars ? 500 : 0
   const pieData = chartData
-    .map((row) => ({
-      name: String(row[dimKey] ?? "Unknown"),
-      value: compareMode
+    .map((row) => {
+      const baseValue = compareMode
         ? Math.max(0, asNumber(row.samsung_vs) + asNumber(row.samsung_croma))
-        : Math.max(0, asNumber(row[measure])),
-    }))
+        : Math.max(0, asNumber(row[measure]))
+      const ewValue = !compareMode && isRelianceSource && measure.includes("quantity")
+        ? Math.max(0, asNumber(row.ew_count))
+        : 0
+      return {
+        name: String(row[dimKey] ?? "Unknown"),
+        value: baseValue + ewValue,
+        baseValue,
+        ewValue,
+      }
+    })
     .filter((row) => row.value > 0)
-  const pieRows = pieData.length ? pieData : [{ name: "No Data", value: 1 }]
+  const pieRows = pieData.length
+    ? pieData
+    : [{ name: "No Data", value: 1, baseValue: 1, ewValue: 0 }]
   const pieGradientBase = (gradientId || "pie").replace(/[^a-zA-Z0-9_-]/g, "")
   const pieSlices = pieRows.map((entry, idx) => {
     const baseColor = pieData.length
@@ -922,16 +1322,106 @@ export default function GraphView({
       gradientId: `${pieGradientBase}-pie-${idx}`,
     }
   })
+  const pieTotal = pieSlices.reduce((sum, slice) => sum + asNumber(slice.value), 0)
+  const pieLegendItems = pieSlices.map((slice) => {
+    const value = asNumber(slice.value)
+    const percentage = pieTotal > 0 ? (value / pieTotal) * 100 : 0
+    return {
+      ...slice,
+      value,
+      percentage,
+      formattedValue: measure.includes("quantity")
+        ? value.toLocaleString()
+        : formatValue(value, measure),
+    }
+  })
   const radarData = chartData.map((row) => ({
     name: String(row[dimKey] ?? "Unknown"),
     samsung_vs: Math.max(0, asNumber(row.samsung_vs)),
     samsung_croma: Math.max(0, asNumber(row.samsung_croma)),
     [measure]: Math.max(0, asNumber(row[measure])),
   }))
+  const indiaMapValuesByStateId = new Map<string, number>()
+  INDIA_MAP_LOCATIONS.forEach((location) => {
+    indiaMapValuesByStateId.set(location.id, 0)
+  })
+  chartData.forEach((row) => {
+    const stateName = String(row[dimKey] ?? "").trim()
+    const stateId = mapStateToIndiaStateId(stateName)
+    if (!stateId) return
+    const value = compareMode
+      ? Math.max(0, asNumber(row.samsung_vs) + asNumber(row.samsung_croma))
+      : Math.max(0, asNumber(row[measure]))
+    indiaMapValuesByStateId.set(stateId, (indiaMapValuesByStateId.get(stateId) || 0) + value)
+  })
+  const indiaMapEntries = INDIA_MAP_LOCATIONS.map((location) => {
+    const value = indiaMapValuesByStateId.get(location.id) || 0
+    return {
+      key: location.id,
+      label: location.name,
+      path: location.path,
+      value,
+    }
+  })
+  const indiaMapLegendEntries = indiaMapEntries
+    .filter((entry) => entry.value > 0)
+    .sort((a, b) => b.value - a.value)
+  const maxIndiaMapValue = indiaMapEntries.reduce((max, entry) => Math.max(max, entry.value), 0)
+  const indiaMapLegendRows = indiaMapLegendEntries.length ? indiaMapLegendEntries : indiaMapEntries
+  const hoverMetricValues = hoverCard ? hoverDetailByStateId[hoverCard.key] || {} : {}
+
+  const placeHoverCard = (
+    clientX: number,
+    clientY: number,
+    stateKey: string,
+    stateLabel: string
+  ) => {
+    const host = mapPanelRef.current
+    if (!host) return
+    const rect = host.getBoundingClientRect()
+    const viewportWidth = typeof window !== "undefined" ? window.innerWidth : rect.width
+    const compact = viewportWidth < 640 || rect.width < 380
+    const desiredWidth = compact ? 210 : 254
+    const maxAllowedWidth = Math.max(120, rect.width - 16)
+    const cardWidth = Math.min(desiredWidth, maxAllowedWidth)
+    const cardHeight = compact ? 142 : 168
+    let x = clientX - rect.left + 12
+    let y = clientY - rect.top + 12
+    if (x + cardWidth > rect.width - 8) x = rect.width - cardWidth - 8
+    if (y + cardHeight > rect.height - 8) y = rect.height - cardHeight - 8
+    if (x < 8) x = 8
+    if (y < 8) y = 8
+    setHoverCard({
+      key: stateKey,
+      label: stateLabel,
+      x,
+      y,
+      width: cardWidth,
+      compact,
+    })
+  }
+
+  const updateHoverCardPosition = (
+    event: MouseEvent<SVGPathElement>,
+    stateKey: string,
+    stateLabel: string
+  ) => {
+    placeHoverCard(event.clientX, event.clientY, stateKey, stateLabel)
+  }
+
+  const updateHoverCardPositionFromTouch = (
+    event: TouchEvent<SVGPathElement>,
+    stateKey: string,
+    stateLabel: string
+  ) => {
+    const touch = event.touches[0] || event.changedTouches[0]
+    if (!touch) return
+    placeHoverCard(touch.clientX, touch.clientY, stateKey, stateLabel)
+  }
 
   return (
     <div ref={containerRef} className={`smooth-surface ${heightClassName}`}>
-      {compareMode && chartType !== "pie" && (
+      {compareMode && chartType !== "pie" && chartType !== "india_map" && (
         <div className="mb-2 flex items-center gap-3 text-[11px] font-semibold text-slate-500">
           <span className="flex items-center gap-1.5">
             <span
@@ -949,9 +1439,234 @@ export default function GraphView({
           </span>
         </div>
       )}
+      {chartType === "india_map" ? (
+        <div className="flex h-full min-h-0 flex-col gap-2">
+          <div
+            ref={mapPanelRef}
+            className="relative min-h-0 basis-[64%] rounded-xl border border-slate-200/80 bg-slate-50/60 px-2 py-2"
+          >
+            <svg
+              viewBox={indiaSvgMap.viewBox}
+              className="h-full w-full"
+              aria-label="India state heatmap"
+              role="img"
+            >
+              {indiaMapEntries.map((entry) => {
+                const ratio = maxIndiaMapValue > 0 ? entry.value / maxIndiaMapValue : 0
+                const isActive = activeMapKey === entry.key
+                const isDimmed = activeMapKey !== null && !isActive
+                const baseFill = entry.value > 0
+                  ? interpolateHex(INDIA_HEATMAP_LOW, INDIA_HEATMAP_HIGH, Math.max(0.08, ratio))
+                  : "#e5e7eb"
+                const fill = isActive ? mixWithBlack(baseFill, 0.14) : baseFill
+                const stroke = isActive ? "#0f172a" : "#ffffff"
+                const accessibleValue = measure.includes("quantity")
+                  ? entry.value.toLocaleString()
+                  : formatValue(entry.value, measure)
+                return (
+                  <path
+                    key={entry.key}
+                    d={entry.path}
+                    fill={fill}
+                    stroke={stroke}
+                    strokeWidth={isActive ? 1.4 : 0.8}
+                    opacity={isDimmed ? 0.35 : 1}
+                    className="cursor-pointer transition-all duration-150 ease-out"
+                    onClick={() => setActiveMapKey((prev) => (prev === entry.key ? null : entry.key))}
+                    onMouseEnter={(event) => updateHoverCardPosition(event, entry.key, entry.label)}
+                    onMouseMove={(event) => updateHoverCardPosition(event, entry.key, entry.label)}
+                    onTouchStart={(event) => updateHoverCardPositionFromTouch(event, entry.key, entry.label)}
+                    onTouchMove={(event) => updateHoverCardPositionFromTouch(event, entry.key, entry.label)}
+                    onMouseLeave={() => setHoverCard(null)}
+                    onTouchCancel={() => setHoverCard(null)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        setActiveMapKey((prev) => (prev === entry.key ? null : entry.key))
+                      }
+                    }}
+                    onBlur={() => setHoverCard(null)}
+                    tabIndex={0}
+                    role="button"
+                    aria-pressed={isActive}
+                    aria-label={`${entry.label}: ${accessibleValue}`}
+                  />
+                )
+              })}
+            </svg>
+            {hoverCard && (
+              <div
+                className={`pointer-events-none absolute z-20 rounded-lg border border-slate-300/90 bg-white/96 shadow-[0_16px_36px_-18px_rgba(15,23,42,0.5)] ${
+                  hoverCard.compact ? "p-2.5" : "p-3"
+                }`}
+                style={{ left: `${hoverCard.x}px`, top: `${hoverCard.y}px`, width: `${hoverCard.width}px` }}
+              >
+                <div className={`mb-1 font-bold text-slate-800 ${hoverCard.compact ? "text-[11px]" : "text-xs"}`}>
+                  {hoverCard.label}
+                </div>
+                <div className={hoverCard.compact ? "space-y-0.5" : "space-y-1"}>
+                  {HOVER_DETAIL_METRICS.map((detailMetric) => {
+                    const value = hoverMetricValues[detailMetric]
+                    const hasValue = value != null
+                    const formatted = hasValue
+                      ? formatValue(asNumber(value), detailMetric)
+                      : "N/A"
+                    return (
+                      <div
+                        key={`${hoverCard.key}-${detailMetric}`}
+                        className={`grid grid-cols-[minmax(0,1fr)_auto] items-center ${
+                          hoverCard.compact ? "gap-1.5 text-[10px]" : "gap-2 text-[11px]"
+                        }`}
+                      >
+                        <span className="truncate text-slate-600">{HOVER_DETAIL_LABELS[detailMetric]}</span>
+                        <span className="font-semibold text-slate-800">{formatted}</span>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="rounded-xl border border-slate-200/80 bg-white/90 px-2.5 py-2">
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">
+              Heat Scale
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-semibold text-slate-500">
+              <span>0</span>
+              <div
+                className="h-2 flex-1 rounded-full border border-slate-200"
+                style={{ backgroundImage: `linear-gradient(90deg, ${INDIA_HEATMAP_LOW}, ${INDIA_HEATMAP_HIGH})` }}
+              />
+              <span>
+                {measure.includes("quantity")
+                  ? maxIndiaMapValue.toLocaleString()
+                  : formatValue(maxIndiaMapValue, measure)}
+              </span>
+            </div>
+          </div>
+          <div className="min-h-[138px] basis-[30%] overflow-y-auto rounded-xl border border-slate-200/80 bg-white/85 p-2">
+            <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">
+              State and UT Legends
+            </div>
+            <ul className="space-y-1.5">
+              {indiaMapLegendRows.map((entry) => {
+                const ratio = maxIndiaMapValue > 0 ? entry.value / maxIndiaMapValue : 0
+                const isActive = activeMapKey === entry.key
+                const isDimmed = activeMapKey !== null && !isActive
+                const swatch = entry.value > 0
+                  ? interpolateHex(INDIA_HEATMAP_LOW, INDIA_HEATMAP_HIGH, Math.max(0.08, ratio))
+                  : "#e5e7eb"
+                const formatted = measure.includes("quantity")
+                  ? entry.value.toLocaleString()
+                  : formatValue(entry.value, measure)
+                return (
+                  <li key={`legend-${entry.key}`}>
+                    <button
+                      type="button"
+                      className={`flex w-full items-center gap-2 rounded-lg border px-2.5 py-1.5 text-left text-[11px] transition ${
+                        isActive
+                          ? "border-slate-400 bg-slate-100/90 text-slate-900"
+                          : "border-slate-200 bg-white text-slate-700 hover:border-slate-300"
+                      }`}
+                      style={{ opacity: isDimmed ? 0.45 : 1 }}
+                      onClick={() => setActiveMapKey((prev) => (prev === entry.key ? null : entry.key))}
+                      aria-pressed={isActive}
+                    >
+                      <span
+                        className="inline-block h-2.5 w-2.5 rounded-full border border-white/80"
+                        style={{ backgroundColor: isActive ? mixWithBlack(swatch, 0.14) : swatch }}
+                      />
+                      <span className="truncate">{entry.label}</span>
+                      <span className="ml-auto whitespace-nowrap font-semibold text-slate-500">
+                        {formatted}
+                      </span>
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        </div>
+      ) : chartType === "pie" && !isSamsungSource ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="min-h-0 basis-[68%]">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart margin={{ top: 2, right: 4, bottom: 2, left: 4 }}>
+                <defs>
+                  {pieSlices.map((slice) => (
+                    <linearGradient
+                      key={slice.gradientId}
+                      id={slice.gradientId}
+                      x1="0%"
+                      y1="0%"
+                      x2="100%"
+                      y2="100%"
+                    >
+                      <stop offset="0%" stopColor={slice.gradientFrom} />
+                      <stop offset="100%" stopColor={slice.gradientTo} />
+                    </linearGradient>
+                  ))}
+                </defs>
+                <Tooltip
+                  formatter={(value: unknown, name: unknown) => {
+                    const numericValue = asNumber(value)
+                    const pct = pieTotal > 0 ? (numericValue / pieTotal) * 100 : 0
+                    return [`${formatValue(numericValue, measure)} (${pct.toFixed(1)}%)`, String(name || "")]
+                  }}
+                />
+                <Pie
+                  data={pieSlices}
+                  dataKey="value"
+                  nameKey="name"
+                  innerRadius="36%"
+                  outerRadius="72%"
+                  paddingAngle={2}
+                  stroke="#ffffff"
+                  strokeWidth={1}
+                  isAnimationActive={shouldAnimateBars}
+                >
+                  {pieSlices.map((entry, idx) => (
+                    <Cell
+                      key={`${entry.name}-${idx}`}
+                      fill={`url(#${entry.gradientId})`}
+                    />
+                  ))}
+                </Pie>
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-1 min-h-[78px] basis-[32%] overflow-y-auto pr-1">
+            <ul className="space-y-1.5">
+              {pieLegendItems.map((item) => (
+                <li key={item.gradientId} className="flex items-center gap-2 text-[11px] text-slate-600">
+                  <span
+                    className="inline-block h-2.5 w-2.5 rounded-full border border-white/80"
+                    style={{
+                      backgroundImage: `linear-gradient(135deg, ${item.gradientFrom}, ${item.gradientTo})`,
+                    }}
+                  />
+                  <span className="truncate" title={item.name}>
+                    {truncateLabel(item.name, 24)}
+                  </span>
+                  <span className="ml-auto whitespace-nowrap font-semibold text-slate-500">
+                    {item.percentage.toFixed(1)}%
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : (
       <ResponsiveContainer width="100%" height="100%">
         {chartType === "line" ? (
-          <AreaChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 6 }}>
+          <AreaChart
+            data={chartData}
+            margin={
+              isMobileViewport
+                ? { top: 8, right: 6, left: 2, bottom: 4 }
+                : { top: 12, right: 10, left: 14, bottom: 8 }
+            }
+          >
             <defs>
               <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor={mixWithWhite(primaryColor, 0.15)} stopOpacity={0.55} />
@@ -966,16 +1681,24 @@ export default function GraphView({
             <XAxis
               dataKey={dimKey}
               interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
-              minTickGap={isTemporalDimension ? 16 : 8}
-              tick={{ fontSize: 11 }}
+              minTickGap={isTemporalDimension ? (isMobileViewport ? 8 : 16) : 8}
+              tick={{ fontSize: isMobileViewport ? 10 : 11 }}
               tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : String(v))}
             />
             <YAxis
-              domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
-              tick={{ fontSize: 11 }}
+              scale={useLogScale ? "log" : "auto"}
+              domain={useLogScale ? [1, "auto"] : (clampToZero ? [0, "auto"] : ["auto", "auto"])}
+              width={isMobileViewport ? 52 : 72}
+              tickMargin={isMobileViewport ? 4 : 6}
+              tick={{ fontSize: isMobileViewport ? 10 : 11 }}
               tickFormatter={(v) => formatAxisCompact(asNumber(v), measure)}
             />
             <Tooltip
+              allowEscapeViewBox={{ x: false, y: false }}
+              wrapperStyle={{
+                maxWidth: isMobileViewport ? "calc(100vw - 40px)" : "320px",
+                zIndex: 30,
+              }}
               content={
                 <CustomTooltip
                   measure={measure}
@@ -987,7 +1710,7 @@ export default function GraphView({
               <>
                 <Area
                   type="monotone"
-                  dataKey="samsung_vs"
+                  dataKey={samsungVsPlotKey}
                   name="Vijay Sales"
                   stroke={primaryColor}
                   fill={`url(#${gradientId})`}
@@ -998,7 +1721,7 @@ export default function GraphView({
                 />
                 <Area
                   type="monotone"
-                  dataKey="samsung_croma"
+                  dataKey={samsungCromaPlotKey}
                   name="Croma"
                   stroke={secondaryColor}
                   fill={`url(#${gradientIdAlt})`}
@@ -1012,7 +1735,7 @@ export default function GraphView({
               <>
                 <Area
                   type="monotone"
-                  dataKey={measure}
+                  dataKey={primaryPlotKey}
                   name={prettyLabel(measure)}
                   stroke={primaryColor}
                   fill={`url(#${gradientId})`}
@@ -1024,7 +1747,7 @@ export default function GraphView({
                 {showEwCounts && (
                   <Line
                     type="monotone"
-                    dataKey="ew_count"
+                    dataKey={ewCountPlotKey}
                     name="EW Count"
                     stroke={secondaryColor}
                     strokeWidth={2}
@@ -1036,7 +1759,7 @@ export default function GraphView({
             )}
           </AreaChart>
         ) : chartType === "pie" ? (
-          <PieChart margin={{ top: 6, right: 20, bottom: 34, left: 20 }}>
+          <PieChart margin={{ top: 6, right: 20, bottom: 22, left: 20 }}>
             <defs>
               {pieSlices.map((slice) => (
                 <linearGradient
@@ -1081,7 +1804,11 @@ export default function GraphView({
               align="center"
               iconType="circle"
               wrapperStyle={{ fontSize: "11px", paddingTop: "8px", color: "#475569" }}
-              formatter={(value) => String(value)}
+              formatter={(value, _entry, index) => {
+                const item = pieLegendItems[index] || null
+                if (!item) return String(value)
+                return `${String(value)} (${item.percentage.toFixed(1)}%)`
+              }}
             />
           </PieChart>
         ) : chartType === "radar" ? (
@@ -1093,7 +1820,11 @@ export default function GraphView({
             margin={{ top: 8, right: 10, bottom: 8, left: 10 }}
           >
             <PolarGrid stroke="#d6dde8" />
-            <PolarAngleAxis dataKey="name" tick={{ fontSize: 10, fill: "#64748b" }} />
+            <PolarAngleAxis
+              dataKey="name"
+              tick={{ fontSize: 10, fill: "#64748b" }}
+              tickFormatter={(value) => truncateLabel(String(value || ""), 16)}
+            />
             <PolarRadiusAxis tick={{ fontSize: 10, fill: "#94a3b8" }} tickFormatter={(v) => formatAxisCompact(asNumber(v), measure)} />
             <Tooltip
               formatter={(value: unknown, name: unknown) => [
@@ -1132,7 +1863,7 @@ export default function GraphView({
             )}
           </RadarChart>
         ) : (
-          <BarChart data={chartData} margin={{ top: 12, right: 8, left: 0, bottom: 6 }} barCategoryGap={14}>
+          <BarChart data={chartData} margin={{ top: 12, right: 10, left: 14, bottom: 8 }} barCategoryGap={14}>
             <defs>
               <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor={mixWithWhite(primaryColor, 0.35)} />
@@ -1153,6 +1884,8 @@ export default function GraphView({
             />
             <YAxis
               domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
+              width={72}
+              tickMargin={6}
               tick={{ fontSize: 11 }}
               tickFormatter={(v) => formatValue(asNumber(v), measure)}
             />
@@ -1224,6 +1957,9 @@ export default function GraphView({
           </BarChart>
         )}
       </ResponsiveContainer>
+      )}
     </div>
   )
 }
+
+

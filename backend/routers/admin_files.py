@@ -15,10 +15,12 @@ from sqlalchemy.orm import Session
 from authentication.deps import require_admin
 from db.deps import get_db
 from models.data_rows import DataRow
+from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_repository import invalidate_dataframe_cache
 from services.analytics.samsung_engine import invalidate_samsung_load_cache
 from services.manual_update_service import mark_manual_update
 from services.precompute_service import rebuild_precomputed_analytics, rebuild_precomputed_for_all_tags
+from services.precomputed_repository import clear_precomputed_for_source_dataset
 
 router = APIRouter(
     prefix="/admin/files",
@@ -33,6 +35,17 @@ def _normalize(value: str | None) -> str | None:
         return None
     cleaned = value.strip().lower()
     return cleaned or None
+
+
+def _normalize_source_for_mapper(source: str) -> str:
+    source_key = (source or "").strip().lower()
+    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
+        return "samsung"
+    if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+        return "reliance"
+    if source_key in {"goodrej", "goddrej"}:
+        return "godrej"
+    return source_key
 
 
 def _clean_json_row(row: dict) -> dict:
@@ -83,8 +96,14 @@ def _replace_tag_rows(
     job_id: str | None,
     payloads: list[dict],
 ) -> int:
-    delete_query = _apply_tag_filter(db.query(DataRow), source, dataset_type, job_id)
+    # Hard overwrite at source+dataset level so latest upload becomes the
+    # single source of truth and no legacy job-tag rows remain.
+    delete_query = db.query(DataRow).filter(
+        DataRow.source == source,
+        DataRow.dataset_type == dataset_type,
+    )
     deleted = int(delete_query.delete(synchronize_session=False) or 0)
+    clear_precomputed_for_source_dataset(db, source=source, dataset_type=dataset_type)
     if payloads:
         db.add_all(
             [
@@ -101,6 +120,12 @@ def _replace_tag_rows(
 
 
 async def _parse_upload_payloads(file: UploadFile) -> list[dict]:
+    df = await _parse_upload_dataframe(file)
+    df = df.astype(object).where(pd.notnull(df), None)
+    return [_clean_json_row(row) for row in df.to_dict(orient="records")]
+
+
+async def _parse_upload_dataframe(file: UploadFile) -> pd.DataFrame:
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -109,18 +134,14 @@ async def _parse_upload_payloads(file: UploadFile) -> list[dict]:
     buffer = BytesIO(contents)
     try:
         if filename.endswith(".csv"):
-            df = pd.read_csv(buffer)
-        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-            df = pd.read_excel(buffer)
-        else:
-            raise HTTPException(status_code=400, detail="Only .csv, .xls, and .xlsx are supported")
+            return pd.read_csv(buffer)
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+            return pd.read_excel(buffer)
+        raise HTTPException(status_code=400, detail="Only .csv, .xls, and .xlsx are supported")
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
-
-    df = df.astype(object).where(pd.notnull(df), None)
-    return [_clean_json_row(row) for row in df.to_dict(orient="records")]
 
 
 def _post_file_update(
@@ -193,6 +214,72 @@ def _post_file_update(
                 dataset_type=dataset_norm,
                 job_id=refresh_job,
             )
+
+
+def _normalize_col_key(value: str) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("_", "")
+        .replace(" ", "")
+        .replace("/", "")
+        .replace("-", "")
+        .replace("(", "")
+        .replace(")", "")
+        .replace(".", "")
+    )
+
+
+def _validate_payload_schema(
+    *,
+    source_norm: str,
+    dataset_norm: str,
+    payloads: list[dict],
+) -> None:
+    # Prevent accidental Reliance sales replacement with pivot/summary exports.
+    if source_norm != "reliance" or dataset_norm != "sales":
+        return
+    if not payloads:
+        raise HTTPException(status_code=400, detail="Reliance sales upload is empty.")
+
+    sample_rows = payloads[: min(len(payloads), 300)]
+    raw_columns = {str(k).strip() for row in sample_rows for k in row.keys()}
+    normalized_columns = {_normalize_col_key(k) for k in raw_columns if str(k).strip()}
+
+    date_cols = {
+        "planstartdate",
+        "warrantystartdate",
+        "warrantystartdate",
+        "purchasedate",
+        "invoicedate",
+        "month",
+    }
+    value_cols = {
+        "plansellingprice",
+        "totalbillingamount",
+        "billingamount",
+        "invoicevalue",
+        "handsetvalue",
+        "zoppersharedtransferprice",
+    }
+
+    only_unnamed = bool(normalized_columns) and all(
+        col.startswith("unnamed") for col in normalized_columns
+    )
+    has_date_col = bool(normalized_columns & date_cols)
+    has_value_col = bool(normalized_columns & value_cols)
+
+    if only_unnamed or not has_date_col or not has_value_col:
+        sample_cols = ", ".join(sorted(raw_columns)[:10]) or "none"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid Reliance sales file format. Upload row-level Reliance sales data (not pivot/summary) "
+                "with fields like Warranty Start Date/Plan Start Date and INVOICE_VALUE/Total Billing Amount. "
+                f"Detected columns: {sample_cols}"
+            ),
+        )
 
 
 @router.get("")
@@ -328,6 +415,11 @@ async def replace_file_group(
     if source_norm is None or dataset_norm is None:
         raise HTTPException(status_code=400, detail="source and dataset_type are required")
     payloads = await _parse_upload_payloads(file)
+    _validate_payload_schema(
+        source_norm=source_norm,
+        dataset_norm=dataset_norm,
+        payloads=payloads,
+    )
     deleted = _replace_tag_rows(
         db,
         source=source_norm,
@@ -361,6 +453,11 @@ async def update_file_group(
         raise HTTPException(status_code=400, detail="source and dataset_type are required")
 
     payloads = await _parse_upload_payloads(file)
+    _validate_payload_schema(
+        source_norm=source_norm,
+        dataset_norm=dataset_norm,
+        payloads=payloads,
+    )
     deleted = _replace_tag_rows(
         db,
         source=source_norm,
@@ -377,6 +474,33 @@ async def update_file_group(
         "dataset_type": dataset_norm,
         "job_id": job_norm,
     }
+
+
+@router.post("/reverse-map")
+async def reverse_map_file(
+    file: UploadFile = File(...),
+    source: str = Form(...),
+    dataset_type: str = Form(...),
+):
+    source_norm = _normalize(source)
+    dataset_norm = _normalize(dataset_type)
+    if source_norm is None or dataset_norm is None:
+        raise HTTPException(status_code=400, detail="source and dataset_type are required")
+    if dataset_norm not in {"sales", "claims"}:
+        raise HTTPException(status_code=400, detail="dataset_type must be sales or claims")
+
+    df = await _parse_upload_dataframe(file)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file has no rows to map")
+
+    mapped_source = _normalize_source_for_mapper(source_norm)
+    suggestion = suggest_reverse_mapping(
+        df,
+        source=mapped_source,
+        dataset_type=dataset_norm,
+    )
+    suggestion["file_name"] = file.filename or ""
+    return suggestion
 
 
 @router.post("/recompute")

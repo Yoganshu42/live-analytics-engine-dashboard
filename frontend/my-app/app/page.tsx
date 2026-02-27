@@ -6,8 +6,6 @@ import { useRouter } from "next/navigation"
 import { motion, AnimatePresence, Variants, useReducedMotion } from "framer-motion"
 import {
   Maximize2,
-  BarChart3,
-  ShieldCheck,
   Activity,
   LogOut,
   ChevronRight
@@ -19,6 +17,7 @@ import GraphSection from "@/components/GraphSection"
 import { clearGraphDataCache } from "@/components/GraphView"
 import DateRangePicker from "@/components/DateRangePicker"
 import KpiCardsRow from "@/components/KpiCardsRow"
+import MasterDashboardView from "@/components/MasterDashboardView"
 import RightSideChatbot from "@/components/RightSideChatbot"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
 
@@ -47,8 +46,59 @@ const headerSlide: Variants = {
   animate: { y: 0, opacity: 1, transition: { duration: 0.5, delay: 0.2 } }
 }
 
+type HoliBurst = {
+  left: string
+  top: string
+  size: number
+  color: string
+  dx: number
+  dy: number
+  duration: number
+  delay: number
+  blur: number
+}
+
+type HoliPowderParticle = {
+  left: string
+  top: string
+  size: number
+  color: string
+  driftX: number
+  driftY: number
+  duration: number
+  delay: number
+}
+
+const HOLI_POPUP_BURSTS: HoliBurst[] = [
+  { left: "6%", top: "14%", size: 180, color: "rgba(236,72,153,0.34)", dx: 46, dy: -28, duration: 6.2, delay: 0.1, blur: 2.5 },
+  { left: "20%", top: "42%", size: 140, color: "rgba(245,158,11,0.32)", dx: -40, dy: -20, duration: 5.7, delay: 0.6, blur: 2.2 },
+  { left: "34%", top: "22%", size: 210, color: "rgba(59,130,246,0.27)", dx: 38, dy: -32, duration: 7.0, delay: 0.4, blur: 2.8 },
+  { left: "48%", top: "12%", size: 170, color: "rgba(132,204,22,0.31)", dx: -30, dy: -26, duration: 6.4, delay: 1.1, blur: 2.2 },
+  { left: "62%", top: "34%", size: 190, color: "rgba(249,115,22,0.33)", dx: 34, dy: -30, duration: 6.8, delay: 0.2, blur: 2.6 },
+  { left: "76%", top: "18%", size: 150, color: "rgba(168,85,247,0.34)", dx: -36, dy: -24, duration: 6.0, delay: 0.8, blur: 2.4 },
+  { left: "88%", top: "46%", size: 210, color: "rgba(16,185,129,0.26)", dx: 28, dy: -36, duration: 7.2, delay: 0.5, blur: 2.7 },
+  { left: "10%", top: "72%", size: 160, color: "rgba(244,63,94,0.28)", dx: 42, dy: -20, duration: 6.3, delay: 1.4, blur: 2.3 },
+  { left: "28%", top: "78%", size: 190, color: "rgba(14,165,233,0.27)", dx: -34, dy: -24, duration: 6.6, delay: 0.9, blur: 2.5 },
+  { left: "46%", top: "66%", size: 165, color: "rgba(234,179,8,0.34)", dx: 26, dy: -28, duration: 5.9, delay: 1.2, blur: 2.1 },
+  { left: "64%", top: "78%", size: 210, color: "rgba(236,72,153,0.26)", dx: -22, dy: -34, duration: 7.1, delay: 0.3, blur: 2.9 },
+  { left: "82%", top: "72%", size: 180, color: "rgba(34,197,94,0.28)", dx: 30, dy: -22, duration: 6.5, delay: 1.0, blur: 2.4 },
+]
+
+const HOLI_FLYING_POWDER: HoliPowderParticle[] = [
+  { left: "5%", top: "84%", size: 14, color: "rgba(236,72,153,0.72)", driftX: 240, driftY: -190, duration: 8.2, delay: 0.2 },
+  { left: "14%", top: "78%", size: 10, color: "rgba(245,158,11,0.72)", driftX: 220, driftY: -160, duration: 7.8, delay: 1.0 },
+  { left: "23%", top: "88%", size: 12, color: "rgba(14,165,233,0.7)", driftX: 210, driftY: -170, duration: 8.6, delay: 0.5 },
+  { left: "31%", top: "82%", size: 16, color: "rgba(132,204,22,0.7)", driftX: 180, driftY: -155, duration: 8.0, delay: 1.3 },
+  { left: "41%", top: "90%", size: 11, color: "rgba(249,115,22,0.68)", driftX: 170, driftY: -180, duration: 7.4, delay: 0.7 },
+  { left: "52%", top: "84%", size: 13, color: "rgba(168,85,247,0.7)", driftX: 160, driftY: -150, duration: 8.4, delay: 1.1 },
+  { left: "63%", top: "88%", size: 15, color: "rgba(16,185,129,0.7)", driftX: 150, driftY: -160, duration: 7.7, delay: 0.4 },
+  { left: "74%", top: "82%", size: 10, color: "rgba(244,63,94,0.72)", driftX: 130, driftY: -165, duration: 8.1, delay: 1.5 },
+  { left: "84%", top: "90%", size: 12, color: "rgba(234,179,8,0.72)", driftX: 120, driftY: -150, duration: 7.9, delay: 0.9 },
+  { left: "92%", top: "86%", size: 14, color: "rgba(59,130,246,0.72)", driftX: 100, driftY: -175, duration: 8.5, delay: 1.7 },
+]
+
 type InitialDashboardState = {
-  view: "home" | "dashboard"
+  view: "home" | "master" | "dashboard"
   brand: string
   mode: "sales" | "claims"
   jobId: string | null
@@ -96,7 +146,7 @@ export default function DashboardPage() {
   const [initialDashboardState] = useState<InitialDashboardState>(() => {
     if (typeof window === "undefined") {
       return {
-        view: "home" as "home" | "dashboard",
+        view: "home" as "home" | "master" | "dashboard",
         brand: "samsung",
         mode: "sales" as "sales" | "claims",
         jobId: null as string | null,
@@ -121,8 +171,11 @@ export default function DashboardPage() {
     const normalizedBrand = storedBrand ? normalizeBrand(storedBrand) : "samsung"
     const normalizedMode: "sales" | "claims" = storedMode === "claims" ? "claims" : "sales"
 
+    const normalizedView: "home" | "master" | "dashboard" =
+      storedView === "dashboard" ? "dashboard" : storedView === "master" ? "master" : "home"
+
     return {
-      view: storedView === "dashboard" ? "dashboard" : "home",
+      view: normalizedView,
       brand: normalizedBrand,
       mode: normalizedMode,
       jobId,
@@ -131,7 +184,7 @@ export default function DashboardPage() {
     }
   })
 
-  const [view, setView] = useState<"home" | "dashboard">(initialDashboardState.view)
+  const [view, setView] = useState<"home" | "master" | "dashboard">(initialDashboardState.view)
   const [brand, setBrand] = useState<string>(initialDashboardState.brand)
   const [mode, setMode] = useState<"sales" | "claims">(initialDashboardState.mode)
   const [isFullscreen, setIsFullscreen] = useState<boolean>(() => {
@@ -152,6 +205,11 @@ export default function DashboardPage() {
   const homeViewportRef = useRef<HTMLDivElement | null>(null)
   const homeSceneRef = useRef<HTMLDivElement | null>(null)
   const [homeSceneScale, setHomeSceneScale] = useState(1)
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return window.innerWidth < 768
+  })
+  const [isMobileFiltersCollapsed, setIsMobileFiltersCollapsed] = useState(false)
 
   const [fromDate, setFromDate] = useState<string>(initialDashboardState.from)
   const [toDate, setToDate] = useState<string>(initialDashboardState.to)
@@ -190,6 +248,22 @@ export default function DashboardPage() {
       defaultKey,
     }
   }, [fromDate, toDate, draftFromDate, draftToDate, defaultFromDate, defaultToDate, defaultKey])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const handleResize = () => {
+      const mobile = window.innerWidth < 768
+      setIsMobileViewport(mobile)
+      if (!mobile) {
+        setIsMobileFiltersCollapsed(false)
+      }
+    }
+    handleResize()
+    window.addEventListener("resize", handleResize)
+    return () => {
+      window.removeEventListener("resize", handleResize)
+    }
+  }, [])
 
   const forceFilterRefresh = useCallback(() => {
     clearGraphDataCache()
@@ -265,8 +339,14 @@ export default function DashboardPage() {
   }, [router])
 
   useEffect(() => { localStorage.setItem("dashboard_view", view) }, [view])
-  useEffect(() => { localStorage.setItem("dashboard_brand", brand) }, [brand])
-  useEffect(() => { localStorage.setItem("dashboard_mode", mode) }, [mode])
+  useEffect(() => {
+    localStorage.setItem("dashboard_brand", brand)
+    window.dispatchEvent(new CustomEvent("dashboard-context-changed", { detail: { brand, mode } }))
+  }, [brand, mode])
+  useEffect(() => {
+    localStorage.setItem("dashboard_mode", mode)
+    window.dispatchEvent(new CustomEvent("dashboard-context-changed", { detail: { brand, mode } }))
+  }, [mode, brand])
   useEffect(() => {
     localStorage.setItem("dashboard_sidebar_collapsed", isSidebarCollapsed ? "1" : "0")
   }, [isSidebarCollapsed])
@@ -393,7 +473,7 @@ export default function DashboardPage() {
     forcePageRefresh()
   }
 
-  const handleViewChange = (nextView: "home" | "dashboard") => {
+  const handleViewChange = (nextView: "home" | "master" | "dashboard") => {
     setView(nextView)
     if (typeof window !== "undefined") {
       localStorage.setItem("dashboard_view", nextView)
@@ -474,6 +554,14 @@ export default function DashboardPage() {
   const isDashboardDataReady =
     hasResolvedDateBounds && (!hasDateBounds || Boolean(fromDate && toDate))
 
+  const persistCurrentDashboardContext = useCallback(() => {
+    if (typeof window === "undefined") return
+    localStorage.setItem("dashboard_view", "dashboard")
+    localStorage.setItem("dashboard_brand", brand)
+    localStorage.setItem("dashboard_mode", mode)
+    localStorage.setItem("dashboard_fullscreen", isFullscreen ? "1" : "0")
+  }, [brand, mode, isFullscreen])
+
   const handleGraphDateRangeApply = (nextFromRaw: string, nextToRaw: string) => {
     const next = normalizeDateRange(
       nextFromRaw,
@@ -485,6 +573,7 @@ export default function DashboardPage() {
     setDraftToDate(next.to)
     setFromDate(next.from)
     setToDate(next.to)
+    persistCurrentDashboardContext()
     forceFilterRefresh()
   }
 
@@ -494,6 +583,7 @@ export default function DashboardPage() {
       setToDate("")
       setDraftFromDate("")
       setDraftToDate("")
+      persistCurrentDashboardContext()
       forceFilterRefresh()
       return
     }
@@ -508,8 +598,9 @@ export default function DashboardPage() {
     setToDate(resetRange.to)
     setDraftFromDate(resetRange.from)
     setDraftToDate(resetRange.to)
+    persistCurrentDashboardContext()
     forceFilterRefresh()
-  }, [defaultFromDate, defaultToDate, fromDate, todayIso, normalizeDateRange, forceFilterRefresh])
+  }, [defaultFromDate, defaultToDate, fromDate, todayIso, normalizeDateRange, forceFilterRefresh, persistCurrentDashboardContext])
 
   const brandLabel = (value: string) => {
     const labels: Record<string, string> = {
@@ -521,6 +612,100 @@ export default function DashboardPage() {
     }
     return labels[value] || value.replace("_", " ")
   }
+
+  type PartnerHeaderLogo = {
+    src: string
+    alt: string
+    width: number
+    height: number
+    className?: string
+  }
+
+  const samsungProtectMaxLogo: PartnerHeaderLogo = {
+    src: "/WhatsApp Image 2026-02-04 at 11.14.29.jpeg",
+    alt: "Samsung Protect Max logo",
+    width: 88,
+    height: 28,
+    className: "h-5 w-auto object-contain",
+  }
+
+  const partnerLogoConfig: Record<string, PartnerHeaderLogo[]> = {
+    samsung: [samsungProtectMaxLogo],
+    samsung_vs: [
+      samsungProtectMaxLogo,
+      {
+        src: "/vs_logo.jpg",
+        alt: "Vijay Sales logo",
+        width: 88,
+        height: 28,
+        className: "h-5 w-auto object-contain",
+      },
+    ],
+    samsung_croma: [
+      samsungProtectMaxLogo,
+      {
+        src: "/croma_logo.jpg",
+        alt: "Croma logo",
+        width: 88,
+        height: 28,
+        className: "h-5 w-auto object-contain",
+      },
+    ],
+    reliance: [
+      {
+        src: "/resq.png",
+        alt: "Reliance ResQ logo",
+        width: 96,
+        height: 28,
+        className: "h-5 w-auto object-contain",
+      },
+    ],
+    godrej: [
+      {
+        src: "/Group 1244833444.png",
+        alt: "Godrej logo",
+        width: 96,
+        height: 28,
+        className: "h-5 w-auto object-contain",
+      },
+    ],
+  }
+
+  const masterCardLogos: PartnerHeaderLogo[] = [
+    samsungProtectMaxLogo,
+    {
+      src: "/croma_logo.jpg",
+      alt: "Croma logo",
+      width: 88,
+      height: 28,
+      className: "h-5 w-auto object-contain",
+    },
+    {
+      src: "/vs_logo.jpg",
+      alt: "Vijay Sales logo",
+      width: 88,
+      height: 28,
+      className: "h-5 w-auto object-contain",
+    },
+    {
+      src: "/resq.png",
+      alt: "Reliance ResQ logo",
+      width: 96,
+      height: 28,
+      className: "h-5 w-auto object-contain",
+    },
+    {
+      src: "/Group 1244833444.png",
+      alt: "Godrej logo",
+      width: 96,
+      height: 28,
+      className: "h-5 w-auto object-contain",
+    },
+  ]
+
+  const activePartnerLogos = partnerLogoConfig[brand] || []
+  const headerPartnerLogos = view === "master" ? masterCardLogos : view === "dashboard" ? activePartnerLogos : []
+  const headerPartnerLabel = view === "master" ? "Master Dashboard" : brandLabel(brand)
 
   const brandConfigs = [
     { label: "Samsung", value: "samsung", logo: "/WhatsApp Image 2026-02-04 at 11.14.29.jpeg", caption: "B2C Protect Max Analysis" },
@@ -572,6 +757,30 @@ export default function DashboardPage() {
               Analytics 
             </span>
           </h1>
+          {headerPartnerLogos.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.25 }}
+              className="hidden items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 sm:flex"
+            >
+              <div className="flex items-center gap-1.5">
+                {headerPartnerLogos.map((logo, index) => (
+                  <Image
+                    key={`${logo.src}-${index}`}
+                    src={logo.src}
+                    alt={logo.alt}
+                    width={logo.width}
+                    height={logo.height}
+                    className={logo.className}
+                  />
+                ))}
+              </div>
+              <span className="text-[10px] font-bold uppercase tracking-[0.12em] text-slate-600">
+                {headerPartnerLabel}
+              </span>
+            </motion.div>
+          )}
         </div>
 
         <div className="flex items-center gap-2 sm:gap-6">
@@ -626,123 +835,85 @@ export default function DashboardPage() {
             className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-3 sm:p-6"
           >
             {/* Background Elements */}
-            <div className="absolute inset-0 -z-10">
-               <video autoPlay={!prefersReducedMotion} muted loop={!prefersReducedMotion} playsInline className="h-full w-full object-cover opacity-20 scale-105 blur-[2px]">
-                <source src="/Business_Analytics_Video_Generation_Prompt.mp4" type="video/mp4" />
-              </video>
-              <div className="absolute inset-0 bg-gradient-to-b from-white/80 via-white/40 to-white" />
-            </div>
+            <div className="absolute inset-0 -z-10 bg-gradient-to-b from-[#fff1f2]/90 via-[#fff7ed]/70 to-[#ecfdf5]/90" />
 
-            <div className="pointer-events-none absolute inset-0 z-0 overflow-hidden opacity-70">
-              <svg
-                viewBox="0 0 1400 900"
-                preserveAspectRatio="none"
-                className="h-full w-full"
-                aria-hidden="true"
-              >
-                <defs>
-                  <linearGradient id="growthLineA" x1="0%" y1="0%" x2="100%" y2="0%">
-                    <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.25" />
-                    <stop offset="50%" stopColor="#f97316" stopOpacity="0.6" />
-                    <stop offset="100%" stopColor="#1e40af" stopOpacity="0.25" />
-                  </linearGradient>
-                  <linearGradient id="growthLineB" x1="0%" y1="0%" x2="100%" y2="0%">
-                    <stop offset="0%" stopColor="#818cf8" stopOpacity="0.15" />
-                    <stop offset="100%" stopColor="#22d3ee" stopOpacity="0.35" />
-                  </linearGradient>
-                  <pattern id="bizGrid" width="48" height="48" patternUnits="userSpaceOnUse">
-                    <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#94a3b8" strokeOpacity="0.14" strokeWidth="1" />
-                  </pattern>
-                </defs>
-                <rect width="1400" height="900" fill="url(#bizGrid)" />
-                <motion.g
-                  animate={{ x: [0, -80, 0] }}
-                  transition={{ duration: 12, repeat: Infinity, ease: "linear" }}
-                >
-                  <motion.path
-                    d="M-40,700 C120,640 220,690 340,560 C430,470 520,530 640,410 C740,310 860,380 960,260 C1050,150 1200,220 1460,110"
-                    fill="none"
-                    stroke="url(#growthLineA)"
-                    strokeWidth="8"
-                    strokeLinecap="round"
-                    initial={{ pathLength: 0.25 }}
-                    animate={{ pathLength: [0.25, 1, 0.25] }}
-                    transition={{ duration: 7, repeat: Infinity, ease: "easeInOut" }}
-                  />
-                  <motion.path
-                    d="M-60,760 C80,730 180,770 300,650 C410,540 520,600 630,490 C740,390 850,440 960,340 C1070,250 1210,300 1460,210"
-                    fill="none"
-                    stroke="url(#growthLineB)"
-                    strokeWidth="4"
-                    strokeLinecap="round"
-                    strokeDasharray="14 12"
-                    animate={{ pathOffset: [0, -26] }}
-                    transition={{ duration: 1.6, repeat: Infinity, ease: "linear" }}
-                  />
-                </motion.g>
-              </svg>
-            </div>
-            
-            <motion.div 
-              animate={{ 
-                scale: [1, 1.15, 1], 
-                x: [0, 20, 0], 
-                y: [0, -20, 0] 
-              }} 
-              transition={{ duration: 15, repeat: Infinity, ease: "linear" }} 
-              className="absolute top-0 right-0 w-[600px] h-[600px] rounded-full bg-indigo-100/30 blur-[100px]" 
-            />
+            <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+              <div className="absolute inset-0 bg-[radial-gradient(circle_at_12%_18%,rgba(236,72,153,0.2),transparent_42%),radial-gradient(circle_at_82%_20%,rgba(245,158,11,0.2),transparent_40%),radial-gradient(circle_at_24%_82%,rgba(59,130,246,0.16),transparent_42%),radial-gradient(circle_at_76%_78%,rgba(34,197,94,0.16),transparent_42%)]" />
 
-            {/* Motion cartoons */}
-            <motion.div
-              initial={{ opacity: 0, y: 30 }}
-              animate={{ opacity: 1, y: [0, -10, 0], rotate: [0, -2, 0] }}
-              transition={{ duration: 6, repeat: Infinity, ease: "easeInOut" }}
-              className="pointer-events-none absolute left-12 top-24 hidden xl:flex items-center gap-3 rounded-3xl border border-indigo-200 bg-white/80 px-3 py-3 shadow-xl backdrop-blur-sm"
-            >
-              <div className="rounded-2xl bg-indigo-100 p-2 text-indigo-600">
-                <BarChart3 size={18} />
-              </div>
-              <div className="flex gap-1.5">
-                <motion.span className="h-8 w-1.5 rounded-full bg-indigo-300" animate={{ scaleY: [0.45, 1, 0.45] }} transition={{ duration: 1, repeat: Infinity }} />
-                <motion.span className="h-8 w-1.5 rounded-full bg-indigo-400" animate={{ scaleY: [1, 0.55, 1] }} transition={{ duration: 1, repeat: Infinity, delay: 0.15 }} />
-                <motion.span className="h-8 w-1.5 rounded-full bg-indigo-500" animate={{ scaleY: [0.55, 1, 0.55] }} transition={{ duration: 1, repeat: Infinity, delay: 0.3 }} />
-              </div>
-            </motion.div>
-
-            <motion.div
-              initial={{ opacity: 0, y: -20 }}
-              animate={{ opacity: 1, y: [0, 12, 0], rotate: [0, 2, 0] }}
-              transition={{ duration: 7, repeat: Infinity, ease: "easeInOut", delay: 0.4 }}
-              className="pointer-events-none absolute right-16 top-32 hidden xl:flex items-center gap-3 rounded-3xl border border-rose-200 bg-white/80 px-3 py-3 shadow-xl backdrop-blur-sm"
-            >
-              <div className="rounded-2xl bg-rose-100 p-2 text-rose-600">
-                <ShieldCheck size={18} />
-              </div>
-              <div className="flex items-end gap-1">
-                <motion.span className="h-2 w-2 rounded-full bg-rose-400" animate={{ y: [0, -5, 0] }} transition={{ duration: 0.9, repeat: Infinity }} />
-                <motion.span className="h-3 w-2 rounded-full bg-rose-500" animate={{ y: [0, -8, 0] }} transition={{ duration: 0.9, repeat: Infinity, delay: 0.15 }} />
-                <motion.span className="h-5 w-2 rounded-full bg-rose-600" animate={{ y: [0, -10, 0] }} transition={{ duration: 0.9, repeat: Infinity, delay: 0.3 }} />
-              </div>
-            </motion.div>
-
-            <motion.div
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: [0, -10, 0], y: [0, -8, 0] }}
-              transition={{ duration: 5.5, repeat: Infinity, ease: "easeInOut", delay: 0.8 }}
-              className="pointer-events-none absolute bottom-20 right-28 hidden xl:flex items-center gap-3 rounded-3xl border border-cyan-200 bg-white/80 px-3 py-3 shadow-xl backdrop-blur-sm"
-            >
-              <div className="rounded-2xl bg-cyan-100 p-2 text-cyan-700">
-                <Activity size={18} />
-              </div>
-              <div className="h-8 w-12 overflow-hidden rounded-xl bg-cyan-50 p-1.5">
-                <motion.div
-                  className="h-0.5 w-full origin-left rounded bg-cyan-500"
-                  animate={{ scaleX: [0.2, 1, 0.2], y: [0, 6, 12, 6, 0] }}
-                  transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+              {HOLI_POPUP_BURSTS.map((burst, index) => (
+                <motion.span
+                  key={`holi-popup-${index}`}
+                  className="absolute rounded-full"
+                  style={{
+                    left: burst.left,
+                    top: burst.top,
+                    width: burst.size,
+                    height: burst.size,
+                    background: burst.color,
+                    filter: `blur(${burst.blur}px)`,
+                  }}
+                  initial={{ opacity: 0, scale: 0.2 }}
+                  animate={
+                    prefersReducedMotion
+                      ? { opacity: 0.2, scale: 1 }
+                      : {
+                          opacity: [0, 0.48, 0],
+                          scale: [0.15, 1.25, 0.72],
+                          x: [0, burst.dx, burst.dx * 0.38],
+                          y: [0, burst.dy, burst.dy * 0.42],
+                        }
+                  }
+                  transition={
+                    prefersReducedMotion
+                      ? { duration: 0 }
+                      : {
+                          duration: burst.duration,
+                          repeat: Infinity,
+                          repeatType: "loop",
+                          ease: "easeOut",
+                          delay: burst.delay,
+                        }
+                  }
                 />
-              </div>
-            </motion.div>
+              ))}
+
+              {HOLI_FLYING_POWDER.map((particle, index) => (
+                <motion.span
+                  key={`holi-powder-${index}`}
+                  className="absolute rounded-full"
+                  style={{
+                    left: particle.left,
+                    top: particle.top,
+                    width: particle.size,
+                    height: particle.size,
+                    background: particle.color,
+                    boxShadow: `0 0 14px ${particle.color}`,
+                  }}
+                  initial={{ opacity: 0, scale: 0.4 }}
+                  animate={
+                    prefersReducedMotion
+                      ? { opacity: 0.22, scale: 1 }
+                      : {
+                          opacity: [0, 0.85, 0],
+                          scale: [0.4, 1, 0.6],
+                          x: [0, particle.driftX],
+                          y: [0, particle.driftY],
+                        }
+                  }
+                  transition={
+                    prefersReducedMotion
+                      ? { duration: 0 }
+                      : {
+                          duration: particle.duration,
+                          repeat: Infinity,
+                          repeatType: "loop",
+                          ease: "easeOut",
+                          delay: particle.delay,
+                        }
+                  }
+                />
+              ))}
+            </div>
 
             <div
               ref={homeSceneRef}
@@ -754,70 +925,110 @@ export default function DashboardPage() {
             >
               <div className="text-center mb-20">
                 <motion.div variants={staggerContainer} initial="initial" animate="animate">
-                  <motion.div variants={fadeIn} className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white border border-slate-200 shadow-sm mb-8">
+                  <motion.div variants={fadeIn} className="mb-8 inline-flex items-center gap-2 rounded-full border border-fuchsia-200 bg-gradient-to-r from-fuchsia-50 via-amber-50 to-emerald-50 px-4 py-1.5 shadow-sm">
                     <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-fuchsia-400 opacity-75"></span>
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500"></span>
                     </span>
-                    <span className="text-[#1E6FFF] text-[10px] font-black uppercase tracking-[0.25em]">Unified Data Experience</span>
+                    <span className="text-[10px] font-black uppercase tracking-[0.25em] text-fuchsia-700">Holi Insights Mode</span>
                   </motion.div>
 
                   <motion.h2 variants={fadeIn} className="font-black tracking-tight mb-8 text-center">
-                    <span className="block text-slate-900 leading-tight text-2xl md:text-3xl">Welcome to</span>
-                    <span className="block text-4xl text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 via-purple-600 to-rose-500 italic font-serif sm:text-5xl md:text-7xl">
+                    <span className="block text-2xl leading-tight text-slate-900 md:text-3xl">Welcome to</span>
+                    <span className="block bg-gradient-to-r from-fuchsia-600 via-amber-500 to-emerald-600 bg-clip-text text-4xl font-serif italic text-transparent sm:text-5xl md:text-7xl">
                      Business Control Centre
                     </span>
                   </motion.h2>
                   
-                  <motion.p variants={fadeIn} className="mx-auto max-w-2xl text-center text-base font-medium leading-relaxed text-slate-500 sm:text-lg md:text-xl">
+                  <motion.p variants={fadeIn} className="mx-auto max-w-2xl text-center text-base font-medium leading-relaxed text-slate-600 sm:text-lg md:text-xl">
                     Navigate through partner ecosystems with precision. <br/>Real-time performance metrics at your fingertips.
                   </motion.p>
                 </motion.div>
               </div>
 
-              <motion.div 
-                variants={staggerContainer} 
-                initial="initial" 
-                animate="animate"
-                className="grid grid-cols-1 gap-4 justify-items-center sm:gap-8 md:grid-cols-3"
-              >
-                {brandConfigs.map((cfg) => (
-                  <motion.div
-                    key={cfg.value}
-                    variants={cardHover}
-                    whileHover="hover"
-                    onClick={() => {
-                      applyBrandChange(cfg.value)
-                    }}
-                    className="group relative w-full max-w-[360px] cursor-pointer rounded-[30px] border border-white bg-white/70 p-6 text-center shadow-2xl transition-all duration-500 backdrop-blur-md sm:max-w-[380px] sm:rounded-[48px] sm:p-10"
-                  >
-                    <div className="mb-6 flex h-20 items-center justify-center overflow-hidden sm:mb-10 sm:h-24">
-                      <motion.div
-                        whileHover={{ scale: 1.1, rotate: 2 }}
-                      >
-                        <Image
-                          src={cfg.logo}
-                          alt={cfg.label}
-                          width={180}
-                          height={80}
-                          className={`max-h-full max-w-full object-contain filter drop-shadow-md ${cfg.value === "reliance" ? "scale-125" : ""}`}
-                        />
-                      </motion.div>
-                    </div>
-                    <div className="space-y-4 text-center">
-                      <div className="flex items-center justify-center gap-3">
-                        <h3 className="text-xl font-bold tracking-tight text-slate-800 sm:text-2xl">{cfg.label}</h3>
-                        <div className="flex h-9 w-9 scale-0 items-center justify-center rounded-full bg-slate-900 text-white transition-transform duration-300 group-hover:scale-100 sm:h-10 sm:w-10">
-                           <ChevronRight size={20} />
-                        </div>
+              <motion.div variants={staggerContainer} initial="initial" animate="animate" className="w-full space-y-4 sm:space-y-8">
+                <motion.div
+                  variants={cardHover}
+                  whileHover="hover"
+                  onClick={() => handleViewChange("master")}
+                  className="group relative mx-auto w-full max-w-[1160px] cursor-pointer rounded-[30px] border border-fuchsia-100 bg-gradient-to-br from-white/90 via-amber-50/75 to-emerald-50/80 p-6 text-center shadow-2xl backdrop-blur-md sm:rounded-[40px] sm:p-8"
+                >
+                  <div className="space-y-3 text-center">
+                    <div className="flex items-center justify-center gap-3">
+                      <h3 className="text-2xl font-black tracking-tight text-fuchsia-800 sm:text-3xl">Master Dashboard</h3>
+                      <div className="flex h-9 w-9 scale-0 items-center justify-center rounded-full bg-gradient-to-br from-fuchsia-600 to-emerald-600 text-white transition-transform duration-300 group-hover:scale-100 sm:h-10 sm:w-10">
+                        <ChevronRight size={20} />
                       </div>
-                      <p className="text-[10px] text-slate-400 font-black uppercase tracking-[0.2em]">{cfg.caption}</p>
                     </div>
-                  </motion.div>
-                ))}
+                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-fuchsia-500">
+                      Unified view across Samsung, Croma, Vijay Sales, Reliance ResQ and Godrej
+                    </p>
+                  </div>
+                </motion.div>
+
+                <div className="grid grid-cols-1 gap-4 justify-items-center sm:gap-8 md:grid-cols-3">
+                  {brandConfigs.map((cfg) => (
+                    <motion.div
+                      key={cfg.value}
+                      variants={cardHover}
+                      whileHover="hover"
+                      onClick={() => {
+                        applyBrandChange(cfg.value)
+                      }}
+                      className="group relative w-full max-w-[360px] cursor-pointer rounded-[30px] border border-rose-100 bg-gradient-to-br from-white/90 via-rose-50/70 to-cyan-50/80 p-6 text-center shadow-2xl transition-all duration-500 backdrop-blur-md sm:max-w-[380px] sm:rounded-[48px] sm:p-10"
+                    >
+                      <div className="mb-6 flex h-20 items-center justify-center overflow-hidden sm:mb-10 sm:h-24">
+                        <motion.div
+                          whileHover={{ scale: 1.1, rotate: 2 }}
+                        >
+                          <Image
+                            src={cfg.logo}
+                            alt={cfg.label}
+                            width={180}
+                            height={80}
+                            className={`max-h-full max-w-full object-contain filter drop-shadow-md ${cfg.value === "reliance" ? "scale-125" : ""}`}
+                          />
+                        </motion.div>
+                      </div>
+                      <div className="space-y-4 text-center">
+                        <div className="flex items-center justify-center gap-3">
+                          <h3 className="text-xl font-bold tracking-tight text-slate-800 sm:text-2xl">{cfg.label}</h3>
+                          <div className="flex h-9 w-9 scale-0 items-center justify-center rounded-full bg-gradient-to-br from-fuchsia-600 to-orange-500 text-white transition-transform duration-300 group-hover:scale-100 sm:h-10 sm:w-10">
+                             <ChevronRight size={20} />
+                          </div>
+                        </div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">{cfg.caption}</p>
+                      </div>
+                    </motion.div>
+                  ))}
+                </div>
               </motion.div>
 
             </div>
+          </motion.div>
+        ) : view === "master" ? (
+          <motion.div
+            key="master"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="flex flex-1 flex-col overflow-hidden bg-[#edf1f6] md:flex-row"
+          >
+            <Sidebar
+              brand={brand}
+              onChange={(b) => applyBrandChange(b)}
+              currentView={view}
+              onViewChange={handleViewChange}
+              authRole={authRole}
+              collapsed={isSidebarCollapsed}
+              onToggleCollapse={() => setIsSidebarCollapsed((prev) => !prev)}
+            />
+
+            <main className="custom-scrollbar min-w-0 flex-1 overflow-y-auto bg-[#edf1f6] px-3 py-3 sm:px-6 sm:py-4 lg:px-8">
+              <div className="mx-auto w-full max-w-[1380px] pb-10">
+                <MasterDashboardView jobId={jobId || undefined} />
+              </div>
+            </main>
           </motion.div>
         ) : (
           <motion.div
@@ -893,24 +1104,54 @@ export default function DashboardPage() {
                       <motion.div variants={fadeIn} className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-5">
                         <div className="mb-3 flex items-center justify-between gap-3">
                           <h4 className="text-sm font-bold text-slate-800">Control Filters</h4>
-                          <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
-                            {mode}
-                          </span>
+                          <div className="flex items-center gap-2">
+                            <span className="rounded-full bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                              {mode}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setIsMobileFiltersCollapsed((prev) => !prev)}
+                              className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-[0.08em] text-slate-500 md:hidden"
+                              aria-expanded={!isMobileFiltersCollapsed}
+                              aria-label={isMobileFiltersCollapsed ? "Expand filters" : "Collapse filters"}
+                            >
+                              <ChevronRight
+                                size={12}
+                                className={`transition-transform ${isMobileFiltersCollapsed ? "" : "rotate-90"}`}
+                              />
+                              {isMobileFiltersCollapsed ? "Expand" : "Collapse"}
+                            </button>
+                          </div>
                         </div>
-                        <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
-                        <DateRangePicker
-                          draftFromDate={draftFromDate}
-                          draftToDate={draftToDate}
-                          minDate={defaultFromDate || undefined}
-                          maxDate={defaultToDate && defaultToDate > todayIso() ? defaultToDate : todayIso()}
-                          compact
-                          onDraftChange={(from, to) => {
-                            setDraftFromDate(clampToCurrentMonth(from))
-                            setDraftToDate(clampToCurrentMonth(to))
-                          }}
-                          onApply={handleGraphDateRangeApply}
-                          onReset={resetDateRange}
-                        />
+                        <AnimatePresence initial={false}>
+                          {(!isMobileViewport || !isMobileFiltersCollapsed) && (
+                            <motion.div
+                              key="filters-body"
+                              initial={{ opacity: 0, y: -6 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              exit={{ opacity: 0, y: -6 }}
+                              transition={{ duration: 0.16, ease: "easeOut" }}
+                              className="overflow-visible"
+                            >
+                              <div className="space-y-3">
+                                <Tabs value={mode} onChange={handleModeChange} disableClaims={false} />
+                                <DateRangePicker
+                                  draftFromDate={draftFromDate}
+                                  draftToDate={draftToDate}
+                                  minDate={defaultFromDate || undefined}
+                                  maxDate={defaultToDate && defaultToDate > todayIso() ? defaultToDate : todayIso()}
+                                  compact
+                                  onDraftChange={(from, to) => {
+                                    setDraftFromDate(clampToCurrentMonth(from))
+                                    setDraftToDate(clampToCurrentMonth(to))
+                                  }}
+                                  onApply={handleGraphDateRangeApply}
+                                  onReset={resetDateRange}
+                                />
+                              </div>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
                       </motion.div>
 
                       <motion.div variants={fadeIn} className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-4">
@@ -940,18 +1181,36 @@ export default function DashboardPage() {
       <AnimatePresence>
         {isFullscreen && (
           <motion.div initial={{ opacity: 0, scale: 1.1 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.1 }} className="fixed inset-0 z-[60] flex flex-col overflow-hidden bg-white">
-            <div className="border-b bg-white/80 p-3 backdrop-blur-md sm:p-6 lg:p-8">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center gap-3 sm:gap-4">
-                <div className={`h-10 w-10 rounded-xl flex items-center justify-center ${theme.bgLight} ${theme.accent}`}>
-                   <Activity size={20} />
+            <div className="relative z-[120] border-b bg-white/80 p-3 backdrop-blur-md sm:p-6 lg:p-8">
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <div className="flex items-center gap-3 sm:gap-4">
+                  <div className={`h-10 w-10 rounded-xl flex items-center justify-center ${theme.bgLight} ${theme.accent}`}>
+                     <Activity size={20} />
+                  </div>
+                  <div>
+                    <h4 className="text-lg font-black tracking-tight">{brandLabel(brand)}</h4>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{mode === "sales" ? "Sales Velocity" : "Claims Integrity"}</p>
+                  </div>
                 </div>
-                <div>
-                  <h4 className="text-lg font-black tracking-tight">{brandLabel(brand)}</h4>
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{mode === "sales" ? "Sales Velocity" : "Claims Integrity"}</p>
+                <div className="flex w-full flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-end xl:w-auto">
+                  <div className="w-full max-w-[360px]">
+                    <DateRangePicker
+                      draftFromDate={draftFromDate}
+                      draftToDate={draftToDate}
+                      minDate={defaultFromDate || undefined}
+                      maxDate={defaultToDate && defaultToDate > todayIso() ? defaultToDate : todayIso()}
+                      compact
+                      align="right"
+                      onDraftChange={(from, to) => {
+                        setDraftFromDate(clampToCurrentMonth(from))
+                        setDraftToDate(clampToCurrentMonth(to))
+                      }}
+                      onApply={handleGraphDateRangeApply}
+                      onReset={resetDateRange}
+                    />
+                  </div>
+                  <button className="w-full whitespace-nowrap rounded-2xl bg-slate-900 px-4 py-3 text-[11px] font-bold text-white transition-all hover:bg-black sm:w-auto sm:px-6 sm:text-xs lg:px-8" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
                 </div>
-              </div>
-              <button className="w-full whitespace-nowrap rounded-2xl bg-slate-900 px-4 py-3 text-[11px] font-bold text-white transition-all hover:bg-black sm:w-auto sm:px-6 sm:text-xs lg:px-8" onClick={() => handleFullscreenToggle(false)}>Close Focus View</button>
               </div>
             </div>
             <div className="flex-1 overflow-auto p-3 sm:p-6 lg:p-12">

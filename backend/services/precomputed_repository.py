@@ -192,6 +192,38 @@ def clear_precomputed_for_tag(
     _invalidate_caches_for_tag(source, dataset_type, job_id)
 
 
+def clear_precomputed_for_source_dataset(
+    db: Session,
+    *,
+    source: str,
+    dataset_type: str,
+) -> None:
+    source_key = _normalize_key(source)
+    dataset_key = _normalize_key(dataset_type)
+    db.query(PrecomputedGraph).filter(
+        PrecomputedGraph.source == source_key,
+        PrecomputedGraph.dataset_type == dataset_key,
+    ).delete(synchronize_session=False)
+    db.query(PrecomputedSummary).filter(
+        PrecomputedSummary.source == source_key,
+        PrecomputedSummary.dataset_type == dataset_key,
+    ).delete(synchronize_session=False)
+    db.query(PrecomputedInsight).filter(
+        PrecomputedInsight.source == source_key,
+        PrecomputedInsight.dataset_type == dataset_key,
+    ).delete(synchronize_session=False)
+    with _precomputed_cache_lock:
+        graph_keys = [k for k in _graph_cache if k[0] == source_key and k[1] == dataset_key]
+        summary_keys = [k for k in _summary_cache if k[0] == source_key and k[1] == dataset_key]
+        insight_keys = [k for k in _insights_cache if k[0] == source_key and k[1] == dataset_key]
+        for key in graph_keys:
+            _graph_cache.pop(key, None)
+        for key in summary_keys:
+            _summary_cache.pop(key, None)
+        for key in insight_keys:
+            _insights_cache.pop(key, None)
+
+
 def get_precomputed_graph(
     db: Session,
     *,
@@ -295,6 +327,9 @@ def upsert_precomputed_graph(
             rows=payload,
         )
         db.add(obj)
+        # SessionLocal uses autoflush=False; flush immediately so subsequent
+        # upsert queries in the same transaction can see this row.
+        db.flush()
         cache_key = _graph_cache_key(
             source=source,
             dataset_type=dataset_type,
@@ -387,6 +422,9 @@ def upsert_precomputed_summary(
             summary=payload,
         )
         db.add(obj)
+        # SessionLocal uses autoflush=False; flush immediately so subsequent
+        # upsert queries in the same transaction can see this row.
+        db.flush()
         cache_key = _summary_cache_key(
             source=source,
             dataset_type=dataset_type,
@@ -526,6 +564,9 @@ def upsert_precomputed_insights(
             message=message,
         )
         db.add(obj)
+        # SessionLocal uses autoflush=False; flush immediately so subsequent
+        # upsert queries in the same transaction can see this row.
+        db.flush()
         cache_key = _insights_cache_key(
             source=source,
             dataset_type=dataset_type,
