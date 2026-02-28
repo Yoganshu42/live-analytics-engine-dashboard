@@ -1510,15 +1510,26 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             )
 
             merged = claims_g.merge(sales_g, on="Month", how="left")
-            numerator = pd.to_numeric(merged["Net Claims"], errors="coerce").fillna(0)
-            denominator = pd.to_numeric(merged["Zopper Earned Premium"], errors="coerce").fillna(0)
-            merged["loss_ratio"] = (
-                numerator / denominator.replace(0, pd.NA) * 100
-            ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
+            merged["Month"] = pd.to_datetime(merged["Month"], errors="coerce")
+            merged = merged[merged["Month"].notna()].sort_values("Month").copy()
+            if merged.empty:
+                return []
 
-            out = merged[["Month", "loss_ratio"]].rename(columns={"Month": "month"})
+            numerator = pd.to_numeric(merged["Net Claims"], errors="coerce").fillna(0.0)
+            denominator = pd.to_numeric(merged["Zopper Earned Premium"], errors="coerce").fillna(0.0)
+            merged["_cum_claims"] = numerator.cumsum()
+            merged["_cum_zp"] = denominator.cumsum()
+            merged["loss_ratio"] = (
+                merged["_cum_claims"] / merged["_cum_zp"].replace(0, pd.NA) * 100
+            ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
+            merged["period_start"] = merged["Month"].iloc[0]
+            merged["period_end"] = merged["Month"]
+
+            out = merged[["Month", "loss_ratio", "period_start", "period_end"]].rename(columns={"Month": "month"})
             out = out.sort_values("month")
             out["month"] = pd.to_datetime(out["month"], errors="coerce").dt.strftime("%b-%y")
+            out["period_start"] = pd.to_datetime(out["period_start"], errors="coerce").dt.strftime("%b-%y")
+            out["period_end"] = pd.to_datetime(out["period_end"], errors="coerce").dt.strftime("%b-%y")
             return out.to_dict(orient="records")
         elif dimension == "state":
             def _normalize_key(value: str) -> str:

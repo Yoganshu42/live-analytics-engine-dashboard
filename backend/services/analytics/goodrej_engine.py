@@ -1048,13 +1048,23 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             merged = claims_out.merge(sales_out, on="month", how="left")
             merged["_claims"] = pd.to_numeric(merged["_claims"], errors="coerce").fillna(0.0)
             merged["_zp"] = pd.to_numeric(merged["_zp"], errors="coerce").fillna(0.0)
+            merged["month"] = pd.to_datetime(merged["month"], errors="coerce")
+            merged = merged[merged["month"].notna()].sort_values("month").copy()
+            if merged.empty:
+                return []
+            merged["_cum_claims"] = merged["_claims"].cumsum()
+            merged["_cum_zp"] = merged["_zp"].cumsum()
             merged["loss_ratio"] = (
-                merged["_claims"] / merged["_zp"].replace(0, pd.NA) * 100
+                merged["_cum_claims"] / merged["_cum_zp"].replace(0, pd.NA) * 100
             ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
+            merged["period_start"] = merged["month"].iloc[0]
+            merged["period_end"] = merged["month"]
 
-            out = merged[["month", "loss_ratio"]].copy()
+            out = merged[["month", "loss_ratio", "period_start", "period_end"]].copy()
             out = out.sort_values("month")
             out["month"] = pd.to_datetime(out["month"], errors="coerce").dt.strftime("%b-%y")
+            out["period_start"] = pd.to_datetime(out["period_start"], errors="coerce").dt.strftime("%b-%y")
+            out["period_end"] = pd.to_datetime(out["period_end"], errors="coerce").dt.strftime("%b-%y")
             out = out[out["month"].notna()]
             return out.to_dict(orient="records")
 

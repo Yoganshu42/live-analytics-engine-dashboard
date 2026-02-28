@@ -1182,6 +1182,19 @@ def compute_by_dimension_rows(
                     except Exception:
                         merged[key][out_key] = 0.0
 
+                    # Preserve loss-ratio period window metadata for temporal charts.
+                    if metric_key == "loss_ratio" and dim_key in {"month", "date"}:
+                        period_start_col = safe_map.get("period_start")
+                        period_end_col = safe_map.get("period_end")
+                        if period_start_col is not None:
+                            start_val = row.get(period_start_col)
+                            if start_val not in (None, ""):
+                                merged[key]["period_start"] = start_val
+                        if period_end_col is not None:
+                            end_val = row.get(period_end_col)
+                            if end_val not in (None, ""):
+                                merged[key]["period_end"] = end_val
+
             def _fetch_and_merge(src: str, out_key: str):
                 force_live_partner_metric = (
                     dataset_type == "sales"
@@ -1213,6 +1226,23 @@ def compute_by_dimension_rows(
                                 overview_mode=False,
                             )
                         )
+                        if (
+                            not suspicious_loss_ratio_cache
+                            and dataset_type == "claims"
+                            and _to_safe_key(metric or "") == "loss_ratio"
+                            and _to_safe_key(dimension or "") in {"month", "date"}
+                        ):
+                            first_partner_row = next(
+                                (row for row in partner_cached if isinstance(row, dict)),
+                                None,
+                            )
+                            if first_partner_row is not None:
+                                safe_partner_keys = {
+                                    _to_safe_key(str(k))
+                                    for k in first_partner_row.keys()
+                                }
+                                if "period_start" not in safe_partner_keys or "period_end" not in safe_partner_keys:
+                                    suspicious_loss_ratio_cache = True
                         if not suspicious_loss_ratio_cache:
                             _merge(partner_cached, out_key)
                             return
@@ -1404,11 +1434,7 @@ def analytics_by_dimension(
         and normalized_dataset == "sales"
         and metric_key in {"earned_premium", "zopper_earned_premium"}
     )
-    force_live_loss_ratio = (
-        normalized_dataset == "claims"
-        and metric_key == "loss_ratio"
-    )
-    cached = None if (force_live_samsung_sales_earned or force_live_loss_ratio) else get_precomputed_graph(
+    cached = None if force_live_samsung_sales_earned else get_precomputed_graph(
         db=db,
         source=resolved_source,
         dataset_type=normalized_dataset,
@@ -1427,6 +1453,7 @@ def analytics_by_dimension(
         is_stale_godrej_legacy_region = False
         is_stale_godrej_claims_range_mismatch = False
         is_stale_godrej_sales_month_mismatch = False
+        is_stale_loss_ratio_period_window = False
         dimension_key = _to_safe_key(dimension or "")
         if isinstance(cached[0], dict):
             row_keys = {_to_safe_key(str(k)) for k in cached[0].keys()}
@@ -1542,6 +1569,17 @@ def analytics_by_dimension(
                 )
             ):
                 is_stale_samsung_loss_ratio_cache = True
+
+        if (
+            normalized_dataset == "claims"
+            and metric_key == "loss_ratio"
+            and dimension_key in {"month", "date"}
+        ):
+            first_cache_row = next((row for row in cached if isinstance(row, dict)), None)
+            if first_cache_row is not None:
+                safe_keys = {_to_safe_key(str(k)) for k in first_cache_row.keys()}
+                if "period_start" not in safe_keys or "period_end" not in safe_keys:
+                    is_stale_loss_ratio_period_window = True
 
         if (
             resolved_source == "godrej"
@@ -1670,6 +1708,7 @@ def analytics_by_dimension(
             or is_stale_godrej_legacy_region
             or is_stale_godrej_claims_range_mismatch
             or is_stale_godrej_sales_month_mismatch
+            or is_stale_loss_ratio_period_window
         ):
             if is_stale_cached_shape:
                 reason = "shape"
@@ -1683,6 +1722,8 @@ def analytics_by_dimension(
                 reason = "godrej_range_mismatch"
             elif is_stale_godrej_sales_month_mismatch:
                 reason = "godrej_sales_month_mismatch"
+            elif is_stale_loss_ratio_period_window:
+                reason = "loss_ratio_period_window"
             else:
                 reason = "samsung_partner_mismatch"
             logger.warning(

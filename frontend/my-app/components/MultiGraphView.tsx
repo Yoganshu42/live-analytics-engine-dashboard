@@ -1253,7 +1253,7 @@ export default function MultiGraphView({
     if (isSamsungOverview || !sectionConfigs.length) return
 
     let active = true
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       if (!active) return
 
       const loadingState: Record<string, SectionMergedState> = {}
@@ -1262,86 +1262,90 @@ export default function MultiGraphView({
       })
       setSectionMergedMap((prev) => ({ ...prev, ...loadingState }))
 
-      Promise.all(
-        sectionConfigs.map(async ({ group, entries }): Promise<[string, SectionMergedState]> => {
-          const firstEntry = entries[0]
-          if (!firstEntry) {
-            return [group, { loading: false, error: "No section preset available.", rows: [] }]
-          }
+      const fetchSectionState = async (
+        entries: Array<{ preset: Preset; visibleMetrics: string[]; mergedMetrics: string[] }>
+      ): Promise<SectionMergedState> => {
+        const firstEntry = entries[0]
+        if (!firstEntry) {
+          return { loading: false, error: "No section preset available.", rows: [] }
+        }
 
-          const dimension = firstEntry.preset.dimension
-          const bucket = firstEntry.preset.bucket
-          const mergedMetrics = firstEntry.mergedMetrics
-          const dimKey = dimension.toLowerCase()
+        const dimension = firstEntry.preset.dimension
+        const bucket = firstEntry.preset.bucket
+        const mergedMetrics = firstEntry.mergedMetrics
+        const dimKey = dimension.toLowerCase()
 
-          try {
-            const metricResponses = await Promise.allSettled(
-              mergedMetrics.map((metric) =>
-                fetchGraphRows({
-                  source,
-                  dimension,
-                  metric,
-                  datasetType,
-                  bucket,
-                  jobId,
-                  from_date: fromDate,
-                  to_date: toDate,
-                })
-              )
+        try {
+          const metricResponses = await Promise.allSettled(
+            mergedMetrics.map((metric) =>
+              fetchGraphRows({
+                source,
+                dimension,
+                metric,
+                datasetType,
+                bucket,
+                jobId,
+                from_date: fromDate,
+                to_date: toDate,
+              })
             )
+          )
 
-            const merged = new Map<string, SectionMergedRow>()
-            let successCount = 0
+          const merged = new Map<string, SectionMergedRow>()
+          let successCount = 0
 
-            metricResponses.forEach((response, idx) => {
-              const metric = mergedMetrics[idx]
-              if (response.status !== "fulfilled") return
-              successCount += 1
+          metricResponses.forEach((response, idx) => {
+            const metric = mergedMetrics[idx]
+            if (response.status !== "fulfilled") return
+            successCount += 1
 
-              for (const row of response.value.data || []) {
-                const rawDim = row[dimKey]
-                const dimValue = String(rawDim ?? "").trim()
-                if (!dimValue) continue
+            for (const row of response.value.data || []) {
+              const rawDim = row[dimKey]
+              const dimValue = String(rawDim ?? "").trim()
+              if (!dimValue) continue
 
-                if (!merged.has(dimValue)) {
-                  const seed: SectionMergedRow = { [dimKey]: dimValue }
-                  mergedMetrics.forEach((m) => {
-                    seed[m] = 0
-                  })
-                  merged.set(dimValue, seed)
-                }
-
-                const target = merged.get(dimValue)
-                if (!target) continue
-                target[metric] = Math.max(0, getSourceMetricValue(row, metric, source))
+              if (!merged.has(dimValue)) {
+                const seed: SectionMergedRow = { [dimKey]: dimValue }
+                mergedMetrics.forEach((m) => {
+                  seed[m] = 0
+                })
+                merged.set(dimValue, seed)
               }
-            })
 
-            if (successCount === 0) {
-              return [group, { loading: false, error: "Unable to load section graph data.", rows: [] }]
+              const target = merged.get(dimValue)
+              if (!target) continue
+              target[metric] = Math.max(0, getSourceMetricValue(row, metric, source))
             }
-
-            const rows = Array.from(merged.values())
-            if (dimKey.includes("month") || dimKey.includes("date")) {
-              rows.sort((a, b) => monthSortValue(String(a[dimKey] || "")) - monthSortValue(String(b[dimKey] || "")))
-            } else {
-              rows.sort((a, b) => String(a[dimKey] || "").localeCompare(String(b[dimKey] || "")))
-            }
-
-            return [group, { loading: false, error: rows.length ? null : "No data available in selected range.", rows }]
-          } catch {
-            return [group, { loading: false, error: "Unable to load section graph data.", rows: [] }]
-          }
-        })
-      )
-        .then((results) => {
-          if (!active) return
-          const nextState: Record<string, SectionMergedState> = {}
-          results.forEach(([group, state]) => {
-            nextState[group] = state
           })
-          setSectionMergedMap((prev) => ({ ...prev, ...nextState }))
-        })
+
+          if (successCount === 0) {
+            return { loading: false, error: "Unable to load section graph data.", rows: [] }
+          }
+
+          const rows = Array.from(merged.values())
+          if (dimKey.includes("month") || dimKey.includes("date")) {
+            rows.sort((a, b) => monthSortValue(String(a[dimKey] || "")) - monthSortValue(String(b[dimKey] || "")))
+          } else {
+            rows.sort((a, b) => String(a[dimKey] || "").localeCompare(String(b[dimKey] || "")))
+          }
+
+          return { loading: false, error: rows.length ? null : "No data available in selected range.", rows }
+        } catch {
+          return { loading: false, error: "Unable to load section graph data.", rows: [] }
+        }
+      }
+
+      // Progressive section loading reduces backend request bursts and improves
+      // time-to-first-chart rendering.
+      for (const section of sectionConfigs) {
+        if (!active) break
+        const state = await fetchSectionState(section.entries)
+        if (!active) break
+        setSectionMergedMap((prev) => ({
+          ...prev,
+          [section.group]: state,
+        }))
+      }
     }, 0)
 
     return () => {
@@ -1875,6 +1879,7 @@ export default function MultiGraphView({
               toDate={toDate}
               chartType={card.chartType}
               tooltipMetricOverride={card.tooltipMetricOverride}
+              deferUntilVisible
               heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
             />
           </div>
@@ -1934,6 +1939,7 @@ export default function MultiGraphView({
               toDate={toDate}
               chartType={card.chartType}
               tooltipMetricOverride={card.tooltipMetricOverride}
+              deferUntilVisible
               heightClassName={
                 card.chartType === "pie"
                   ? "h-[230px] sm:h-[260px]"
@@ -2101,6 +2107,7 @@ export default function MultiGraphView({
                           fromDate={fromDate}
                           toDate={toDate}
                           chartType="india_map"
+                          deferUntilVisible
                           heightClassName="h-full"
                         />
                       ) : sectionData.loading ? (

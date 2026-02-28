@@ -328,7 +328,7 @@ type FetchRowsResult = {
   usedRangeFallback?: boolean
 }
 
-const GRAPH_RESULT_TTL_MS = 120000
+const GRAPH_RESULT_TTL_MS = 300000
 const graphResultCache = new Map<string, { expiresAt: number; value: FetchRowsResult }>()
 const graphInFlight = new Map<string, Promise<FetchRowsResult>>()
 
@@ -780,6 +780,8 @@ type CustomTooltipProps = {
   label?: string
   measure: string
   compareTooltipQuantity?: boolean
+  showPeriodRange?: boolean
+  periodStartLabel?: string
 }
 
 const CustomTooltip = ({
@@ -788,10 +790,23 @@ const CustomTooltip = ({
   label,
   measure,
   compareTooltipQuantity = false,
+  showPeriodRange = false,
+  periodStartLabel = "",
 }: CustomTooltipProps) => {
   if (!active || !payload?.length) return null
   const formattedLabel = formatMonth(label || "")
   const tooltipRow = payload[0]?.payload
+  const metricIsLossRatio = measure.toLowerCase().includes("loss_ratio")
+  const rowPeriodStart = formatMonth(String(tooltipRow?.period_start ?? ""))
+  const rowPeriodEnd = formatMonth(String((tooltipRow?.period_end ?? label) || ""))
+  const effectivePeriodStart = rowPeriodStart || periodStartLabel
+  const effectivePeriodEnd = rowPeriodEnd || formattedLabel
+  const showPeriod = Boolean(
+    showPeriodRange &&
+    metricIsLossRatio &&
+    effectivePeriodStart &&
+    effectivePeriodEnd
+  )
   const showQuantityOnly =
     compareTooltipQuantity &&
     Boolean(tooltipRow) &&
@@ -805,6 +820,11 @@ const CustomTooltip = ({
     return (
       <div className="max-w-[min(84vw,280px)] rounded-lg border bg-white p-2.5 shadow sm:p-3">
         <p className="text-[11px] font-bold text-gray-400 sm:text-xs">{formattedLabel}</p>
+        {showPeriod && (
+          <p className="mt-1 text-[10px] font-semibold text-indigo-500">
+            Period: {effectivePeriodStart} to {effectivePeriodEnd}
+          </p>
+        )}
         <div className="mt-2">
           <div className="grid grid-cols-[minmax(92px,1fr)_auto_auto] items-center gap-x-2 gap-y-1 text-[10px] font-semibold text-slate-500 sm:grid-cols-[minmax(120px,1fr)_auto_auto] sm:gap-x-4 sm:text-[11px]">
             <span />
@@ -833,6 +853,11 @@ const CustomTooltip = ({
   return (
     <div className="max-w-[min(84vw,280px)] rounded-lg border bg-white p-2.5 shadow sm:p-3">
       <p className="text-[11px] font-bold text-gray-400 sm:text-xs">{formattedLabel}</p>
+      {showPeriod && (
+        <p className="mt-1 text-[10px] font-semibold text-indigo-500">
+          Period: {effectivePeriodStart} to {effectivePeriodEnd}
+        </p>
+      )}
       <div className="space-y-0.5 sm:space-y-1">
         {payload.map((p) => (
           (() => {
@@ -960,7 +985,7 @@ export default function GraphView({
           observer.disconnect()
         }
       },
-      { rootMargin: "240px 0px 240px 0px" }
+      { rootMargin: "420px 0px 420px 0px" }
     )
     observer.observe(node)
     return () => observer.disconnect()
@@ -1163,7 +1188,7 @@ export default function GraphView({
 
   useEffect(() => {
     let active = true
-    if (chartType !== "india_map" || !source) {
+    if (chartType !== "india_map" || !source || (deferUntilVisible && !isVisible)) {
       setHoverDetailByStateId({})
       return () => {
         active = false
@@ -1204,11 +1229,12 @@ export default function GraphView({
       setHoverDetailByStateId(aggregate)
     }
 
-    loadHoverDetails()
+    const timer = setTimeout(loadHoverDetails, 220)
     return () => {
       active = false
+      clearTimeout(timer)
     }
-  }, [chartType, source, bucket, jobId, fromDate, toDate, datasetType, categoryFiltersKey, normalizedCategoryFilters])
+  }, [chartType, source, bucket, jobId, fromDate, toDate, datasetType, categoryFiltersKey, normalizedCategoryFilters, deferUntilVisible, isVisible])
 
   if (deferUntilVisible && !isVisible) {
     return (
@@ -1289,6 +1315,13 @@ export default function GraphView({
     return next
   })
   const shouldAnimateBars = !prefersReducedMotion && chartData.length <= 36
+  const periodStartLabel = (() => {
+    if (!isTemporalDimension || !chartData.length) return ""
+    const firstRow = chartData[0]
+    const explicitStart = String(firstRow?.period_start ?? "").trim()
+    if (explicitStart) return formatMonth(explicitStart)
+    return formatMonth(String(firstRow?.[dimKey] ?? ""))
+  })()
   const barAnimationDuration = shouldAnimateBars ? 500 : 0
   const pieData = chartData
     .map((row) => {
@@ -1703,6 +1736,8 @@ export default function GraphView({
                 <CustomTooltip
                   measure={measure}
                   compareTooltipQuantity={showCompareQuantityTooltip}
+                  showPeriodRange={isTemporalDimension}
+                  periodStartLabel={periodStartLabel}
                 />
               }
             />
@@ -1894,6 +1929,8 @@ export default function GraphView({
                 <CustomTooltip
                   measure={measure}
                   compareTooltipQuantity={showCompareQuantityTooltip}
+                  showPeriodRange={isTemporalDimension}
+                  periodStartLabel={periodStartLabel}
                 />
               }
             />

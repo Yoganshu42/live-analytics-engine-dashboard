@@ -1365,10 +1365,20 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                     }
                 )
                 merged = claims_out.merge(sales_out, on="_k", how="left")
+                merged["_month_sort"] = pd.to_datetime(merged["_k"], errors="coerce")
+                merged = merged[merged["_month_sort"].notna()].sort_values("_month_sort").copy()
+                if merged.empty:
+                    return []
+                merged["_cum_claims"] = pd.to_numeric(merged["_net_claims"], errors="coerce").fillna(0.0).cumsum()
+                merged["_cum_zp"] = pd.to_numeric(merged["_zp"], errors="coerce").fillna(0.0).cumsum()
                 merged["loss_ratio"] = (
-                    merged["_net_claims"] / pd.to_numeric(merged["_zp"], errors="coerce").fillna(0).replace(0, pd.NA) * 100
+                    merged["_cum_claims"] / merged["_cum_zp"].replace(0, pd.NA) * 100
                 ).replace([float("inf"), float("-inf")], 0).fillna(0).clip(lower=0, upper=LOSS_RATIO_CAP_PERCENT)
-                out = merged[[dim, "loss_ratio"]]
+                merged["period_start"] = merged["_month_sort"].iloc[0]
+                merged["period_end"] = merged["_month_sort"]
+                out = merged[[dim, "loss_ratio", "period_start", "period_end"]].copy()
+                out["period_start"] = pd.to_datetime(out["period_start"], errors="coerce").dt.strftime("%b-%y")
+                out["period_end"] = pd.to_datetime(out["period_end"], errors="coerce").dt.strftime("%b-%y")
             else:
                 sales_out = (
                     sales_df
