@@ -73,6 +73,22 @@ const normalizeDatasetType = (value: string) => {
   return (value || "").trim().toLowerCase() === "claims" ? "claims" : "sales"
 }
 
+const buildUiContextSnapshot = () => {
+  if (typeof window === "undefined") return {}
+  return {
+    path: window.location.pathname,
+    view: localStorage.getItem("dashboard_view") || "",
+    source: localStorage.getItem("dashboard_brand") || "",
+    dataset_type: localStorage.getItem("dashboard_mode") || "",
+    job_id: localStorage.getItem("job_id") || "",
+    use_job_filter: localStorage.getItem("use_job_filter") === "1",
+    from_date: localStorage.getItem("dashboard_from_date") || "",
+    to_date: localStorage.getItem("dashboard_to_date") || "",
+    fullscreen: localStorage.getItem("dashboard_fullscreen") === "1",
+    sidebar_collapsed: localStorage.getItem("dashboard_sidebar_collapsed") === "1",
+  }
+}
+
 const splitToSentences = (text: string) =>
   text
     .replace(/([.!?])\s+(?=[A-Z0-9])/g, "$1\n")
@@ -338,6 +354,8 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
         job_id: jobId || undefined,
         from_date: fromDate || undefined,
         to_date: toDate || undefined,
+        global_scope: true,
+        ui_context: buildUiContextSnapshot(),
       })
       const reply = (result.response || "").trim() || "No response generated."
       appendAssistantMessage(reply)

@@ -163,6 +163,8 @@ export type ChatbotPayload = {
   job_id?: string
   from_date?: string
   to_date?: string
+  global_scope?: boolean
+  ui_context?: Record<string, unknown>
 }
 
 export type ChatbotResponse = {
@@ -229,6 +231,49 @@ export type CategoryPercentageRow = {
   percentage: number
 }
 
+export type DeckDownloadParams = {
+  partners?: string[]
+  dataset_type: "sales" | "claims"
+  job_id?: string
+  from_date?: string
+  to_date?: string
+  include_tables?: boolean
+  week_window?: 2 | 3 | 4 | 6
+}
+
+export type DeckPreviewPartnerItem = {
+  source: string
+  display_name: string
+  logo?: string | null
+  summary: {
+    gross_premium: number
+    quantity: number
+  }
+  trend_dimension: "month" | "week" | string
+  trend_points: Array<{
+    label: string
+    gross_premium: number
+    quantity: number
+  }>
+  state_points: Array<{
+    label: string
+    gross_premium: number
+    quantity: number
+  }>
+  product_points?: Array<{
+    label: string
+    gross_premium: number
+    quantity: number
+  }>
+  insights: string[]
+}
+
+type DeckPreviewResponse = {
+  items: DeckPreviewPartnerItem[]
+  dataset_type: "sales" | "claims" | string
+  week_window: number
+}
+
 type CategoryPercentageResponse = {
   dimension: string
   metric: string
@@ -289,6 +334,8 @@ const API_FALLBACKS = Array.from(
 const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
 const ADMIN_UPLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_ADMIN_UPLOAD_TIMEOUT_MS || 180000)
 const CHATBOT_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_CHATBOT_TIMEOUT_MS || 120000)
+const DECK_DOWNLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_DECK_DOWNLOAD_TIMEOUT_MS || 240000)
+const DECK_PREVIEW_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_DECK_PREVIEW_TIMEOUT_MS || 120000)
 let preferredApiBase = API_FALLBACKS[0] || ""
 
 const orderedApiBases = () => {
@@ -348,6 +395,7 @@ async function fetchJsonWithFallback(path: string, query: string, init: ApiReque
 async function fetchResponseWithFallback(path: string, query: string, init: ApiRequestInit = {}) {
   const errors: string[] = []
   let sawUnauthorized = false
+  let sawNonAuthFailure = false
   const { timeoutMs, ...requestInit } = init
 
   for (const base of orderedApiBases()) {
@@ -404,6 +452,7 @@ async function fetchResponseWithFallback(path: string, query: string, init: ApiR
       if (err instanceof NoFallbackError) {
         throw err
       }
+      sawNonAuthFailure = true
       const msg =
         err instanceof Error && err.name === "AbortError"
           ? `Request timed out after ${timeoutMs ?? API_REQUEST_TIMEOUT_MS}ms`
@@ -415,7 +464,7 @@ async function fetchResponseWithFallback(path: string, query: string, init: ApiR
     }
   }
 
-  if (sawUnauthorized) {
+  if (sawUnauthorized && !sawNonAuthFailure) {
     if (path === "/auth/me" || path === "/insights/graph") {
       handleUnauthorized()
     }
@@ -659,6 +708,62 @@ export async function downloadAdminFile(params: {
     blob,
     filename: match?.[1] || fallbackName,
   }
+}
+
+export async function downloadDeckPptx(
+  params: DeckDownloadParams
+): Promise<{ blob: Blob; filename: string }> {
+  const safeParams = withSafeDateRange(params)
+  const queryParams = new URLSearchParams()
+  const partners = Array.isArray(safeParams.partners)
+    ? safeParams.partners.map((value) => String(value).trim()).filter(Boolean)
+    : []
+
+  if (partners.length) {
+    queryParams.set("partners", partners.join(","))
+  }
+  queryParams.set("dataset_type", safeParams.dataset_type)
+  if (safeParams.job_id) queryParams.set("job_id", safeParams.job_id)
+  if (safeParams.from_date) queryParams.set("from_date", safeParams.from_date)
+  if (safeParams.to_date) queryParams.set("to_date", safeParams.to_date)
+  queryParams.set("include_tables", String(safeParams.include_tables !== false))
+  if (safeParams.week_window) queryParams.set("week_window", String(safeParams.week_window))
+
+  const res = await fetchResponseWithFallback("/deck/download-pptx", queryParams.toString(), {
+    method: "GET",
+    timeoutMs: DECK_DOWNLOAD_TIMEOUT_MS,
+  })
+  const blob = await res.blob()
+  const contentDisposition = res.headers.get("content-disposition") || ""
+  const match = contentDisposition.match(/filename=\"?([^\";]+)\"?/)
+  const fallbackName = `partner_deck_${safeParams.dataset_type}.pptx`
+
+  return {
+    blob,
+    filename: match?.[1] || fallbackName,
+  }
+}
+
+export async function fetchDeckPreview(params: DeckDownloadParams): Promise<DeckPreviewResponse> {
+  const safeParams = withSafeDateRange(params)
+  const queryParams = new URLSearchParams()
+  const partners = Array.isArray(safeParams.partners)
+    ? safeParams.partners.map((value) => String(value).trim()).filter(Boolean)
+    : []
+
+  if (partners.length) {
+    queryParams.set("partners", partners.join(","))
+  }
+  queryParams.set("dataset_type", safeParams.dataset_type)
+  if (safeParams.job_id) queryParams.set("job_id", safeParams.job_id)
+  if (safeParams.from_date) queryParams.set("from_date", safeParams.from_date)
+  if (safeParams.to_date) queryParams.set("to_date", safeParams.to_date)
+  if (safeParams.week_window) queryParams.set("week_window", String(safeParams.week_window))
+
+  return fetchJsonWithFallback("/deck/preview", queryParams.toString(), {
+    method: "GET",
+    timeoutMs: DECK_PREVIEW_TIMEOUT_MS,
+  })
 }
 
 export async function fetchGraphInsights(payload: GraphInsightsPayload): Promise<GraphInsightsResponse> {

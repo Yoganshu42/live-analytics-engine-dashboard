@@ -14,6 +14,7 @@ import {
 } from "lucide-react"
 
 import AdminFileAccess from "@/components/AdminFileAccess"
+import DeckStudioAccess from "@/components/DeckStudioAccess"
 
 type Props = {
   brand: string
@@ -178,8 +179,12 @@ export default function Sidebar({
         </div>
       </div>
 
-      <div className={`mt-4 border-t border-slate-200 pt-4 ${collapsed ? "md:hidden" : ""}`}>
-        <AdminFileAccess isAdmin={authRole === "admin"} />
+      <div className="mt-3 sm:mt-4">
+        <DeckStudioAccess collapsed={collapsed} />
+      </div>
+
+      <div className="mt-4 border-t border-slate-200 pt-4">
+        <AdminFileAccess isAdmin={authRole === "admin"} compact={collapsed} />
       </div>
     </aside>
   )

@@ -18,6 +18,7 @@ from models.data_rows import DataRow
 from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_repository import invalidate_dataframe_cache
 from services.analytics.samsung_engine import invalidate_samsung_load_cache
+from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
 from services.manual_update_service import mark_manual_update
 from services.precompute_service import rebuild_precomputed_analytics, rebuild_precomputed_for_all_tags
 from services.precomputed_repository import clear_precomputed_for_source_dataset
@@ -151,6 +152,12 @@ def _post_file_update(
     job_norm: str | None,
     action: str,
 ):
+    invalidate_deck_cache_for_source_dataset(
+        db=db,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
+
     refresh_sources: list[str] = [source_norm]
     if source_norm in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
         refresh_sources.append("samsung")

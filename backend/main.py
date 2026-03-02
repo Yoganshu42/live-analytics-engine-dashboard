@@ -36,6 +36,7 @@ from db.base import Base
 from db.deps import get_db
 
 from models.data_rows import DataRow
+from models.deck_pptx_cache import DeckPptxCache
 from models.manual_updates import ManualUpdateMarker
 from models.precomputed_analytics import PrecomputedGraph, PrecomputedInsight, PrecomputedSummary
 from authentication import models as auth_models
@@ -52,6 +53,7 @@ from services.precomputed_repository import (
 )
 from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_engine import filter_by_date_range
+from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
 
 # --------------------------------------------------
 # LOGGING
@@ -142,6 +144,7 @@ def _refresh_after_data_change(
     src = source.lower().strip()
     ds = dataset_type.lower().strip()
     refresh_jobs = _refresh_jobs(job_id)
+    invalidate_deck_cache_for_source_dataset(db=db, source=src, dataset_type=ds)
 
     for refresh_job in refresh_jobs:
         mark_manual_update(
@@ -249,6 +252,45 @@ def _init_db():
             conn.execute(
                 text(
                     """
+                    CREATE TABLE IF NOT EXISTS public.deck_pptx_cache (
+                        id SERIAL PRIMARY KEY,
+                        cache_key TEXT NOT NULL,
+                        partners_key TEXT NOT NULL DEFAULT '',
+                        dataset_type TEXT NOT NULL DEFAULT 'sales',
+                        job_key TEXT NOT NULL DEFAULT '',
+                        from_date TEXT NOT NULL DEFAULT '',
+                        to_date TEXT NOT NULL DEFAULT '',
+                        include_tables BOOLEAN NOT NULL DEFAULT TRUE,
+                        week_window INTEGER NOT NULL DEFAULT 4,
+                        data_fingerprint TEXT NOT NULL DEFAULT '',
+                        filename TEXT NOT NULL DEFAULT 'partner_deck_sales.pptx',
+                        size_bytes INTEGER NOT NULL DEFAULT 0,
+                        pptx_blob BYTEA NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_deck_pptx_cache_key
+                    ON public.deck_pptx_cache (cache_key);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_deck_pptx_cache_updated_at
+                    ON public.deck_pptx_cache (updated_at);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
                     CREATE INDEX IF NOT EXISTS ix_data_rows_source_dataset
                     ON public.data_rows (source, dataset_type)
                     """
@@ -308,10 +350,12 @@ def preflight(path: str, request: Request):
 # --------------------------------------------------
 from routers.analytics import compute_by_dimension_rows, router as analytics_router
 from routers.admin_files import router as admin_files_router
+from routers.deck_export import router as deck_export_router
 from services.analytics_repository import invalidate_dataframe_cache, get_dataframe
 app.include_router(auth_router)
 app.include_router(analytics_router, dependencies=[Depends(get_current_user)])
 app.include_router(admin_files_router)
+app.include_router(deck_export_router)
 
 # --------------------------------------------------
 # HEALTH CHECK
@@ -1304,6 +1348,8 @@ class ChatbotPayload(BaseModel):
     job_id: str | None = Field(default=None, max_length=128)
     from_date: str | None = Field(default=None, max_length=32)
     to_date: str | None = Field(default=None, max_length=32)
+    global_scope: bool = False
+    ui_context: dict[str, Any] | None = None
 
 
 DEFAULT_LLM_MODEL = (
@@ -1509,6 +1555,22 @@ def _normalize_chatbot_date_range(
     if safe_from and safe_to and safe_from > safe_to:
         return safe_to, safe_from
     return safe_from, safe_to
+
+
+def _summarize_ui_context(ui_context: dict[str, Any] | None) -> str:
+    if not isinstance(ui_context, dict) or not ui_context:
+        return ""
+    try:
+        compact = json.dumps(ui_context, ensure_ascii=True, default=str, separators=(",", ":"))
+    except Exception:
+        compact = str(ui_context)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if not compact:
+        return ""
+    max_len = 1200
+    if len(compact) > max_len:
+        compact = f"{compact[:max_len].rstrip()}..."
+    return f"UI context snapshot: {compact}"
 
 
 def _detect_source_from_text(text: str) -> str | None:
@@ -2179,6 +2241,7 @@ def _build_chatbot_global_context(
         "rankings": [],
         "allowed_labels": sorted({_source_display_name(str(scope.get("source", ""))) for scope in scopes}),
         "global_scope": True,
+        "ui_context": payload.ui_context if isinstance(payload.ui_context, dict) else {},
     }
 
     context_lines = [
@@ -2187,6 +2250,9 @@ def _build_chatbot_global_context(
     ]
     if job_id:
         context_lines.append(f"Selected job tag: {job_id}")
+    ui_context_line = _summarize_ui_context(payload.ui_context)
+    if ui_context_line:
+        context_lines.append(ui_context_line)
 
     if not scopes:
         context_lines.append("No rows are available in data_rows for the current filters.")
@@ -2520,9 +2586,11 @@ def _build_chatbot_dashboard_context(
         "rankings": [],
         "allowed_labels": [],
         "requested_dimensions": [],
+        "global_scope": bool(payload.global_scope),
+        "ui_context": payload.ui_context if isinstance(payload.ui_context, dict) else {},
     }
 
-    if not source or _requests_global_scope(payload.message):
+    if payload.global_scope or not source or _requests_global_scope(payload.message):
         return _build_chatbot_global_context(
             db=db,
             payload=payload,
@@ -2601,6 +2669,9 @@ def _build_chatbot_dashboard_context(
         f"Selected dataset: {dataset_type}",
         f"Selected date range: {date_label}",
     ]
+    ui_context_line = _summarize_ui_context(payload.ui_context)
+    if ui_context_line:
+        context_lines.append(ui_context_line)
     if _normalize_source_key(source) in {"samsung", "samsung_vs", "samsung_croma"}:
         context_lines.append(_samsung_model_mapping_context_line())
         context_lines.extend(_samsung_plan_reference_context_lines())
@@ -4358,6 +4429,8 @@ def _chatbot_cache_key(
         "job_id": _normalize_chatbot_job_id(payload.job_id) or "",
         "from_date": _normalize_chatbot_date(payload.from_date) or "",
         "to_date": _normalize_chatbot_date(payload.to_date) or "",
+        "global_scope": bool(payload.global_scope),
+        "ui_context": payload.ui_context if isinstance(payload.ui_context, dict) else {},
     }
     raw = json.dumps(signature, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

@@ -1,6 +1,7 @@
 "use client"
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react"
+import { Shield } from "lucide-react"
 import {
   AdminFileItem,
   AdminUser,
@@ -16,11 +17,12 @@ import {
 
 type Props = {
   isAdmin: boolean
+  compact?: boolean
 }
 
 type AdminSection = "data" | "users"
 
-export default function AdminFileAccess({ isAdmin }: Props) {
+export default function AdminFileAccess({ isAdmin, compact = false }: Props) {
   const [open, setOpen] = useState(false)
   const [section, setSection] = useState<AdminSection>("data")
 
@@ -31,12 +33,19 @@ export default function AdminFileAccess({ isAdmin }: Props) {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="w-full rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-left"
+        className={`w-full rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 ${compact ? "flex items-center justify-center" : "text-left"}`}
+        title="Admin Manual Access"
       >
-        <div className="text-[11px] font-bold uppercase tracking-wider text-indigo-700">
-          Admin Manual Access
-        </div>
-        <div className="text-[10px] text-indigo-500 mt-1">Open admin tools</div>
+        {compact ? (
+          <Shield size={16} className="text-indigo-700" />
+        ) : (
+          <>
+            <div className="text-[11px] font-bold uppercase tracking-wider text-indigo-700">
+              Admin Manual Access
+            </div>
+            <div className="mt-1 text-[10px] text-indigo-500">Open admin tools</div>
+          </>
+        )}
       </button>
 
       {open && (
