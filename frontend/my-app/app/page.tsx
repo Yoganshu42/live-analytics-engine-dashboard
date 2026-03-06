@@ -2,6 +2,7 @@
 
 import { useState, useMemo, useEffect, useRef, useCallback, useLayoutEffect } from "react"
 import Image from "next/image"
+import dynamic from "next/dynamic"
 import { useRouter } from "next/navigation"
 import { motion, AnimatePresence, Variants, useReducedMotion } from "framer-motion"
 import {
@@ -13,13 +14,43 @@ import {
 
 import Sidebar from "@/components/Sidebar"
 import Tabs from "@/components/Tabs"
-import GraphSection from "@/components/GraphSection"
 import { clearGraphDataCache } from "@/components/GraphView"
 import DateRangePicker from "@/components/DateRangePicker"
-import KpiCardsRow from "@/components/KpiCardsRow"
-import MasterDashboardView from "@/components/MasterDashboardView"
-import RightSideChatbot from "@/components/RightSideChatbot"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
+
+const GraphSection = dynamic(() => import("@/components/GraphSection"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-[360px] items-center justify-center text-sm text-slate-400 sm:h-[460px]">
+      Loading charts...
+    </div>
+  ),
+})
+
+const KpiCardsRow = dynamic(() => import("@/components/KpiCardsRow"), {
+  ssr: false,
+  loading: () => (
+    <div className="grid grid-cols-1 gap-3">
+      {Array.from({ length: 3 }).map((_, index) => (
+        <div
+          key={`kpi-loader-${index}`}
+          className="h-[92px] animate-pulse rounded-2xl bg-slate-100"
+        />
+      ))}
+    </div>
+  ),
+})
+
+const MasterDashboardView = dynamic(() => import("@/components/MasterDashboardView"), {
+  ssr: false,
+  loading: () => (
+    <div className="min-h-[420px] animate-pulse rounded-3xl border border-slate-200 bg-white/70" />
+  ),
+})
+
+const RightSideChatbot = dynamic(() => import("@/components/RightSideChatbot"), {
+  ssr: false,
+})
 
 // --- ENHANCED ANIMATION VARIANTS ---
 const fadeIn: Variants = {
@@ -220,13 +251,6 @@ export default function DashboardPage() {
   const [defaultKey, setDefaultKey] = useState<string>("")
   const [filterRefreshTick, setFilterRefreshTick] = useState(0)
 
-  const forcePageRefresh = useCallback((delayMs = 60) => {
-    if (typeof window === "undefined") return
-    window.setTimeout(() => {
-      window.location.reload()
-    }, delayMs)
-  }, [])
-
   const dateStateRef = useRef({
     fromDate: initialDashboardState.from,
     toDate: initialDashboardState.to,
@@ -356,7 +380,7 @@ export default function DashboardPage() {
   }, [fromDate, toDate])
 
   useEffect(() => {
-    if (!brand || !mode) return
+    if (view !== "dashboard" || !brand || !mode) return
     const nextKey = `${brand}|${mode}|${effectiveJobId || ""}`
     const snapshot = dateStateRef.current
     if (snapshot.defaultKey === nextKey && snapshot.defaultFromDate && snapshot.defaultToDate) return
@@ -444,7 +468,7 @@ export default function DashboardPage() {
         setDraftToDate(fallbackRange.to)
       })
     return () => { mounted = false }
-  }, [brand, mode, effectiveJobId, clampToCurrentMonth, todayIso, normalizeDateRange])
+  }, [view, brand, mode, effectiveJobId, clampToCurrentMonth, todayIso, normalizeDateRange])
 
   const handleModeChange = (nextMode: "sales" | "claims") => {
     setIsFullscreen(false)
@@ -454,7 +478,6 @@ export default function DashboardPage() {
         localStorage.setItem("dashboard_view", "dashboard")
         localStorage.setItem("dashboard_fullscreen", "0")
       }
-      forcePageRefresh()
       return
     }
 
@@ -470,10 +493,10 @@ export default function DashboardPage() {
       localStorage.setItem("dashboard_fullscreen", "0")
     }
     forceFilterRefresh()
-    forcePageRefresh()
   }
 
   const handleViewChange = (nextView: "home" | "master" | "dashboard") => {
+    if (nextView === view) return
     setView(nextView)
     if (typeof window !== "undefined") {
       localStorage.setItem("dashboard_view", nextView)
@@ -482,15 +505,14 @@ export default function DashboardPage() {
       }
     }
     setIsFullscreen(false)
-    forcePageRefresh()
   }
 
   const handleFullscreenToggle = (next: boolean) => {
+    if (next === isFullscreen) return
     setIsFullscreen(next)
     if (typeof window !== "undefined") {
       localStorage.setItem("dashboard_fullscreen", next ? "1" : "0")
     }
-    forcePageRefresh()
   }
 
   const theme = useMemo(() => ({

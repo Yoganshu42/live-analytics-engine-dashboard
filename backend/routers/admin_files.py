@@ -1,27 +1,36 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import gzip
 import json
 import logging
 import math
+import threading
 from io import BytesIO
 from datetime import date, datetime
+from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from authentication.deps import require_admin
+from db.session import SessionLocal
 from db.deps import get_db
 from models.data_rows import DataRow
 from services.ai_mapper import suggest_reverse_mapping
+from services.data_quality_service import get_primary_key_candidate_order, prepare_rows_for_storage
 from services.analytics_repository import invalidate_dataframe_cache
 from services.analytics.samsung_engine import invalidate_samsung_load_cache
 from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
 from services.manual_update_service import mark_manual_update
 from services.precompute_service import rebuild_precomputed_analytics, rebuild_precomputed_for_all_tags
 from services.precomputed_repository import clear_precomputed_for_source_dataset
+from services.partner_filter_service import (
+    dataframe_to_payload_rows,
+    normalize_partner_dataframe,
+)
 
 router = APIRouter(
     prefix="/admin/files",
@@ -38,14 +47,25 @@ def _normalize(value: str | None) -> str | None:
     return cleaned or None
 
 
-def _normalize_source_for_mapper(source: str) -> str:
-    source_key = (source or "").strip().lower()
-    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
-        return "samsung"
+def _normalize_source_key(value: str | None) -> str | None:
+    source_key = _normalize(value)
+    if source_key is None:
+        return None
+    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung vs", "samsung vijay sales", "vijay sales"}:
+        return "samsung_vs"
+    if source_key in {"samsung_croma", "samsung croma", "croma"}:
+        return "samsung_croma"
     if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         return "reliance"
-    if source_key in {"goodrej", "goddrej"}:
+    if source_key in {"godrej", "goodrej", "goddrej"}:
         return "godrej"
+    return source_key
+
+
+def _normalize_source_for_mapper(source: str) -> str:
+    source_key = _normalize_source_key(source) or ""
+    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
+        return "samsung"
     return source_key
 
 
@@ -96,34 +116,145 @@ def _replace_tag_rows(
     dataset_type: str,
     job_id: str | None,
     payloads: list[dict],
-) -> int:
-    # Hard overwrite at source+dataset level so latest upload becomes the
-    # single source of truth and no legacy job-tag rows remain.
-    delete_query = db.query(DataRow).filter(
-        DataRow.source == source,
-        DataRow.dataset_type == dataset_type,
+    mode: str = "merge",
+) -> tuple[int, int, dict[str, Any]]:
+    mode_key = str(mode or "merge").strip().lower()
+    storage_rows, quality_meta = prepare_rows_for_storage(
+        payloads,
+        source=source,
+        dataset_type=dataset_type,
     )
-    deleted = int(delete_query.delete(synchronize_session=False) or 0)
-    clear_precomputed_for_source_dataset(db, source=source, dataset_type=dataset_type)
-    if payloads:
-        db.add_all(
-            [
-                DataRow(
-                    source=source,
-                    dataset_type=dataset_type,
-                    job_id=job_id,
-                    data=payload,
-                )
-                for payload in payloads
-            ]
+
+    def _is_missing(v: Any) -> bool:
+        if v is None:
+            return True
+        text = str(v).strip().lower()
+        return text in {"", "nan", "none", "null"}
+
+    def _merge_payload(old_payload: dict[str, Any], new_payload: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(old_payload or {})
+        for key, value in (new_payload or {}).items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            if not _is_missing(value):
+                merged[key] = value
+        return merged
+
+    deleted = 0
+    inserted = 0
+    updated = 0
+
+    if mode_key == "replace":
+        delete_query = db.query(DataRow).filter(
+            DataRow.source == source,
+            DataRow.dataset_type == dataset_type,
         )
-    return deleted
+        if job_id is None:
+            delete_query = delete_query.filter(DataRow.job_id.is_(None))
+        else:
+            delete_query = delete_query.filter(DataRow.job_id == job_id)
+        deleted = int(delete_query.delete(synchronize_session=False) or 0)
+        insert_payloads: list[dict[str, Any]] = [
+            {
+                "source": source,
+                "dataset_type": dataset_type,
+                "job_id": job_id,
+                "data": item.get("data") if isinstance(item, dict) else item,
+                "record_key": (item or {}).get("record_key") if isinstance(item, dict) else None,
+                "primary_key_name": (item or {}).get("primary_key_name") if isinstance(item, dict) else None,
+            }
+            for item in storage_rows
+        ]
+        if insert_payloads:
+            db.bulk_insert_mappings(DataRow, insert_payloads)
+        inserted = int(len(insert_payloads))
+    else:
+        incoming_keys = [
+            str(item.get("record_key") or "").strip()
+            for item in storage_rows
+            if isinstance(item, dict) and str(item.get("record_key") or "").strip()
+        ]
+        unique_incoming_keys = list(dict.fromkeys(incoming_keys))
+        existing_by_key: dict[str, DataRow] = {}
+        if unique_incoming_keys:
+            chunk_size = 2000
+            for offset in range(0, len(unique_incoming_keys), chunk_size):
+                chunk = unique_incoming_keys[offset : offset + chunk_size]
+                scoped_query = db.query(DataRow).filter(
+                    DataRow.source == source,
+                    DataRow.dataset_type == dataset_type,
+                    DataRow.record_key.in_(chunk),
+                )
+                if job_id is None:
+                    scoped_query = scoped_query.filter(DataRow.job_id.is_(None))
+                else:
+                    scoped_query = scoped_query.filter(DataRow.job_id == job_id)
+                for row in scoped_query.all():
+                    key = str(row.record_key or "").strip()
+                    if key:
+                        existing_by_key[key] = row
+
+        insert_payloads: list[dict[str, Any]] = []
+        for item in storage_rows:
+            if not isinstance(item, dict):
+                continue
+            rk = str(item.get("record_key") or "").strip()
+            payload = item.get("data") if isinstance(item.get("data"), dict) else {}
+            pk_name = str(item.get("primary_key_name") or "").strip() or None
+            existing = existing_by_key.get(rk) if rk else None
+            if existing is None:
+                insert_payloads.append(
+                    {
+                        "source": source,
+                        "dataset_type": dataset_type,
+                        "job_id": job_id,
+                        "data": payload,
+                        "record_key": rk or None,
+                        "primary_key_name": pk_name,
+                    }
+                )
+                inserted += 1
+                continue
+            existing.data = _merge_payload(existing.data if isinstance(existing.data, dict) else {}, payload)
+            if pk_name:
+                existing.primary_key_name = pk_name
+            if job_id is not None:
+                existing.job_id = job_id
+            updated += 1
+        if insert_payloads:
+            db.bulk_insert_mappings(DataRow, insert_payloads)
+
+    clear_precomputed_for_source_dataset(db, source=source, dataset_type=dataset_type)
+    quality_meta["merge_mode"] = "replace" if mode_key == "replace" else "upsert"
+    quality_meta["updated_rows"] = int(updated)
+    quality_meta["inserted_rows"] = int(inserted)
+    quality_meta["deleted_rows"] = int(deleted)
+    return int(deleted), int(inserted), quality_meta
 
 
-async def _parse_upload_payloads(file: UploadFile) -> list[dict]:
+async def _parse_upload_payloads(
+    file: UploadFile,
+    *,
+    source: str | None = None,
+    dataset_type: str | None = None,
+) -> tuple[list[dict], dict[str, Any]]:
     df = await _parse_upload_dataframe(file)
-    df = df.astype(object).where(pd.notnull(df), None)
-    return [_clean_json_row(row) for row in df.to_dict(orient="records")]
+    normalize_meta: dict[str, Any] = {
+        "source": (source or "").strip().lower(),
+        "dataset_type": (dataset_type or "").strip().lower(),
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "smart_mapping": {"applied": 0, "required_found": 0, "required_total": 0, "coverage": 0.0},
+        "columns_touched": 0,
+    }
+    if source and dataset_type:
+        df, normalize_meta = normalize_partner_dataframe(
+            df,
+            source=source,
+            dataset_type=dataset_type,
+        )
+    return dataframe_to_payload_rows(df), normalize_meta
 
 
 async def _parse_upload_dataframe(file: UploadFile) -> pd.DataFrame:
@@ -145,6 +276,180 @@ async def _parse_upload_dataframe(file: UploadFile) -> pd.DataFrame:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
 
 
+def _snapshot_rows(rows: list[DataRow]) -> list[dict[str, Any]]:
+    snapshot: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.data if isinstance(row.data, dict) else {}
+        snapshot.append(
+            {
+                "job_id": row.job_id,
+                "source": row.source,
+                "dataset_type": row.dataset_type,
+                "record_key": row.record_key,
+                "primary_key_name": row.primary_key_name,
+                "data": _clean_json_row(payload),
+            }
+        )
+    return snapshot
+
+
+def _compress_snapshot(snapshot: list[dict[str, Any]]) -> bytes:
+    raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    return gzip.compress(raw, compresslevel=6)
+
+
+def _decompress_snapshot(blob: bytes) -> list[dict[str, Any]]:
+    try:
+        raw = gzip.decompress(blob or b"")
+    except Exception:
+        raw = blob or b""
+    if not raw:
+        return []
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def _save_filter_revision(
+    db: Session,
+    *,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    before_snapshot: list[dict[str, Any]],
+    after_rows: int,
+) -> int | None:
+    params = {
+        "source": source,
+        "dataset_type": dataset_type,
+        "job_key": str(job_id or ""),
+        "before_blob": _compress_snapshot(before_snapshot),
+        "before_rows": int(len(before_snapshot)),
+        "after_rows": int(after_rows),
+    }
+    try:
+        row = (
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.admin_filter_revisions
+                    (source, dataset_type, job_key, before_blob, before_rows, after_rows)
+                    VALUES (:source, :dataset_type, :job_key, :before_blob, :before_rows, :after_rows)
+                    RETURNING id
+                    """
+                ),
+                params,
+            )
+            .mappings()
+            .first()
+        )
+        if row and row.get("id") is not None:
+            return int(row["id"])
+    except Exception:
+        logger.exception(
+            "Failed to persist admin filter revision source=%s dataset=%s job=%s",
+            source,
+            dataset_type,
+            job_id,
+        )
+    return None
+
+
+def _build_filter_ai_diagnostics(
+    *,
+    suggestion: dict[str, Any],
+    normalize_meta: dict[str, Any],
+    key_meta: dict[str, Any],
+) -> dict[str, Any]:
+    mappings = suggestion.get("mappings") if isinstance(suggestion, dict) else []
+    if not isinstance(mappings, list):
+        mappings = []
+
+    right_mappings: list[dict[str, Any]] = []
+    wrong_mappings: list[dict[str, Any]] = []
+    for item in mappings:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        found = bool(item.get("found"))
+        required = bool(item.get("required"))
+        confidence = float(item.get("confidence") or 0.0)
+        column = str(item.get("suggested_column") or "").strip()
+        reason = item.get("reasoning") if isinstance(item.get("reasoning"), list) else []
+        reason_text = ", ".join([str(v) for v in reason if str(v).strip()][:2])
+
+        if found and column and confidence >= 0.55:
+            right_mappings.append(
+                {
+                    "field": field,
+                    "column": column,
+                    "confidence": round(confidence, 3),
+                }
+            )
+            continue
+
+        if required and (not found or confidence < 0.55):
+            wrong_mappings.append(
+                {
+                    "field": field,
+                    "column": column or None,
+                    "confidence": round(confidence, 3),
+                    "issue": "Required mapping is missing" if not found else "Low-confidence mapping",
+                    "reason": reason_text or "Insufficient signal in uploaded column values",
+                }
+            )
+
+    smart_meta = normalize_meta.get("smart_mapping") if isinstance(normalize_meta, dict) else {}
+    required_found = int((smart_meta or {}).get("required_found") or 0)
+    required_total = int((smart_meta or {}).get("required_total") or 0)
+    coverage = float((smart_meta or {}).get("coverage") or 0.0)
+    duplicates = int(key_meta.get("duplicate_keys_in_file") or 0)
+    missing_keys = int(key_meta.get("missing_key_values") or 0)
+    strategy = str(key_meta.get("strategy") or "composite_hash")
+    key_column = key_meta.get("key_column")
+
+    issues: list[str] = []
+    if required_total > 0 and required_found < required_total:
+        issues.append(f"AI mapping found {required_found}/{required_total} required fields.")
+    if strategy != "natural_column":
+        issues.append("No reliable Plan ID / Claim ID column detected, so composite row hash key will be used.")
+    if missing_keys > 0:
+        issues.append(f"{missing_keys} rows have blank values in the detected primary key column.")
+    if duplicates > 0:
+        issues.append(f"{duplicates} duplicate rows detected in file for the same record key.")
+
+    planned_changes: list[str] = [
+        f"Smart mapping fills canonical columns for {int((smart_meta or {}).get('applied') or 0)} fields.",
+        f"Normalization will touch {int(normalize_meta.get('columns_touched') or 0)} columns to align partner schema.",
+        f"Data quality stage keeps {int(key_meta.get('rows_out') or 0)} rows from {int(key_meta.get('rows_in') or 0)} input rows.",
+        f"Primary key strategy: {strategy} ({'column ' + str(key_column) if key_column else 'fallback composite key'}).",
+    ]
+    if duplicates > 0:
+        planned_changes.append(f"Duplicate records removed in-file: {duplicates}.")
+
+    return {
+        "mapping_quality": {
+            "required_found": required_found,
+            "required_total": required_total,
+            "coverage": round(coverage, 4),
+        },
+        "key_detection": {
+            "primary_key_name": key_meta.get("primary_key_name"),
+            "key_column": key_column,
+            "strategy": strategy,
+            "key_candidates": key_meta.get("key_candidates") or [],
+            "missing_key_values": missing_keys,
+            "duplicate_keys_in_file": duplicates,
+            "uniqueness_ratio": float(key_meta.get("uniqueness_ratio") or 0.0),
+        },
+        "right_mappings": right_mappings,
+        "wrong_mappings": wrong_mappings,
+        "issues": issues,
+        "planned_changes": planned_changes,
+    }
+
+
 def _post_file_update(
     db: Session,
     source_norm: str,
@@ -152,6 +457,15 @@ def _post_file_update(
     job_norm: str | None,
     action: str,
 ):
+    # Master dashboard payloads are cached separately from source-specific caches.
+    # Clear both active and legacy versions so top-level KPI strips always refresh.
+    for master_cache_source in ("master_dashboard_v6", "master_dashboard_v7"):
+        clear_precomputed_for_source_dataset(
+            db,
+            source=master_cache_source,
+            dataset_type="overview",
+        )
+
     invalidate_deck_cache_for_source_dataset(
         db=db,
         source=source_norm,
@@ -191,36 +505,46 @@ def _post_file_update(
                     job_id=refresh_job,
                 )
 
-    for refresh_source in refresh_sources:
-        for refresh_job in refresh_jobs:
-            try:
-                rebuild_precomputed_analytics(
-                    db=db,
-                    source=refresh_source,
-                    dataset_type=dataset_norm,
-                    job_id=refresh_job,
-                )
-            except Exception:
-                db.rollback()
-                logger.exception(
-                    "Failed to rebuild precomputed analytics after %s source=%s dataset=%s job_id=%s",
-                    action,
-                    refresh_source,
-                    dataset_norm,
-                    refresh_job,
-                )
+    def _background_rebuild() -> None:
+        worker_db = SessionLocal()
+        try:
+            for refresh_source in refresh_sources:
+                for refresh_job in refresh_jobs:
+                    try:
+                        rebuild_precomputed_analytics(
+                            db=worker_db,
+                            source=refresh_source,
+                            dataset_type=dataset_norm,
+                            job_id=refresh_job,
+                        )
+                    except Exception:
+                        worker_db.rollback()
+                        logger.exception(
+                            "Failed to rebuild precomputed analytics after %s source=%s dataset=%s job_id=%s",
+                            action,
+                            refresh_source,
+                            dataset_norm,
+                            refresh_job,
+                        )
+            # A concurrent read can repopulate samsung's shared in-memory load cache while
+            # precompute is rebuilding. Clear once more so subsequent reads are guaranteed fresh.
+            for refresh_source in refresh_sources:
+                if not refresh_source.startswith("samsung"):
+                    continue
+                for refresh_job in refresh_jobs:
+                    invalidate_samsung_load_cache(
+                        source=refresh_source,
+                        dataset_type=dataset_norm,
+                        job_id=refresh_job,
+                    )
+        finally:
+            worker_db.close()
 
-    # A concurrent read can repopulate samsung's shared in-memory load cache while
-    # precompute is rebuilding. Clear once more so subsequent reads are guaranteed fresh.
-    for refresh_source in refresh_sources:
-        if not refresh_source.startswith("samsung"):
-            continue
-        for refresh_job in refresh_jobs:
-            invalidate_samsung_load_cache(
-                source=refresh_source,
-                dataset_type=dataset_norm,
-                job_id=refresh_job,
-            )
+    threading.Thread(
+        target=_background_rebuild,
+        name=f"admin-files-precompute-{source_norm}-{dataset_norm}",
+        daemon=True,
+    ).start()
 
 
 def _normalize_col_key(value: str) -> str:
@@ -296,7 +620,7 @@ def list_file_groups(
     job_id: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
 
@@ -345,7 +669,7 @@ def download_file_group(
     format: str = Query("csv"),
     db: Session = Depends(get_db),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
     fmt = (format or "csv").strip().lower()
@@ -389,7 +713,7 @@ def delete_file_group(
     job_id: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
     if source_norm is None or dataset_norm is None:
@@ -416,32 +740,39 @@ async def replace_file_group(
     job_id: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
     if source_norm is None or dataset_norm is None:
         raise HTTPException(status_code=400, detail="source and dataset_type are required")
-    payloads = await _parse_upload_payloads(file)
+    payloads, normalize_meta = await _parse_upload_payloads(
+        file,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
     _validate_payload_schema(
         source_norm=source_norm,
         dataset_norm=dataset_norm,
         payloads=payloads,
     )
-    deleted = _replace_tag_rows(
+    deleted, inserted, quality_meta = _replace_tag_rows(
         db,
         source=source_norm,
         dataset_type=dataset_norm,
         job_id=job_norm,
         payloads=payloads,
+        mode="replace",
     )
     db.commit()
     _post_file_update(db, source_norm, dataset_norm, job_norm, action="replace")
     return {
         "deleted_rows": deleted,
-        "rows_inserted": len(payloads),
+        "rows_inserted": inserted,
         "source": source_norm,
         "dataset_type": dataset_norm,
         "job_id": job_norm,
+        "normalization": normalize_meta,
+        "data_quality": quality_meta,
     }
 
 
@@ -453,33 +784,40 @@ async def update_file_group(
     job_id: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
     if source_norm is None or dataset_norm is None:
         raise HTTPException(status_code=400, detail="source and dataset_type are required")
 
-    payloads = await _parse_upload_payloads(file)
+    payloads, normalize_meta = await _parse_upload_payloads(
+        file,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
     _validate_payload_schema(
         source_norm=source_norm,
         dataset_norm=dataset_norm,
         payloads=payloads,
     )
-    deleted = _replace_tag_rows(
+    deleted, inserted, quality_meta = _replace_tag_rows(
         db,
         source=source_norm,
         dataset_type=dataset_norm,
         job_id=job_norm,
         payloads=payloads,
+        mode="merge",
     )
     db.commit()
     _post_file_update(db, source_norm, dataset_norm, job_norm, action="update")
     return {
         "deleted_rows": deleted,
-        "rows_inserted": len(payloads),
+        "rows_inserted": inserted,
         "source": source_norm,
         "dataset_type": dataset_norm,
         "job_id": job_norm,
+        "normalization": normalize_meta,
+        "data_quality": quality_meta,
     }
 
 
@@ -489,7 +827,7 @@ async def reverse_map_file(
     source: str = Form(...),
     dataset_type: str = Form(...),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     if source_norm is None or dataset_norm is None:
         raise HTTPException(status_code=400, detail="source and dataset_type are required")
@@ -510,6 +848,353 @@ async def reverse_map_file(
     return suggestion
 
 
+@router.post("/filter-analyze")
+async def analyze_filter_file(
+    file: UploadFile = File(...),
+    source: str = Form(...),
+    dataset_type: str = Form(...),
+):
+    source_norm = _normalize_source_key(source)
+    dataset_norm = _normalize(dataset_type)
+    if source_norm is None or dataset_norm is None:
+        raise HTTPException(status_code=400, detail="source and dataset_type are required")
+    if dataset_norm not in {"sales", "claims"}:
+        raise HTTPException(status_code=400, detail="dataset_type must be sales or claims")
+
+    raw_df = await _parse_upload_dataframe(file)
+    if raw_df.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file has no rows to analyze")
+
+    mapped_source = _normalize_source_for_mapper(source_norm)
+    suggestion = suggest_reverse_mapping(
+        raw_df,
+        source=mapped_source,
+        dataset_type=dataset_norm,
+    )
+    normalized_df, normalize_meta = normalize_partner_dataframe(
+        raw_df,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
+    payloads = dataframe_to_payload_rows(normalized_df)
+    _, key_meta = prepare_rows_for_storage(payloads, source=source_norm, dataset_type=dataset_norm)
+    diagnostics = _build_filter_ai_diagnostics(
+        suggestion=suggestion,
+        normalize_meta=normalize_meta,
+        key_meta=key_meta,
+    )
+
+    return {
+        "file_name": file.filename or "",
+        "source": source_norm,
+        "dataset_type": dataset_norm,
+        "rows_in": int(len(raw_df)),
+        "rows_after_filter": int(key_meta.get("rows_out") or 0),
+        "ai_mapping": {
+            "message": suggestion.get("message"),
+            "can_reverse_map": bool(suggestion.get("can_reverse_map")),
+        },
+        **diagnostics,
+        "primary_key_candidates": get_primary_key_candidate_order(
+            source=source_norm,
+            dataset_type=dataset_norm,
+        ),
+        "can_apply": not diagnostics.get("wrong_mappings"),
+    }
+
+
+@router.post("/filter-revert")
+def revert_filter_apply(
+    source: str = Form(...),
+    dataset_type: str = Form(...),
+    job_id: str | None = Form(None),
+    revision_id: int | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    source_norm = _normalize_source_key(source)
+    dataset_norm = _normalize(dataset_type)
+    job_norm = _normalize(job_id)
+    if source_norm is None or dataset_norm is None:
+        raise HTTPException(status_code=400, detail="source and dataset_type are required")
+    if dataset_norm not in {"sales", "claims"}:
+        raise HTTPException(status_code=400, detail="dataset_type must be sales or claims")
+
+    if revision_id is not None:
+        revision = (
+            db.execute(
+                text(
+                    """
+                    SELECT id, source, dataset_type, job_key, before_blob, before_rows, after_rows, reverted_at
+                    FROM public.admin_filter_revisions
+                    WHERE id = :revision_id
+                    """
+                ),
+                {"revision_id": int(revision_id)},
+            )
+            .mappings()
+            .first()
+        )
+    else:
+        revision = (
+            db.execute(
+                text(
+                    """
+                    SELECT id, source, dataset_type, job_key, before_blob, before_rows, after_rows, reverted_at
+                    FROM public.admin_filter_revisions
+                    WHERE source = :source
+                      AND dataset_type = :dataset_type
+                      AND job_key = :job_key
+                      AND reverted_at IS NULL
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "source": source_norm,
+                    "dataset_type": dataset_norm,
+                    "job_key": str(job_norm or ""),
+                },
+            )
+            .mappings()
+            .first()
+        )
+
+    if not revision:
+        raise HTTPException(status_code=404, detail="No saved filter revision found to revert")
+
+    revision_source = str(revision.get("source") or source_norm).strip().lower()
+    revision_dataset = str(revision.get("dataset_type") or dataset_norm).strip().lower()
+    revision_job = str(revision.get("job_key") or "").strip() or None
+
+    before_blob = revision.get("before_blob")
+    snapshot = _decompress_snapshot(before_blob if isinstance(before_blob, (bytes, bytearray)) else b"")
+    payloads = [item.get("data") for item in snapshot if isinstance(item.get("data"), dict)]
+
+    deleted, inserted, quality_meta = _replace_tag_rows(
+        db,
+        source=revision_source,
+        dataset_type=revision_dataset,
+        job_id=revision_job,
+        payloads=payloads,
+        mode="replace",
+    )
+    db.execute(
+        text(
+            """
+            UPDATE public.admin_filter_revisions
+            SET reverted_at = NOW()
+            WHERE id = :revision_id
+            """
+        ),
+        {"revision_id": int(revision["id"])},
+    )
+    db.commit()
+    _post_file_update(db, revision_source, revision_dataset, revision_job, action="filter-revert")
+
+    return {
+        "reverted": True,
+        "revision_id": int(revision["id"]),
+        "source": revision_source,
+        "dataset_type": revision_dataset,
+        "job_id": revision_job,
+        "deleted_rows": deleted,
+        "rows_inserted": inserted,
+        "data_quality": quality_meta,
+    }
+
+
+@router.post("/filter-apply")
+async def filter_and_apply_file(
+    file: UploadFile = File(...),
+    source: str = Form(...),
+    dataset_type: str = Form(...),
+    job_id: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    source_norm = _normalize_source_key(source)
+    dataset_norm = _normalize(dataset_type)
+    job_norm = _normalize(job_id)
+    if source_norm is None or dataset_norm is None:
+        raise HTTPException(status_code=400, detail="source and dataset_type are required")
+    if dataset_norm not in {"sales", "claims"}:
+        raise HTTPException(status_code=400, detail="dataset_type must be sales or claims")
+
+    df = await _parse_upload_dataframe(file)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file has no rows to filter")
+
+    normalized_df, normalize_meta = normalize_partner_dataframe(
+        df,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
+    payloads = dataframe_to_payload_rows(normalized_df)
+    storage_rows, key_meta = prepare_rows_for_storage(payloads, source=source_norm, dataset_type=dataset_norm)
+    filtered_payloads = [item.get("data") for item in storage_rows if isinstance(item.get("data"), dict)]
+    if not filtered_payloads:
+        raise HTTPException(status_code=400, detail="No rows found after applying filters")
+
+    _validate_payload_schema(
+        source_norm=source_norm,
+        dataset_norm=dataset_norm,
+        payloads=filtered_payloads,
+    )
+    before_rows = (
+        _apply_tag_filter(
+            db.query(DataRow),
+            source_norm,
+            dataset_norm,
+            job_norm,
+        ).all()
+    )
+    before_snapshot = _snapshot_rows(before_rows)
+    replaced_rows, inserted_rows, quality_meta = _replace_tag_rows(
+        db,
+        source=source_norm,
+        dataset_type=dataset_norm,
+        job_id=job_norm,
+        payloads=filtered_payloads,
+        mode="merge",
+    )
+    revision_id = _save_filter_revision(
+        db,
+        source=source_norm,
+        dataset_type=dataset_norm,
+        job_id=job_norm,
+        before_snapshot=before_snapshot,
+        after_rows=inserted_rows,
+    )
+    db.commit()
+    _post_file_update(db, source_norm, dataset_norm, job_norm, action="filter-apply")
+
+    return {
+        "applied": True,
+        "source": source_norm,
+        "dataset_type": dataset_norm,
+        "job_id": job_norm,
+        "deleted_rows": int(replaced_rows),
+        "rows_inserted": int(inserted_rows),
+        "revision_id": int(revision_id) if revision_id is not None else None,
+        "normalization": normalize_meta,
+        "data_quality": quality_meta,
+        "key_detection": key_meta,
+        "summary": (
+            f"Applied filtered dataset to DB for {source_norm}:{dataset_norm}. "
+            f"Rows inserted {int(inserted_rows)} after dedupe."
+        ),
+    }
+
+
+@router.post("/filter-download")
+async def filter_and_download_file(
+    file: UploadFile = File(...),
+    source: str = Form(...),
+    dataset_type: str = Form(...),
+    output_format: str = Form("csv"),
+    apply_to_db: bool = Form(False),
+    job_id: str | None = Form(None),
+    db: Session = Depends(get_db),
+):
+    source_norm = _normalize_source_key(source)
+    dataset_norm = _normalize(dataset_type)
+    job_norm = _normalize(job_id)
+    fmt = (output_format or "csv").strip().lower()
+
+    if source_norm is None or dataset_norm is None:
+        raise HTTPException(status_code=400, detail="source and dataset_type are required")
+    if dataset_norm not in {"sales", "claims"}:
+        raise HTTPException(status_code=400, detail="dataset_type must be sales or claims")
+    if fmt not in {"csv", "xlsx"}:
+        raise HTTPException(status_code=400, detail="output_format must be csv or xlsx")
+
+    df = await _parse_upload_dataframe(file)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file has no rows to filter")
+
+    normalized_df, normalize_meta = normalize_partner_dataframe(
+        df,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
+    payloads = dataframe_to_payload_rows(normalized_df)
+    storage_rows, key_meta = prepare_rows_for_storage(payloads, source=source_norm, dataset_type=dataset_norm)
+    filtered_payloads = [item.get("data") for item in storage_rows if isinstance(item.get("data"), dict)]
+    if not filtered_payloads:
+        raise HTTPException(status_code=400, detail="No rows found after applying filters")
+
+    replaced_rows = 0
+    inserted_rows = int(len(filtered_payloads))
+    revision_id: int | None = None
+    if apply_to_db:
+        _validate_payload_schema(
+            source_norm=source_norm,
+            dataset_norm=dataset_norm,
+            payloads=filtered_payloads,
+        )
+        before_rows = (
+            _apply_tag_filter(
+                db.query(DataRow),
+                source_norm,
+                dataset_norm,
+                job_norm,
+            ).all()
+        )
+        before_snapshot = _snapshot_rows(before_rows)
+        replaced_rows, inserted_rows, _ = _replace_tag_rows(
+            db,
+            source=source_norm,
+            dataset_type=dataset_norm,
+            job_id=job_norm,
+            payloads=filtered_payloads,
+            mode="merge",
+        )
+        revision_id = _save_filter_revision(
+            db,
+            source=source_norm,
+            dataset_type=dataset_norm,
+            job_id=job_norm,
+            before_snapshot=before_snapshot,
+            after_rows=inserted_rows,
+        )
+        db.commit()
+        _post_file_update(db, source_norm, dataset_norm, job_norm, action="filter-download")
+
+    if fmt == "xlsx":
+        out_buffer = BytesIO()
+        pd.DataFrame(filtered_payloads).to_excel(out_buffer, index=False, sheet_name="filtered")
+        content = out_buffer.getvalue()
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        content = pd.DataFrame(filtered_payloads).to_csv(index=False).encode("utf-8")
+        media_type = "text/csv"
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"filtered_{source_norm}_{dataset_norm}_{stamp}.{fmt}"
+    summary = (
+        f"Filtered {len(filtered_payloads)} rows for {source_norm}:{dataset_norm}. "
+        f"Smart mapping applied {int((normalize_meta.get('smart_mapping') or {}).get('applied', 0))} fields. "
+        f"Columns touched {int(normalize_meta.get('columns_touched') or 0)}. "
+        f"Primary key strategy {key_meta.get('strategy')}, key field {key_meta.get('key_column') or key_meta.get('primary_key_name')}."
+    )
+    if apply_to_db:
+        summary += f" Merged into database: {int(inserted_rows)} new rows added, {int(replaced_rows)} rows deleted."
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Filter-Summary": summary,
+        "X-Filter-Apply-Db": str(bool(apply_to_db)).lower(),
+        "X-Filter-Rows": str(len(filtered_payloads)),
+    }
+    if revision_id is not None:
+        headers["X-Filter-Revision-Id"] = str(int(revision_id))
+
+    return StreamingResponse(
+        iter([content]),
+        media_type=media_type,
+        headers=headers,
+    )
+
+
 @router.post("/recompute")
 def recompute_precomputed_data(
     source: str | None = Query(None),
@@ -517,7 +1202,7 @@ def recompute_precomputed_data(
     job_id: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    source_norm = _normalize(source)
+    source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
     try:
@@ -537,3 +1222,7 @@ def recompute_precomputed_data(
         )
         raise HTTPException(status_code=500, detail="Failed to rebuild precomputed analytics")
     return result
+
+
+
+

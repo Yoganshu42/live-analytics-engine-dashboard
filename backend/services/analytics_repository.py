@@ -26,8 +26,9 @@ def _source_variants(source: str | None) -> list[str]:
     if source_key in {"godrej", "goodrej", "goddrej"}:
         # Legacy uploads contain mixed spellings for Godrej.
         return ["godrej", "goodrej", "goddrej"]
-    if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
-        return ["reliance"]
+    if source_key in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+        # Keep legacy Reliance ResQ aliases readable without forcing a migration first.
+        return ["reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"]
     if source_key in {"samsung_vs", "samsung_vijay_sales"}:
         # Keep both aliases readable without requiring a data migration first.
         return ["samsung_vs", "samsung_vijay_sales"]
@@ -49,6 +50,10 @@ def invalidate_dataframe_cache(
             src = (source or "").strip().lower()
             if src in {"samsung_vs", "samsung_vijay_sales"}:
                 src_values = {"samsung_vs", "samsung_vijay_sales"}
+            elif src in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+                src_values = {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}
+            elif src in {"godrej", "goodrej", "goddrej"}:
+                src_values = {"godrej", "goodrej", "goddrej"}
             else:
                 src_values = {src}
         ds = (dataset_type or "").strip().lower() if dataset_type is not None else None

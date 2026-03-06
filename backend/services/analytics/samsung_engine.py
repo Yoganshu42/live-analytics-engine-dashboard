@@ -213,6 +213,20 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         df[target] = combined
         return df
 
+    def _claims_amount_series(self, df: pd.DataFrame) -> pd.Series:
+        col = self._find_column_by_alias(
+            df,
+            "Net Amount",
+            "Net_Amount",
+            "Claim_Amount",
+            "Claim Amount",
+            "Claims Cost",
+            "Claim Cost",
+        )
+        if col is None:
+            return pd.Series(0.0, index=df.index, dtype="float64")
+        return self._numeric_series(df[col])
+
     def _clean_text_series(self, series: pd.Series) -> pd.Series:
         cleaned = series.astype(str).str.strip()
         return cleaned.replace(
@@ -293,6 +307,10 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             return df
 
         src = (self.source or "").strip().lower()
+        # Partner-specific queries already scope rows at source level; do not
+        # rely on marketplace text because vendor files are often inconsistent.
+        if src in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
+            return df
         is_vs = ("vijay" in src) or src in {"samsung_vs", "samsung_vijay_sales"}
         is_croma = "croma" in src
         if not is_vs and not is_croma:
@@ -321,6 +339,48 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         filtered = df[mask]
         # If mapping mismatches for some partner files, avoid dropping to empty.
         return filtered if not filtered.empty else df
+
+    def _trim_sparse_croma_claims_tail_month(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop a one-row terminal month artifact in Samsung Croma claims.
+
+        Some Croma claim uploads contain a single trailing month row that skews
+        month-on-month charts (sharp artificial drop). Keep the dataset intact
+        unless the latest month is clearly a sparse outlier.
+        """
+        if df.empty or "Month" not in df.columns:
+            return df
+        src = (self.source or "").strip().lower()
+        if src != "samsung_croma":
+            return df
+
+        month_key = pd.to_datetime(df["Month"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        valid_months = month_key.dropna()
+        if valid_months.empty:
+            return df
+
+        counts = valid_months.value_counts().sort_index()
+        if len(counts) < 4:
+            return df
+
+        last_month = counts.index.max()
+        previous = counts[counts.index < last_month]
+        if previous.empty:
+            return df
+
+        prev_median = float(previous.median())
+        last_count = float(counts.loc[last_month])
+        # Trim only when latest bucket is a single-row outlier vs historical months.
+        if prev_median >= 3.0 and last_count <= 1.0 and last_count <= max(1.0, prev_median * 0.08):
+            keep_mask = month_key.ne(last_month) | month_key.isna()
+            trimmed = df.loc[keep_mask].copy()
+            logger.info(
+                "Trimmed sparse croma tail month source=%s last_month=%s removed_rows=%s",
+                self.source,
+                str(last_month),
+                int((~keep_mask).sum()),
+            )
+            return trimmed
+        return df
 
     # --------------------------------------------------
     # LOAD DATA
@@ -383,16 +443,13 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                         return []
                     if source_key == "samsung":
                         return list(SAMSUNG_SOURCE_VARIANTS)
-                    if self.dataset_type == "claims" and source_key.startswith("samsung"):
-                        # Claims loss_ratio uses sales as denominator across samsung partners.
-                        return list(SAMSUNG_SOURCE_VARIANTS)
                     return [self.source] if self.source else []
 
                 if dataset_type == "claims":
                     if not include_claims:
                         return []
-                    if source_key.startswith("samsung"):
-                        # Claims source is partner-dependent in payloads; pull samsung-wide claims.
+                    if source_key == "samsung":
+                        # Overview mode merges both samsung partners.
                         return list(SAMSUNG_SOURCE_VARIANTS)
                     return [self.source] if self.source else []
 
@@ -585,6 +642,10 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                     claims_df["Device Plan Category"],
                     model_ref,
                 )
+                # Keep alias columns synchronized so downstream dimension matching
+                # does not accidentally pick stale blank alias fields.
+                claims_df["Plan_Category"] = claims_df["Plan Category"]
+                claims_df["Device_Plan_Category"] = claims_df["Device Plan Category"]
 
                 # Legacy fallback: if no device segment column exists in the upload,
                 # keep dashboard populated using plan categories.
@@ -603,18 +664,60 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                         .str.strip()
                     )
 
-                # Samsung claims uploads can carry a shifted "Month-Year" while
-                # "Fiscal Month" remains correct (e.g. 2026-07 vs 202507).
-                # Prefer Fiscal Month as canonical month whenever it is present.
+                # Build canonical claims month with Fiscal Month as the primary source.
+                # Claims uploads are monthly and fiscal buckets are typically the stable
+                # timeline anchor; claim/call dates remain fallback.
+                month_from_claim = pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
+                for claim_col in ["Claim Date", "Day of Call_Date", "Call_Date", "Call Date", "Date"]:
+                    if claim_col not in claims_df.columns:
+                        continue
+                    try:
+                        parsed_claim = pd.to_datetime(claims_df[claim_col], format="mixed", errors="coerce")
+                    except TypeError:
+                        parsed_claim = pd.to_datetime(claims_df[claim_col], errors="coerce")
+                    if parsed_claim.notna().any():
+                        month_from_claim = month_from_claim.where(month_from_claim.notna(), parsed_claim)
+                month_from_claim = month_from_claim.dt.to_period("M").dt.to_timestamp()
+
+                fiscal_month = pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
                 if "Fiscal Month" in claims_df.columns:
-                    fiscal_month = self._parse_month_series(claims_df["Fiscal Month"])
-                    if fiscal_month is not None and fiscal_month.notna().any():
-                        claims_df["Month"] = fiscal_month
+                    parsed_fiscal = self._parse_month_series(claims_df["Fiscal Month"])
+                    if parsed_fiscal is not None and parsed_fiscal.notna().any():
+                        fiscal_month = parsed_fiscal.dt.to_period("M").dt.to_timestamp()
+
+                existing_month = pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
+                if "Month" in claims_df.columns:
+                    parsed_existing_month = self._parse_month_series(claims_df["Month"])
+                    if parsed_existing_month is not None and parsed_existing_month.notna().any():
+                        existing_month = parsed_existing_month.dt.to_period("M").dt.to_timestamp()
+
+                canonical_month = fiscal_month.where(fiscal_month.notna(), existing_month)
+                # Guard against ambiguous source date strings being interpreted in
+                # current year (e.g. "25-Aug" -> 2026-08-25). If Fiscal Month
+                # exists and month matches but year differs, trust Fiscal Month.
+                if canonical_month.notna().any() and fiscal_month.notna().any():
+                    same_month = (
+                        canonical_month.dt.month.eq(fiscal_month.dt.month)
+                        & canonical_month.notna()
+                        & fiscal_month.notna()
+                    )
+                    year_mismatch = canonical_month.dt.year.ne(fiscal_month.dt.year)
+                    mismatch_mask = same_month & year_mismatch
+                    if mismatch_mask.any():
+                        canonical_month = canonical_month.where(~mismatch_mask, fiscal_month)
+                canonical_month = canonical_month.where(canonical_month.notna(), month_from_claim)
+                if canonical_month.notna().any():
+                    claims_df["Month"] = canonical_month
+                    claims_df = self._trim_sparse_croma_claims_tail_month(claims_df)
 
                 # Apply date filter to claims using a coalesced date series.
                 # Some files provide partial values across multiple date columns
                 # (e.g. Call_Date for some rows, Month/Fiscal Month for others).
-                date_series = pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
+                date_series = (
+                    canonical_month.copy()
+                    if canonical_month.notna().any()
+                    else pd.Series(pd.NaT, index=claims_df.index, dtype="datetime64[ns]")
+                )
 
                 def _parse_claim_date_column(column: str) -> pd.Series:
                     raw = claims_df[column]
@@ -629,15 +732,16 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                         return pd.to_datetime(raw, errors="coerce")
 
                 for col in [
+                    "Claim Date",
                     "Day of Call_Date",
                     "Call_Date",
                     "Call Date",
-                    "Fiscal Month",
+                    "Date",
                     "Month",
                     "Month-Year",
+                    "Fiscal Month",
                     "Payment_date",
                     "Payment Date",
-                    "Date",
                 ]:
                     if col not in claims_df.columns:
                         continue
@@ -789,13 +893,22 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         else:
             preferred_cols = ["Date", "Start_Date", "Month", "End_Date"]
 
+        coalesced = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
         for col in preferred_cols:
             if col not in df.columns:
                 continue
             series = _parse(df[col])
-            if not series.isna().all():
-                return series
-        return None
+            if series.isna().all():
+                continue
+            # Coalesce date candidates row-wise so sparse Date columns do not
+            # drop valid rows (notably EW rows with only Start_Date populated).
+            coalesced = coalesced.where(coalesced.notna(), series)
+            if coalesced.notna().all():
+                break
+
+        if coalesced.isna().all():
+            return None
+        return coalesced
 
     def _apply_sales_date_filter(
         self,
@@ -934,13 +1047,9 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             df = self._filter_claims_partner_rows(df)
 
             if metric == "claims":
-                if "Net Amount" not in df.columns:
-                    return []
-                df["_value"] = pd.to_numeric(df["Net Amount"], errors="coerce").fillna(0)
+                df["_value"] = self._claims_amount_series(df)
             elif metric == "net_claims":
-                if "Net Amount" not in df.columns:
-                    return []
-                net_amt = pd.to_numeric(df["Net Amount"], errors="coerce").fillna(0)
+                net_amt = self._claims_amount_series(df)
                 if "OTD Amount" in df.columns:
                     otd = pd.to_numeric(df["OTD Amount"], errors="coerce").fillna(0)
                 else:
@@ -953,7 +1062,9 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             else:
                 return []
         else:
-            premium_metric = metric in {"gross_premium", "earned_premium", "zopper_earned_premium"}
+            # Gross premium should follow transaction/start-date scope.
+            # Adjusted dates are only for earned-style metrics.
+            premium_metric = metric in {"earned_premium", "zopper_earned_premium"}
             df = self._apply_sales_date_filter(df, use_adjusted=premium_metric)
             amount_col = self._find_column_by_alias(
                 df,
@@ -1048,42 +1159,46 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         dim_key = dimension.lower()
         candidates = DIMENSION_MAP.get(dim_key, [dimension])
 
+        def _non_empty_count(series: pd.Series) -> int:
+            return int(self._clean_text_series(series).notna().sum())
+
         def _find_dim_column(frame: pd.DataFrame, cand: list[str]) -> str | None:
+            available: list[str] = []
             for c in cand:
                 if c in frame.columns:
-                    return c
-            # try normalized match
-            target = _norm(cand[0])
-            return next((c for c in frame.columns if _norm(c) == target), None)
+                    available.append(c)
+            if not available:
+                # try normalized matches for each candidate
+                for c in cand:
+                    target = _norm(c)
+                    matched = next((col for col in frame.columns if _norm(col) == target), None)
+                    if matched is not None and matched not in available:
+                        available.append(matched)
+            if not available:
+                return None
+            # Prefer the most populated candidate (fixes blank alias column picks).
+            best = max(available, key=lambda col: _non_empty_count(frame[col]))
+            return best
 
-        dim = None
-        for c in candidates:
-            if c in df.columns:
-                dim = c
-                break
-
+        dim = _find_dim_column(df, candidates)
         if dim is None:
             # try normalized match
-            matched = _find_dim_column(df, candidates)
-            if matched is None:
-                # Claims files often carry only Device Plan Category; for plan_category
-                # views use it as the nearest categorical fallback.
-                if self.dataset_type == "claims" and dim_key == "plan_category":
-                    device_candidates = DIMENSION_MAP.get("device_plan_category", ["Device Plan Category"])
-                    matched_device = _find_dim_column(df, device_candidates)
-                    if matched_device is not None:
-                        dim = matched_device
-                    else:
-                        return []
-                # special: derive Month from Start_Date if missing
-                elif dim_key == "month" and "Start_Date" in df.columns:
-                    df = df.copy()
-                    df["Month"] = pd.to_datetime(df["Start_Date"], errors="coerce")
-                    dim = "Month"
-                elif dim is None:
+            # Claims files often carry only Device Plan Category; for plan_category
+            # views use it as the nearest categorical fallback.
+            if self.dataset_type == "claims" and dim_key == "plan_category":
+                device_candidates = DIMENSION_MAP.get("device_plan_category", ["Device Plan Category"])
+                matched_device = _find_dim_column(df, device_candidates)
+                if matched_device is not None:
+                    dim = matched_device
+                else:
                     return []
-            else:
-                dim = matched
+            # special: derive Month from Start_Date if missing
+            elif dim_key == "month" and "Start_Date" in df.columns:
+                df = df.copy()
+                df["Month"] = pd.to_datetime(df["Start_Date"], errors="coerce")
+                dim = "Month"
+            elif dim is None:
+                return []
 
         # For plan_category loss ratio, prefer true plan category labels.
         # Fall back to device category only when plan category isn't available.
@@ -1112,6 +1227,11 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             if self.dataset_type == "claims":
                 start_series = None
                 month_source = df[dim]
+                if "Fiscal Month" in df.columns:
+                    fiscal_month_source = self._parse_month_series(df["Fiscal Month"])
+                    if fiscal_month_source is not None and fiscal_month_source.notna().any():
+                        # Keep Fiscal Month as primary, but do not drop rows where it is blank.
+                        month_source = fiscal_month_source.where(fiscal_month_source.notna(), month_source)
             else:
                 start_series = None
                 if "Date" in df.columns:
@@ -1529,11 +1649,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 }
 
             df = self._filter_claims_partner_rows(df)
-
-            if "Net Amount" in df.columns:
-                claims = pd.to_numeric(df["Net Amount"], errors="coerce").fillna(0).sum()
-            else:
-                claims = 0
+            claims = float(self._claims_amount_series(df).sum())
             if "OTD Amount" in df.columns:
                 otd = pd.to_numeric(df["OTD Amount"], errors="coerce").fillna(0).sum()
             else:
@@ -1564,7 +1680,9 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
         # Units sold should always reflect total rows (EW included), not date-filtered
         df_qty = df
-        df_prem = self._apply_sales_date_filter(df, use_adjusted=True)
+        # Keep gross premium in transaction/start-date scope (not adjusted EW dates)
+        # so category/month splits stay aligned with quantity and ASP denominators.
+        df_prem = self._apply_sales_date_filter(df, use_adjusted=False)
         df_earned_scope = self._apply_sales_overlap_filter(df, use_adjusted=True)
 
         def _sum_col(frame: pd.DataFrame, *candidates: str) -> float:

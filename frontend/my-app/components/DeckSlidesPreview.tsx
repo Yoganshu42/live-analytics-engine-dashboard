@@ -29,8 +29,9 @@ const currencyCompact = new Intl.NumberFormat("en-IN", {
   notation: "compact",
   maximumFractionDigits: 1,
 })
-const PREVIEW_CACHE_TTL_MS = 120000
+const PREVIEW_CACHE_TTL_MS = 180000
 const previewCache = new Map<string, { expiresAt: number; items: DeckPreviewPartnerItem[] }>()
+const previewInFlight = new Map<string, Promise<DeckPreviewPartnerItem[]>>()
 
 function formatCurrency(value: number) {
   return `Rs ${currencyCompact.format(Number.isFinite(value) ? value : 0)}`
@@ -95,17 +96,29 @@ export default function DeckSlidesPreview({
       setIsLoading(true)
       setError("")
 
-      fetchDeckPreview({
-        partners: partnerQuery,
-        dataset_type: datasetType,
-        job_id: jobId || undefined,
-        from_date: fromDate || undefined,
-        to_date: toDate || undefined,
-        week_window: weekWindow,
-      })
-        .then((response) => {
+      const existing = previewInFlight.get(requestKey)
+      const pending =
+        existing ||
+        fetchDeckPreview({
+          partners: partnerQuery,
+          dataset_type: datasetType,
+          job_id: jobId || undefined,
+          from_date: fromDate || undefined,
+          to_date: toDate || undefined,
+          week_window: weekWindow,
+        })
+          .then((response) => (Array.isArray(response?.items) ? response.items : []))
+          .finally(() => {
+            previewInFlight.delete(requestKey)
+          })
+
+      if (!existing) {
+        previewInFlight.set(requestKey, pending)
+      }
+
+      pending
+        .then((nextItems) => {
           if (cancelled) return
-          const nextItems = Array.isArray(response?.items) ? response.items : []
           setResult({ key: requestKey, items: nextItems })
           previewCache.set(requestKey, {
             expiresAt: Date.now() + PREVIEW_CACHE_TTL_MS,
@@ -115,13 +128,15 @@ export default function DeckSlidesPreview({
         .catch((err: unknown) => {
           if (cancelled) return
           setError(err instanceof Error ? err.message : "Failed to load deck preview.")
-          setResult({ key: requestKey, items: [] })
+          if (!cachedItems.length) {
+            setResult({ key: requestKey, items: [] })
+          }
         })
         .finally(() => {
           if (cancelled) return
           setIsLoading(false)
         })
-    }, 260)
+    }, 80)
 
     return () => {
       cancelled = true

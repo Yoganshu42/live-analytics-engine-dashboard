@@ -1,9 +1,9 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Image from "next/image"
 import { useRouter } from "next/navigation"
-import { Download, ExternalLink, FileChartColumnIncreasing, Loader2, Maximize2, X } from "lucide-react"
+import { Download, ExternalLink, Loader2, Maximize2, X } from "lucide-react"
 
 import { downloadDeckPptx, fetchDateBounds } from "@/app/lib/api"
 import { buildGoogleSlidesEditUrl, getGoogleDriveAccessToken, uploadPptxAsGoogleSlides } from "@/app/lib/googleSlides"
@@ -32,11 +32,9 @@ const PARTNERS: PartnerOption[] = [
   { key: "godrej", label: "Godrej", logo: "/Group 1244833444.png", cardLabel: "Godrej" },
 ]
 
-const cardButtonClass =
-  "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] font-medium transition-colors sm:text-sm text-slate-700 hover:bg-slate-100"
-
 export default function DeckStudioAccess({ collapsed = false }: Props) {
   const router = useRouter()
+  const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
   const [open, setOpen] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
   const [isOpeningSlides, setIsOpeningSlides] = useState(false)
@@ -55,6 +53,7 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
   const [includeTables, setIncludeTables] = useState(true)
   const [weekWindow, setWeekWindow] = useState<WeekWindow>(4)
   const [selectedPartners, setSelectedPartners] = useState<string[]>(PARTNERS.map((partner) => partner.key))
+  const [boundsRefreshTick, setBoundsRefreshTick] = useState(0)
   const lastAutoBoundsKeyRef = useRef("")
   const focusedPartner = selectedPartners.length === 1 ? selectedPartners[0] : null
 
@@ -63,38 +62,123 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
     [selectedPartners, isDownloading, isOpeningSlides]
   )
 
-  const applyDateRange = (nextFrom: string, nextTo: string) => {
-    const normalizedFrom = nextFrom || ""
-    const normalizedTo = nextTo || ""
+  const toIsoDate = useCallback((value: string) => {
+    const raw = (value || "").trim()
+    if (!raw) return ""
+    const directIso = raw.match(/^(\d{4}-\d{2}-\d{2})/)
+    if (directIso?.[1]) return directIso[1]
+    const parsed = new Date(raw)
+    if (Number.isNaN(parsed.getTime())) return ""
+    return parsed.toISOString().slice(0, 10)
+  }, [])
+
+  const clampToToday = useCallback((value: string) => {
+    const iso = toIsoDate(value)
+    if (!iso) return ""
+    return iso > todayIso ? todayIso : iso
+  }, [toIsoDate, todayIso])
+
+  const applyDateRange = useCallback((nextFrom: string, nextTo: string, options?: { syncStorage?: boolean }) => {
+    const normalizedFrom = clampToToday(nextFrom || "")
+    const normalizedTo = clampToToday(nextTo || "")
+    const syncStorage = options?.syncStorage !== false
     if (normalizedFrom && normalizedTo && normalizedFrom > normalizedTo) {
       setFromDate(normalizedTo)
       setToDate(normalizedFrom)
       setDraftFromDate(normalizedTo)
       setDraftToDate(normalizedFrom)
+      if (syncStorage && typeof window !== "undefined") {
+        localStorage.setItem("dashboard_from_date", normalizedTo)
+        localStorage.setItem("dashboard_to_date", normalizedFrom)
+        window.dispatchEvent(
+          new CustomEvent("dashboard-filters-changed", {
+            detail: {
+              fromDate: normalizedTo,
+              toDate: normalizedFrom,
+            },
+          })
+        )
+      }
       return
     }
     setFromDate(normalizedFrom)
     setToDate(normalizedTo)
     setDraftFromDate(normalizedFrom)
     setDraftToDate(normalizedTo)
-  }
+    if (syncStorage && typeof window !== "undefined") {
+      localStorage.setItem("dashboard_from_date", normalizedFrom)
+      localStorage.setItem("dashboard_to_date", normalizedTo)
+      window.dispatchEvent(
+        new CustomEvent("dashboard-filters-changed", {
+          detail: {
+            fromDate: normalizedFrom,
+            toDate: normalizedTo,
+          },
+        })
+      )
+    }
+  }, [clampToToday])
+
+  const syncFiltersFromDashboard = useCallback((refreshBounds = false) => {
+    if (typeof window === "undefined") return
+    const storedMode = (localStorage.getItem("dashboard_mode") || "").trim().toLowerCase()
+    if (storedMode === "sales" || storedMode === "claims") {
+      setDatasetType(storedMode)
+    }
+
+    const useJobFilter = localStorage.getItem("use_job_filter") === "1"
+    const rawJob = (localStorage.getItem("job_id") || "").trim()
+    const nextJob =
+      useJobFilter && rawJob && rawJob !== "null" && rawJob !== "undefined" && rawJob !== "all"
+        ? rawJob
+        : ""
+    setJobId(nextJob)
+
+    const storedFrom = clampToToday(localStorage.getItem("dashboard_from_date") || "")
+    const storedTo = clampToToday(localStorage.getItem("dashboard_to_date") || "")
+    applyDateRange(storedFrom, storedTo, { syncStorage: false })
+
+    if (refreshBounds) {
+      lastAutoBoundsKeyRef.current = ""
+      setBoundsRefreshTick((prev) => prev + 1)
+    }
+  }, [applyDateRange, clampToToday])
+
+  useEffect(() => {
+    syncFiltersFromDashboard(true)
+  }, [syncFiltersFromDashboard])
 
   useEffect(() => {
     if (typeof window === "undefined") return
-    const storedFrom = localStorage.getItem("dashboard_from_date") || ""
-    const storedTo = localStorage.getItem("dashboard_to_date") || ""
-    if (storedFrom && storedTo && storedFrom > storedTo) {
-      setFromDate(storedTo)
-      setToDate(storedFrom)
-      setDraftFromDate(storedTo)
-      setDraftToDate(storedFrom)
-      return
+    const handleDataRefresh = () => {
+      syncFiltersFromDashboard(true)
     }
-    setFromDate(storedFrom)
-    setToDate(storedTo)
-    setDraftFromDate(storedFrom)
-    setDraftToDate(storedTo)
-  }, [])
+    const handleFiltersChanged = () => {
+      syncFiltersFromDashboard(false)
+    }
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        event.key === "dashboard_from_date" ||
+        event.key === "dashboard_to_date" ||
+        event.key === "dashboard_mode" ||
+        event.key === "job_id" ||
+        event.key === "use_job_filter" ||
+        event.key === "dashboard_data_refresh_at"
+      ) {
+        syncFiltersFromDashboard(event.key === "dashboard_data_refresh_at")
+      }
+    }
+    window.addEventListener("dashboard-data-refreshed", handleDataRefresh as EventListener)
+    window.addEventListener("dashboard-filters-changed", handleFiltersChanged as EventListener)
+    window.addEventListener("dashboard-context-changed", handleFiltersChanged as EventListener)
+    window.addEventListener("storage", handleStorage)
+    return () => {
+      window.removeEventListener("dashboard-data-refreshed", handleDataRefresh as EventListener)
+      window.removeEventListener("dashboard-filters-changed", handleFiltersChanged as EventListener)
+      window.removeEventListener("dashboard-context-changed", handleFiltersChanged as EventListener)
+      window.removeEventListener("storage", handleStorage)
+    }
+  }, [syncFiltersFromDashboard])
 
   useEffect(() => {
     const activePartners = selectedPartners.map((value) => value.trim()).filter(Boolean)
@@ -117,9 +201,9 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
             dataset_type: datasetType,
             job_id: jobId.trim() || undefined,
           })
-          const min = String(res?.min_date || "").trim()
-          const max = String(res?.max_date || "").trim()
-          return min && max ? { min, max } : null
+          const min = clampToToday(String(res?.min_date || "").trim())
+          const max = clampToToday(String(res?.max_date || "").trim())
+          return min || max ? { min, max } : null
         } catch {
           return null
         }
@@ -135,15 +219,15 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
         return
       }
 
-      const mins = valid.map((item) => item.min)
-      const maxs = valid.map((item) => item.max)
-      const unionMin = mins.reduce((acc, cur) => (cur < acc ? cur : acc))
-      const unionMax = maxs.reduce((acc, cur) => (cur > acc ? cur : acc))
-      const overlapMin = mins.reduce((acc, cur) => (cur > acc ? cur : acc))
-      const overlapMax = maxs.reduce((acc, cur) => (cur < acc ? cur : acc))
-      const hasOverlap = overlapMin <= overlapMax
-      const nextFrom = hasOverlap ? overlapMin : unionMin
-      const nextTo = hasOverlap ? overlapMax : unionMax
+      const mins = valid.map((item) => item.min).filter(Boolean)
+      const maxs = valid.map((item) => item.max).filter(Boolean)
+      const unionMin = mins.length ? mins.reduce((acc, cur) => (cur < acc ? cur : acc)) : ""
+      const overlapMin = mins.length ? mins.reduce((acc, cur) => (cur > acc ? cur : acc)) : ""
+      const overlapMax = maxs.length ? maxs.reduce((acc, cur) => (cur < acc ? cur : acc)) : ""
+      const hasOverlap = Boolean(overlapMin && overlapMax && overlapMin <= overlapMax)
+      const nextTo = todayIso
+      const candidateFrom = hasOverlap ? overlapMin : unionMin
+      const nextFrom = candidateFrom && candidateFrom <= nextTo ? candidateFrom : nextTo
 
       setMinDate(nextFrom)
       setMaxDate(nextTo)
@@ -169,7 +253,7 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
     return () => {
       cancelled = true
     }
-  }, [datasetType, jobId, selectedPartners])
+  }, [datasetType, jobId, selectedPartners, fromDate, toDate, todayIso, boundsRefreshTick, clampToToday, applyDateRange])
 
   const togglePartner = (partnerKey: string) => {
     setSelectedPartners((prev) => {
@@ -376,17 +460,28 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
           Deck Studio
         </div>
 
-        <button
-          type="button"
-          title="Partner Decks (.pptx)"
-          onClick={() => openStudio()}
-          className={`${cardButtonClass} ${collapsed ? "md:justify-center md:px-2" : ""}`}
-        >
-          <FileChartColumnIncreasing size={16} />
-          <span className={collapsed ? "md:hidden" : ""}>Partner Decks (.pptx)</span>
-        </button>
-
-        {!collapsed ? (
+        {collapsed ? (
+          <div className="grid grid-cols-1 gap-2">
+            {PARTNERS.map((partner) => {
+              const active = focusedPartner === partner.key
+              return (
+                <button
+                  key={partner.key}
+                  type="button"
+                  onClick={() => openStudio([partner.key])}
+                  className={`flex items-center justify-center rounded-lg border px-1.5 py-2 transition ${
+                    active
+                      ? "border-[#1f6fe5] bg-[#eaf2ff]"
+                      : "border-slate-200 bg-white hover:bg-slate-50"
+                  }`}
+                  title={`Open ${partner.label} deck`}
+                >
+                  <Image src={partner.logo} alt={partner.label} width={34} height={14} className="h-4 w-8 object-contain" />
+                </button>
+              )
+            })}
+          </div>
+        ) : (
           <div className="mt-2 grid grid-cols-2 gap-2">
             {PARTNERS.map((partner) => {
               const active = focusedPartner === partner.key
@@ -408,7 +503,7 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
               )
             })}
           </div>
-        ) : null}
+        )}
       </div>
 
       {open && (

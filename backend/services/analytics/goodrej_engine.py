@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
 
-VALUATION_DATE = pd.Timestamp("2025-12-31")
 LOSS_RATIO_CAP_PERCENT = 300.0
 logger = logging.getLogger(__name__)
 
@@ -66,9 +65,16 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         super().__init__(db=db, job_id=job_id, source=source)
         self.dataset_type = dataset_type or "sales"
         self._loaded_data_cache: dict[tuple[bool, bool], dict[str, pd.DataFrame]] = {}
-        self.apply_date_filter = bool(from_date or to_date)
         self.report_start = pd.to_datetime(from_date, errors="coerce") if from_date else None
         self.report_end = pd.to_datetime(to_date, errors="coerce") if to_date else None
+        if self.report_start is not None and pd.isna(self.report_start):
+            self.report_start = None
+        if self.report_end is not None and pd.isna(self.report_end):
+            self.report_end = None
+        if self.report_start is not None and self.report_end is not None and self.report_end < self.report_start:
+            self.report_end = self.report_start
+        self.apply_date_filter = bool(self.report_start is not None or self.report_end is not None)
+        self.valuation_date = self._resolve_valuation_date(self.report_end)
 
     # --------------------------------------------------
     # LOAD DATA
@@ -168,6 +174,17 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     # PREMIUM CALCULATION
     # --------------------------------------------------
 
+    @staticmethod
+    def _resolve_valuation_date(report_end: pd.Timestamp | None) -> pd.Timestamp:
+        today = pd.Timestamp.now().normalize()
+        if report_end is None:
+            return today
+        candidate = pd.to_datetime(report_end, errors="coerce")
+        if candidate is None or pd.isna(candidate):
+            return today
+        candidate_ts = pd.Timestamp(candidate).normalize()
+        return candidate_ts if candidate_ts <= today else today
+
     def compute_premiums(self, df: pd.DataFrame) -> pd.DataFrame:
 
         required = {
@@ -208,7 +225,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         df["Coverage_Days"] = df["Coverage_Days"].clip(lower=1)
 
         # Used Days
-        df["Used_Days"] = (VALUATION_DATE - df["Warranty Start Date"]).dt.days
+        df["Used_Days"] = (self.valuation_date - df["Warranty Start Date"]).dt.days
         df["Used_Days"] = df[["Used_Days", "Coverage_Days"]].min(axis=1)
         df["Used_Days"] = df["Used_Days"].clip(lower=0)
 

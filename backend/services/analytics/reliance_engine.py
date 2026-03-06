@@ -13,7 +13,6 @@ from services.analytics_repository import get_dataframe
 logger = logging.getLogger(__name__)
 
 GST_MULTIPLIER = 1.18
-VALUATION_DATE = pd.Timestamp("2025-12-31")
 RELIANCE_START = pd.Timestamp("2025-04-01")
 RELIANCE_END = pd.Timestamp("2025-12-31")
 LOSS_RATIO_CAP_PERCENT = 300.0
@@ -75,6 +74,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             self.report_end = None
         if self.report_start is not None and self.report_end is not None and self.report_end < self.report_start:
             self.report_end = self.report_start
+        self.valuation_date = self._resolve_valuation_date(self.report_end)
 
     # --------------------------------------------------
     # HELPERS
@@ -95,6 +95,17 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             .pipe(pd.to_numeric, errors="coerce")
             .fillna(0)
         )
+
+    @staticmethod
+    def _resolve_valuation_date(report_end: pd.Timestamp | None) -> pd.Timestamp:
+        today = pd.Timestamp.now().normalize()
+        if report_end is None:
+            return today
+        candidate = pd.to_datetime(report_end, errors="coerce")
+        if candidate is None or pd.isna(candidate):
+            return today
+        candidate_ts = pd.Timestamp(candidate).normalize()
+        return candidate_ts if candidate_ts <= today else today
 
     def _is_ew_plan(self, df: pd.DataFrame) -> pd.Series:
         candidates = ["Plan Category", "Plan Type", "Device Plan Category"]
@@ -924,7 +935,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             coverage_days = coverage_days.fillna(365).clip(lower=1)
 
             exposure_days_raw = (
-                VALUATION_DATE - sales_df["Plan Start Date"]
+                self.valuation_date - sales_df["Plan Start Date"]
             ).dt.days
             # Future-start policies should not generate negative earned premium.
             # Also cap exposure at coverage days.

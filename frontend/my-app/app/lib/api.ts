@@ -124,6 +124,57 @@ export type AdminReverseMapResponse = {
   mappings: AdminReverseMapField[]
 }
 
+export type AdminFilterAnalyzeMapping = {
+  field: string
+  column: string | null
+  confidence: number
+  issue?: string
+  reason?: string
+}
+
+export type AdminFilterAnalyzeResponse = {
+  file_name: string
+  source: string
+  dataset_type: "sales" | "claims"
+  rows_in: number
+  rows_after_filter: number
+  ai_mapping: {
+    message?: string
+    can_reverse_map: boolean
+  }
+  mapping_quality: {
+    required_found: number
+    required_total: number
+    coverage: number
+  }
+  key_detection: {
+    primary_key_name: string
+    key_column: string | null
+    strategy: string
+    key_candidates: string[]
+    missing_key_values: number
+    duplicate_keys_in_file: number
+    uniqueness_ratio: number
+  }
+  right_mappings: AdminFilterAnalyzeMapping[]
+  wrong_mappings: AdminFilterAnalyzeMapping[]
+  issues: string[]
+  planned_changes: string[]
+  primary_key_candidates: string[]
+  can_apply: boolean
+}
+
+export type AdminFilterApplyResponse = {
+  applied: boolean
+  source: string
+  dataset_type: "sales" | "claims"
+  job_id?: string
+  deleted_rows: number
+  rows_inserted: number
+  revision_id?: number | null
+  summary?: string
+}
+
 type AdminFileListResponse = {
   items: AdminFileItem[]
 }
@@ -432,10 +483,15 @@ async function fetchResponseWithFallback(path: string, query: string, init: ApiR
         }
         const message = detail || `HTTP ${res.status}`
         const shouldRedirectOnUnauthorized = path !== "/auth/login"
+        const isDeckPath = path.startsWith("/deck/")
 
         if (res.status === 401 || res.status === 403) {
           if (shouldRedirectOnUnauthorized) sawUnauthorized = true
           errors.push(`${url} -> ${message}`)
+          if (shouldRedirectOnUnauthorized && isDeckPath) {
+            handleUnauthorized()
+            throw new NoFallbackError("Not authenticated")
+          }
           continue
         }
         // Allow fallback for route/method mismatches (common with stale/wrong API base).
@@ -682,6 +738,96 @@ export async function reverseMapAdminFile(payload: {
     body: form,
     timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
   })
+}
+
+export async function analyzeAdminFilterFile(payload: {
+  file: File
+  source: string
+  dataset_type: "sales" | "claims"
+}): Promise<AdminFilterAnalyzeResponse> {
+  const form = new FormData()
+  form.append("file", payload.file)
+  form.append("source", payload.source)
+  form.append("dataset_type", payload.dataset_type)
+  return fetchJsonWithFallback("/admin/files/filter-analyze", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
+}
+
+export async function revertAdminFilterApply(payload: {
+  source: string
+  dataset_type: "sales" | "claims"
+  job_id?: string
+  revision_id?: number
+}): Promise<{ reverted: boolean; revision_id: number; rows_inserted: number; deleted_rows: number }> {
+  const form = new FormData()
+  form.append("source", payload.source)
+  form.append("dataset_type", payload.dataset_type)
+  if (payload.job_id) form.append("job_id", payload.job_id)
+  if (payload.revision_id !== undefined) form.append("revision_id", String(payload.revision_id))
+  return fetchJsonWithFallback("/admin/files/filter-revert", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
+}
+
+export async function applyAdminFilterFile(payload: {
+  file: File
+  source: string
+  dataset_type: "sales" | "claims"
+  job_id?: string
+}): Promise<AdminFilterApplyResponse> {
+  const form = new FormData()
+  form.append("file", payload.file)
+  form.append("source", payload.source)
+  form.append("dataset_type", payload.dataset_type)
+  if (payload.job_id) form.append("job_id", payload.job_id)
+  return fetchJsonWithFallback("/admin/files/filter-apply", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
+}
+
+export async function filterAndDownloadAdminFile(payload: {
+  file: File
+  source: string
+  dataset_type: "sales" | "claims"
+  output_format?: "csv" | "xlsx"
+  apply_to_db?: boolean
+  job_id?: string
+}): Promise<{ blob: Blob; filename: string; summary: string; revision_id?: number }> {
+  const form = new FormData()
+  form.append("file", payload.file)
+  form.append("source", payload.source)
+  form.append("dataset_type", payload.dataset_type)
+  form.append("output_format", payload.output_format || "csv")
+  form.append("apply_to_db", String(Boolean(payload.apply_to_db)))
+  if (payload.job_id) {
+    form.append("job_id", payload.job_id)
+  }
+
+  const res = await fetchResponseWithFallback("/admin/files/filter-download", "", {
+    method: "POST",
+    body: form,
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
+  const blob = await res.blob()
+  const contentDisposition = res.headers.get("content-disposition") || ""
+  const fileMatch = contentDisposition.match(/filename=\"?([^\";]+)\"?/)
+  const fallbackName = `filtered_${payload.source}_${payload.dataset_type}.${payload.output_format || "csv"}`
+  const revisionRaw = res.headers.get("x-filter-revision-id")
+  const revisionId = revisionRaw ? Number(revisionRaw) : undefined
+
+  return {
+    blob,
+    filename: fileMatch?.[1] || fallbackName,
+    summary: res.headers.get("x-filter-summary") || "File filtered successfully.",
+    revision_id: Number.isFinite(revisionId) ? revisionId : undefined,
+  }
 }
 
 export async function downloadAdminFile(params: {

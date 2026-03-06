@@ -21,6 +21,7 @@ from services.analytics_engine import (
 )
 from models.data_rows import DataRow
 from models.manual_updates import ManualUpdateMarker
+from models.precomputed_analytics import PrecomputedSummary
 from services.precomputed_repository import (
     get_precomputed_graph,
     get_precomputed_summary,
@@ -856,6 +857,46 @@ def _parse_filter_values(raw_values: str | None) -> list[str]:
     return values
 
 
+def _canonical_plan_category_value(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text:
+        return ""
+    if "combo" in text:
+        return "Combo"
+    if "adld" in text or "accidental" in text or "liquid" in text:
+        return "ADLD"
+    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text:
+        return "Screen Protection"
+    if re.search(r"\bew\b", text) or "extended warranty" in text:
+        return "Extended Warranty"
+    return str(value or "").strip()
+
+
+def _canonical_device_plan_category_value(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text:
+        return ""
+    if "luxury" in text and "fold" in text:
+        return "Luxury Fold"
+    if "luxury" in text and "flip" in text:
+        return "Luxury Flip"
+    if "fold" in text:
+        return "Luxury Fold"
+    if "flip" in text:
+        return "Luxury Flip"
+    if "super" in text and "premium" in text:
+        return "Super Premium"
+    if text.startswith("premium") or ("premium" in text and "super" not in text):
+        return "Premium"
+    if text.startswith("high") or text == "high":
+        return "High"
+    if text.startswith("mid") or text == "mid":
+        return "Mid"
+    if text.startswith("mass") or text == "mass":
+        return "Mass"
+    return str(value or "").strip()
+
+
 def _build_dimension_filters(
     *,
     filter_1_dimension: str | None,
@@ -912,9 +953,18 @@ def _apply_dimension_filters_to_frame(
         if not dim_col:
             return scoped.iloc[0:0].copy()
 
-        allowed_compact = {_collapse_bucket_value(v) for v in values}
-        series = scoped[dim_col].astype(str).str.strip()
-        compact_series = series.map(_collapse_bucket_value)
+        if dim_key == "plan_category":
+            allowed_compact = {_collapse_bucket_value(_canonical_plan_category_value(v)) for v in values}
+            series = scoped[dim_col].astype(str).str.strip().map(_canonical_plan_category_value)
+            compact_series = series.map(_collapse_bucket_value)
+        elif dim_key == "device_plan_category":
+            allowed_compact = {_collapse_bucket_value(_canonical_device_plan_category_value(v)) for v in values}
+            series = scoped[dim_col].astype(str).str.strip().map(_canonical_device_plan_category_value)
+            compact_series = series.map(_collapse_bucket_value)
+        else:
+            allowed_compact = {_collapse_bucket_value(v) for v in values}
+            series = scoped[dim_col].astype(str).str.strip()
+            compact_series = series.map(_collapse_bucket_value)
         mask = compact_series.isin(allowed_compact)
         if not mask.any():
             return scoped.iloc[0:0].copy()
@@ -1196,9 +1246,17 @@ def compute_by_dimension_rows(
                                 merged[key]["period_end"] = end_val
 
             def _fetch_and_merge(src: str, out_key: str):
+                metric_key_local = _to_safe_key(metric or "")
+                dimension_key_local = _to_safe_key(dimension or "")
                 force_live_partner_metric = (
-                    dataset_type == "sales"
-                    and _to_safe_key(metric or "") in {"earned_premium", "zopper_earned_premium"}
+                    (
+                        dataset_type == "sales"
+                        and metric_key_local in {"earned_premium", "zopper_earned_premium"}
+                    )
+                    or (
+                        dataset_type == "claims"
+                        and dimension_key_local in {"month", "date"}
+                    )
                 )
                 if not active_category_filters and not force_live_partner_metric:
                     partner_cached = get_precomputed_graph(
@@ -1429,12 +1487,18 @@ def analytics_by_dimension(
         return out
 
     metric_key = _to_safe_key(metric or "")
+    dimension_key = _to_safe_key(dimension or "")
     force_live_samsung_sales_earned = (
         resolved_source.startswith("samsung")
         and normalized_dataset == "sales"
         and metric_key in {"earned_premium", "zopper_earned_premium"}
     )
-    cached = None if force_live_samsung_sales_earned else get_precomputed_graph(
+    force_live_samsung_claims_trend = (
+        resolved_source.startswith("samsung")
+        and normalized_dataset == "claims"
+        and dimension_key in {"month", "date"}
+    )
+    cached = None if (force_live_samsung_sales_earned or force_live_samsung_claims_trend) else get_precomputed_graph(
         db=db,
         source=resolved_source,
         dataset_type=normalized_dataset,
@@ -2625,10 +2689,39 @@ def _date_bounds_for_source_dataset(
             ],
         )
 
-    if src_key.startswith("samsung"):
-        fiscal_min, fiscal_max = _bounds_from_columns(df, ["Fiscal Month"])
-        if fiscal_min is not None and fiscal_max is not None:
-            return fiscal_min, fiscal_max
+    if dataset_key == "claims" and src_key.startswith("samsung"):
+        # Samsung claims files can spread timeline fields across Fiscal/Month/Claim-Date
+        # columns. Use a combined bound so newly uploaded claim dates are not hidden by
+        # a stale fiscal-month range.
+        bound_sets = [
+            _bounds_from_columns(df, ["Fiscal Month"]),
+            _bounds_from_columns(
+                df,
+                ["Month", "Month-Year", "Month Year", "Month_Year", "Month Name", "Month_Name"],
+            ),
+            _bounds_from_columns(
+                df,
+                [
+                    "Claim Date",
+                    "Day of Call_Date",
+                    "Call_Date",
+                    "Call Date",
+                    "Date",
+                    "Payment_date",
+                    "Payment Date",
+                    "Posting Date",
+                    "Complete Date",
+                    "Bill Created Date",
+                ],
+            ),
+        ]
+        min_candidates = [mn for mn, _mx in bound_sets if mn is not None]
+        max_candidates = [mx for _mn, mx in bound_sets if mx is not None]
+        if min_candidates or max_candidates:
+            return (
+                min(min_candidates) if min_candidates else None,
+                max(max_candidates) if max_candidates else None,
+            )
 
     return _bounds_from_columns(
         df,
@@ -2710,7 +2803,7 @@ def _load_master_summary(
     to_date: str | None,
 ) -> tuple[dict[str, Any], str | None]:
     source_key = (source or "").strip().lower()
-    force_live_summary = source_key in {"samsung_vs", "samsung_croma"} and dataset_type == "sales"
+    force_live_summary = source_key in {"samsung_vs", "samsung_croma"} and dataset_type in {"sales", "claims"}
     selected_summary: dict[str, Any] = {}
     selected_job_id: str | None = candidate_job_ids[0] if candidate_job_ids else None
     for candidate_job_id in candidate_job_ids:
@@ -2763,7 +2856,7 @@ def _load_master_metric_rows(
     to_date: str | None,
 ) -> list[dict[str, Any]]:
     source_key = (source or "").strip().lower()
-    force_live_rows = source_key in {"samsung_vs", "samsung_croma"} and dataset_type == "sales"
+    force_live_rows = source_key in {"samsung_vs", "samsung_croma"} and dataset_type in {"sales", "claims"}
     ordered_candidates: list[str | None] = []
     if preferred_job_id in candidate_job_ids:
         ordered_candidates.append(preferred_job_id)
@@ -2989,6 +3082,52 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
     return True
 
 
+def _get_master_cache_updated_at(
+    *,
+    db: Session,
+    cache_source: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> datetime | None:
+    row = (
+        db.query(PrecomputedSummary)
+        .filter(PrecomputedSummary.source == (cache_source or "").strip().lower())
+        .filter(PrecomputedSummary.dataset_type == "overview")
+        .filter(PrecomputedSummary.job_key == (job_id or "").strip())
+        .filter(PrecomputedSummary.from_date == (from_date or "").strip())
+        .filter(PrecomputedSummary.to_date == (to_date or "").strip())
+        .first()
+    )
+    return row.updated_at if row is not None else None
+
+
+def _latest_master_marker_updated_at(
+    *,
+    db: Session,
+    job_id: str | None,
+) -> datetime | None:
+    master_sources = [
+        "samsung",
+        "samsung_vs",
+        "samsung_croma",
+        "samsung_vijay_sales",
+        "reliance",
+        "godrej",
+    ]
+    query = (
+        db.query(func.max(ManualUpdateMarker.updated_at))
+        .filter(ManualUpdateMarker.source.in_(master_sources))
+        .filter(ManualUpdateMarker.dataset_type.in_(["sales", "claims"]))
+    )
+    job_key = (job_id or "").strip()
+    if job_key:
+        query = query.filter(ManualUpdateMarker.job_key.in_([job_key, ""]))
+    else:
+        query = query.filter(ManualUpdateMarker.job_key == "")
+    return query.scalar()
+
+
 @router.get("/master-dashboard")
 def analytics_master_dashboard(
     job_id: str | None = Query(None),
@@ -2998,7 +3137,7 @@ def analytics_master_dashboard(
 ):
     started = time.perf_counter()
     from_date, to_date = _sanitize_range(from_date, to_date)
-    cache_source = "master_dashboard_v5"
+    cache_source = "master_dashboard_v7"
 
     cached = get_precomputed_summary(
         db=db,
@@ -3008,7 +3147,22 @@ def analytics_master_dashboard(
         from_date=from_date,
         to_date=to_date,
     )
-    if _is_valid_master_payload(cached):
+    cache_updated_at = _get_master_cache_updated_at(
+        db=db,
+        cache_source=cache_source,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    latest_marker_updated_at = _latest_master_marker_updated_at(db=db, job_id=job_id)
+    cache_is_fresh = False
+    if cache_updated_at is not None:
+        if latest_marker_updated_at is None:
+            cache_is_fresh = True
+        else:
+            cache_is_fresh = pd.Timestamp(cache_updated_at) >= pd.Timestamp(latest_marker_updated_at)
+
+    if _is_valid_master_payload(cached) and cache_is_fresh:
         logger.info(
             "TIMING analytics.master_dashboard mode=precomputed duration_ms=%.2f",
             (time.perf_counter() - started) * 1000,
@@ -3059,10 +3213,7 @@ def analytics_summary(
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
-    force_live_summary = (
-        (resolved_source == "godrej" and normalized_dataset == "sales")
-        or (resolved_source.startswith("samsung") and normalized_dataset == "sales")
-    )
+    force_live_summary = resolved_source.startswith("samsung") and normalized_dataset == "sales"
 
     if resolved_source == "samsung" and not force_live_summary:
         partner_rows: list[dict[str, Any]] = []

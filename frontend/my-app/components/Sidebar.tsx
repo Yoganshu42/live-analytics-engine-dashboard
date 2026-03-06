@@ -54,7 +54,7 @@ export default function Sidebar({
 
   return (
     <aside
-      className={`w-full shrink-0 border-b border-slate-200 bg-[#f6f8fc] p-2.5 sm:p-3 md:h-full md:border-b-0 md:border-r md:p-4 md:pt-5 ${
+      className={`custom-scrollbar w-full shrink-0 overflow-y-auto border-b border-slate-200 bg-[#f6f8fc] p-2.5 pb-4 sm:p-3 md:h-full md:border-b-0 md:border-r md:p-4 md:pt-5 ${
         collapsed ? "md:w-[82px]" : "md:w-[230px]"
       }`}
     >

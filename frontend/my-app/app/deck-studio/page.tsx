@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Image from "next/image"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
@@ -29,6 +29,7 @@ const PARTNERS: PartnerOption[] = [
 
 export default function DeckStudioPage() {
   const router = useRouter()
+  const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
   const [isDownloading, setIsDownloading] = useState(false)
   const [isOpeningSlides, setIsOpeningSlides] = useState(false)
   const [error, setError] = useState("")
@@ -46,7 +47,64 @@ export default function DeckStudioPage() {
   const [includeTables, setIncludeTables] = useState(true)
   const [weekWindow, setWeekWindow] = useState<WeekWindow>(4)
   const [selectedPartners, setSelectedPartners] = useState<string[]>(PARTNERS.map((partner) => partner.key))
+  const [boundsRefreshTick, setBoundsRefreshTick] = useState(0)
   const lastAutoBoundsKeyRef = useRef("")
+
+  const toIsoDate = useCallback((value: string) => {
+    const raw = (value || "").trim()
+    if (!raw) return ""
+    const directIso = raw.match(/^(\d{4}-\d{2}-\d{2})/)
+    if (directIso?.[1]) return directIso[1]
+    const parsed = new Date(raw)
+    if (Number.isNaN(parsed.getTime())) return ""
+    return parsed.toISOString().slice(0, 10)
+  }, [])
+
+  const clampToToday = useCallback((value: string) => {
+    const iso = toIsoDate(value)
+    if (!iso) return ""
+    return iso > todayIso ? todayIso : iso
+  }, [toIsoDate, todayIso])
+
+  const applyDateRange = useCallback((nextFrom: string, nextTo: string) => {
+    const normalizedFrom = clampToToday(nextFrom || "")
+    const normalizedTo = clampToToday(nextTo || "")
+    if (normalizedFrom && normalizedTo && normalizedFrom > normalizedTo) {
+      setFromDate(normalizedTo)
+      setToDate(normalizedFrom)
+      setDraftFromDate(normalizedTo)
+      setDraftToDate(normalizedFrom)
+      if (typeof window !== "undefined") {
+        localStorage.setItem("dashboard_from_date", normalizedTo)
+        localStorage.setItem("dashboard_to_date", normalizedFrom)
+        window.dispatchEvent(
+          new CustomEvent("dashboard-filters-changed", {
+            detail: {
+              fromDate: normalizedTo,
+              toDate: normalizedFrom,
+            },
+          })
+        )
+      }
+      return
+    }
+    setFromDate(normalizedFrom)
+    setToDate(normalizedTo)
+    setDraftFromDate(normalizedFrom)
+    setDraftToDate(normalizedTo)
+    if (typeof window !== "undefined") {
+      localStorage.setItem("dashboard_from_date", normalizedFrom)
+      localStorage.setItem("dashboard_to_date", normalizedTo)
+      window.dispatchEvent(
+        new CustomEvent("dashboard-filters-changed", {
+          detail: {
+            fromDate: normalizedFrom,
+            toDate: normalizedTo,
+          },
+        })
+      )
+    }
+  }, [clampToToday])
 
   useEffect(() => {
     const token = (typeof window !== "undefined" ? localStorage.getItem("auth_token") : "") || ""
@@ -70,20 +128,29 @@ export default function DeckStudioPage() {
       }
     }
     const dataset = params.get("dataset_type")
+    const storedMode = (localStorage.getItem("dashboard_mode") || "").trim().toLowerCase()
     if (dataset === "claims" || dataset === "sales") {
       setDatasetType(dataset)
+    } else if (storedMode === "claims" || storedMode === "sales") {
+      setDatasetType(storedMode)
     }
     const weekValue = Number(params.get("week_window") || 0)
     if (weekValue === 2 || weekValue === 3 || weekValue === 4 || weekValue === 6) {
       setWeekWindow(weekValue)
     }
-    const nextJob = params.get("job_id") || ""
+    const useJobFilter = localStorage.getItem("use_job_filter") === "1"
+    const storedJob = (localStorage.getItem("job_id") || "").trim()
+    const nextJob =
+      params.get("job_id") ||
+      (useJobFilter && storedJob && storedJob !== "all" && storedJob !== "null" && storedJob !== "undefined"
+        ? storedJob
+        : "")
     const queryFrom = params.get("from_date") || ""
     const queryTo = params.get("to_date") || ""
-    const storedFrom = localStorage.getItem("dashboard_from_date") || ""
-    const storedTo = localStorage.getItem("dashboard_to_date") || ""
-    const nextFrom = queryFrom || storedFrom
-    const nextTo = queryTo || storedTo
+    const storedFrom = clampToToday(localStorage.getItem("dashboard_from_date") || "")
+    const storedTo = clampToToday(localStorage.getItem("dashboard_to_date") || "")
+    const nextFrom = clampToToday(queryFrom || storedFrom)
+    const nextTo = clampToToday(queryTo || storedTo)
     setJobId(nextJob)
     setFromDate(nextFrom)
     setToDate(nextTo)
@@ -93,7 +160,66 @@ export default function DeckStudioPage() {
     if (includeTablesRaw !== null) {
       setIncludeTables(includeTablesRaw === "1")
     }
-  }, [])
+  }, [todayIso, clampToToday])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+
+    const syncFromStorage = (refreshBounds: boolean) => {
+      const storedMode = (localStorage.getItem("dashboard_mode") || "").trim().toLowerCase()
+      if (storedMode === "claims" || storedMode === "sales") {
+        setDatasetType(storedMode)
+      }
+
+      const useJobFilter = localStorage.getItem("use_job_filter") === "1"
+      const rawJob = (localStorage.getItem("job_id") || "").trim()
+      const normalizedJob =
+        useJobFilter && rawJob && rawJob !== "all" && rawJob !== "null" && rawJob !== "undefined"
+          ? rawJob
+          : ""
+      setJobId(normalizedJob)
+
+      const storedFrom = clampToToday(localStorage.getItem("dashboard_from_date") || "")
+      const storedTo = clampToToday(localStorage.getItem("dashboard_to_date") || "")
+      const orderedFrom = storedFrom && storedTo && storedFrom > storedTo ? storedTo : storedFrom
+      const orderedTo = storedFrom && storedTo && storedFrom > storedTo ? storedFrom : storedTo
+      setFromDate(orderedFrom)
+      setToDate(orderedTo)
+      setDraftFromDate(orderedFrom)
+      setDraftToDate(orderedTo)
+
+      if (refreshBounds) {
+        lastAutoBoundsKeyRef.current = ""
+        setBoundsRefreshTick((prev) => prev + 1)
+      }
+    }
+
+    const handleDataRefresh = () => syncFromStorage(true)
+    const handleFiltersChanged = () => syncFromStorage(false)
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        event.key === "dashboard_from_date" ||
+        event.key === "dashboard_to_date" ||
+        event.key === "dashboard_mode" ||
+        event.key === "job_id" ||
+        event.key === "use_job_filter" ||
+        event.key === "dashboard_data_refresh_at"
+      ) {
+        syncFromStorage(event.key === "dashboard_data_refresh_at")
+      }
+    }
+
+    window.addEventListener("dashboard-data-refreshed", handleDataRefresh as EventListener)
+    window.addEventListener("dashboard-filters-changed", handleFiltersChanged as EventListener)
+    window.addEventListener("dashboard-context-changed", handleFiltersChanged as EventListener)
+    window.addEventListener("storage", handleStorage)
+    return () => {
+      window.removeEventListener("dashboard-data-refreshed", handleDataRefresh as EventListener)
+      window.removeEventListener("dashboard-filters-changed", handleFiltersChanged as EventListener)
+      window.removeEventListener("dashboard-context-changed", handleFiltersChanged as EventListener)
+      window.removeEventListener("storage", handleStorage)
+    }
+  }, [todayIso, clampToToday])
 
   useEffect(() => {
     const activePartners = selectedPartners.map((value) => value.trim()).filter(Boolean)
@@ -116,9 +242,9 @@ export default function DeckStudioPage() {
             dataset_type: datasetType,
             job_id: jobId.trim() || undefined,
           })
-          const min = String(res?.min_date || "").trim()
-          const max = String(res?.max_date || "").trim()
-          return min && max ? { min, max } : null
+          const min = clampToToday(String(res?.min_date || "").trim())
+          const max = clampToToday(String(res?.max_date || "").trim())
+          return min || max ? { min, max } : null
         } catch {
           return null
         }
@@ -134,15 +260,15 @@ export default function DeckStudioPage() {
         return
       }
 
-      const mins = valid.map((item) => item.min)
-      const maxs = valid.map((item) => item.max)
-      const unionMin = mins.reduce((acc, cur) => (cur < acc ? cur : acc))
-      const unionMax = maxs.reduce((acc, cur) => (cur > acc ? cur : acc))
-      const overlapMin = mins.reduce((acc, cur) => (cur > acc ? cur : acc))
-      const overlapMax = maxs.reduce((acc, cur) => (cur < acc ? cur : acc))
-      const hasOverlap = overlapMin <= overlapMax
-      const nextFrom = hasOverlap ? overlapMin : unionMin
-      const nextTo = hasOverlap ? overlapMax : unionMax
+      const mins = valid.map((item) => item.min).filter(Boolean)
+      const maxs = valid.map((item) => item.max).filter(Boolean)
+      const unionMin = mins.length ? mins.reduce((acc, cur) => (cur < acc ? cur : acc)) : ""
+      const overlapMin = mins.length ? mins.reduce((acc, cur) => (cur > acc ? cur : acc)) : ""
+      const overlapMax = maxs.length ? maxs.reduce((acc, cur) => (cur < acc ? cur : acc)) : ""
+      const hasOverlap = Boolean(overlapMin && overlapMax && overlapMin <= overlapMax)
+      const nextTo = todayIso
+      const candidateFrom = hasOverlap ? overlapMin : unionMin
+      const nextFrom = candidateFrom && candidateFrom <= nextTo ? candidateFrom : nextTo
 
       setMinDate(nextFrom)
       setMaxDate(nextTo)
@@ -168,23 +294,7 @@ export default function DeckStudioPage() {
     return () => {
       cancelled = true
     }
-  }, [datasetType, jobId, selectedPartners])
-
-  const applyDateRange = (nextFrom: string, nextTo: string) => {
-    const normalizedFrom = nextFrom || ""
-    const normalizedTo = nextTo || ""
-    if (normalizedFrom && normalizedTo && normalizedFrom > normalizedTo) {
-      setFromDate(normalizedTo)
-      setToDate(normalizedFrom)
-      setDraftFromDate(normalizedTo)
-      setDraftToDate(normalizedFrom)
-      return
-    }
-    setFromDate(normalizedFrom)
-    setToDate(normalizedTo)
-    setDraftFromDate(normalizedFrom)
-    setDraftToDate(normalizedTo)
-  }
+  }, [datasetType, jobId, selectedPartners, fromDate, toDate, todayIso, boundsRefreshTick, clampToToday, applyDateRange])
 
   const canDownload = useMemo(
     () => selectedPartners.length > 0 && !isDownloading && !isOpeningSlides,

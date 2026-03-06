@@ -1709,16 +1709,7 @@ export default function MultiGraphView({
   ])
 
   const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
-  const pickerMaxDate = useMemo(() => {
-    const candidates = [resetToDate, toDate, fullscreenToDate]
-      .map((value) => (value || "").trim())
-      .filter(Boolean)
-    const futureCandidate = candidates
-      .filter((value) => value > todayIso)
-      .sort()
-      .pop()
-    return futureCandidate || todayIso
-  }, [resetToDate, toDate, fullscreenToDate, todayIso])
+  const pickerMaxDate = useMemo(() => todayIso, [todayIso])
 
   const handleApplyFullscreenDateRange = (nextFromRaw: string, nextToRaw: string) => {
     if (!onDateRangeApply) return

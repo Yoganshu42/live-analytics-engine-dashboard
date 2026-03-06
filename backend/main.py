@@ -54,6 +54,12 @@ from services.precomputed_repository import (
 from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_engine import filter_by_date_range
 from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
+from services.partner_filter_service import (
+    dataframe_to_payload_rows,
+    normalize_partner_dataframe,
+    normalize_partner_rows,
+)
+from services.data_quality_service import prepare_rows_for_storage
 
 # --------------------------------------------------
 # LOGGING
@@ -95,7 +101,7 @@ def _normalize_data_tag(
     dataset_type: str,
     job_id: str | None,
 ) -> tuple[str, str, str | None]:
-    src = (source or "").strip().lower()
+    src = _normalize_source_key((source or "").strip())
     ds = (dataset_type or "").strip().lower()
     jb = (job_id or "").strip() or None
     return src, ds, jb
@@ -108,29 +114,96 @@ def _overwrite_rows_for_source_dataset(
     dataset_type: str,
     job_id: str | None,
     payloads: list[dict[str, Any]],
-) -> tuple[int, int, str | None]:
+) -> tuple[int, int, str | None, dict[str, Any]]:
     src, ds, jb = _normalize_data_tag(source=source, dataset_type=dataset_type, job_id=job_id)
-    deleted = int(
-        db.query(DataRow)
-        .filter(DataRow.source == src, DataRow.dataset_type == ds)
-        .delete(synchronize_session=False)
-        or 0
+    storage_rows, quality_meta = prepare_rows_for_storage(
+        payloads,
+        source=src,
+        dataset_type=ds,
     )
+    existing_query = db.query(DataRow).filter(
+        DataRow.source == src,
+        DataRow.dataset_type == ds,
+    )
+    incoming_keys = [
+        str(item.get("record_key") or "").strip()
+        for item in storage_rows
+        if isinstance(item, dict) and str(item.get("record_key") or "").strip()
+    ]
+    unique_incoming_keys = list(dict.fromkeys(incoming_keys))
+    existing_by_key: dict[str, DataRow] = {}
+    if unique_incoming_keys:
+        chunk_size = 2000
+        for offset in range(0, len(unique_incoming_keys), chunk_size):
+            chunk = unique_incoming_keys[offset : offset + chunk_size]
+            scoped_query = existing_query.filter(DataRow.record_key.in_(chunk))
+            if jb is None:
+                scoped_query = scoped_query.filter(DataRow.job_id.is_(None))
+            else:
+                scoped_query = scoped_query.filter(DataRow.job_id == jb)
+            for row in scoped_query.all():
+                key = str(row.record_key or "").strip()
+                if key:
+                    existing_by_key[key] = row
+
+    def _is_missing(v: Any) -> bool:
+        if v is None:
+            return True
+        text = str(v).strip().lower()
+        return text in {"", "nan", "none", "null"}
+
+    def _merge_payload(old_payload: dict[str, Any], new_payload: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(old_payload or {})
+        for key, value in (new_payload or {}).items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            if not _is_missing(value):
+                merged[key] = value
+        return merged
+
+    inserted_rows = 0
+    updated_rows = 0
+    insert_payloads: list[dict[str, Any]] = []
+    for item in storage_rows:
+        if not isinstance(item, dict):
+            continue
+        rk = str(item.get("record_key") or "").strip()
+        payload = item.get("data") if isinstance(item.get("data"), dict) else {}
+        pk_name = str(item.get("primary_key_name") or "").strip() or None
+        existing = existing_by_key.get(rk) if rk else None
+        if existing is None:
+            insert_payloads.append(
+                {
+                    "job_id": jb,
+                    "source": src,
+                    "dataset_type": ds,
+                    "data": payload,
+                    "record_key": rk or None,
+                    "primary_key_name": pk_name,
+                }
+            )
+            inserted_rows += 1
+            continue
+        existing.data = _merge_payload(existing.data if isinstance(existing.data, dict) else {}, payload)
+        if pk_name:
+            existing.primary_key_name = pk_name
+        if jb is not None:
+            existing.job_id = jb
+        updated_rows += 1
+
     clear_precomputed_for_source_dataset(db, source=src, dataset_type=ds)
-    if payloads:
-        db.add_all(
-            [
-                DataRow(
-                    job_id=jb,
-                    source=src,
-                    dataset_type=ds,
-                    data=row,
-                )
-                for row in payloads
-            ]
+    if insert_payloads:
+        db.bulk_insert_mappings(
+            DataRow,
+            insert_payloads,
         )
     db.commit()
-    return deleted, len(payloads), jb
+    quality_meta["merge_mode"] = "upsert"
+    quality_meta["updated_rows"] = int(updated_rows)
+    quality_meta["inserted_rows"] = int(inserted_rows)
+    quality_meta["deleted_rows"] = 0
+    return 0, int(inserted_rows), jb, quality_meta
 
 
 def _refresh_after_data_change(
@@ -141,7 +214,7 @@ def _refresh_after_data_change(
     job_id: str | None,
     action: str,
 ) -> None:
-    src = source.lower().strip()
+    src = _normalize_source_key(source)
     ds = dataset_type.lower().strip()
     refresh_jobs = _refresh_jobs(job_id)
     invalidate_deck_cache_for_source_dataset(db=db, source=src, dataset_type=ds)
@@ -304,6 +377,64 @@ def _init_db():
                     """
                 )
             )
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE public.data_rows
+                    ADD COLUMN IF NOT EXISTS record_key TEXT;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE public.data_rows
+                    ADD COLUMN IF NOT EXISTS primary_key_name TEXT;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_data_rows_record_key
+                    ON public.data_rows (record_key);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_data_rows_unique_record
+                    ON public.data_rows (source, dataset_type, COALESCE(job_id, ''), record_key)
+                    WHERE record_key IS NOT NULL;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.admin_filter_revisions (
+                        id BIGSERIAL PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        dataset_type TEXT NOT NULL,
+                        job_key TEXT NOT NULL DEFAULT '',
+                        before_blob BYTEA NOT NULL,
+                        before_rows INTEGER NOT NULL DEFAULT 0,
+                        after_rows INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        reverted_at TIMESTAMPTZ NULL
+                    );
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_admin_filter_revisions_tag
+                    ON public.admin_filter_revisions (source, dataset_type, job_key, created_at DESC);
+                    """
+                )
+            )
     except Exception:
         logger.exception("DB init failed")
 
@@ -333,6 +464,10 @@ app.add_middleware(
         "X-Transform-Rows-Affected",
         "X-Transform-Columns-Touched",
         "X-Transform-Skipped",
+        "X-Filter-Summary",
+        "X-Filter-Apply-Db",
+        "X-Filter-Rows",
+        "X-Filter-Revision-Id",
     ],
 )
 
@@ -385,6 +520,8 @@ async def upload_file(
             status_code=400,
             detail="Missing required fields: source and dataset_type.",
         )
+    source_norm = _normalize_source_key(source)
+    dataset_norm = (dataset_type or "").strip().lower()
 
     contents = await file.read()
     if not contents:
@@ -404,20 +541,24 @@ async def upload_file(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
 
-    df = df.astype(object).where(pd.notnull(df), None)
-    rows = [_clean_json_row(r) for r in df.to_dict(orient="records")]
+    normalized_df, normalize_meta = normalize_partner_dataframe(
+        df,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
+    rows = dataframe_to_payload_rows(normalized_df)
 
-    deleted_rows, inserted_rows, normalized_job_id = _overwrite_rows_for_source_dataset(
+    deleted_rows, inserted_rows, normalized_job_id, quality_meta = _overwrite_rows_for_source_dataset(
         db=db,
-        source=source,
-        dataset_type=dataset_type,
+        source=source_norm,
+        dataset_type=dataset_norm,
         job_id=job_id,
         payloads=rows,
     )
     _refresh_after_data_change(
         db=db,
-        source=source,
-        dataset_type=dataset_type,
+        source=source_norm,
+        dataset_type=dataset_norm,
         job_id=normalized_job_id,
         action="upload",
     )
@@ -433,9 +574,11 @@ async def upload_file(
     return {
         "deleted_rows": deleted_rows,
         "rows_inserted": inserted_rows,
-        "source": source,
-        "dataset_type": dataset_type,
+        "source": source_norm,
+        "dataset_type": dataset_norm,
         "job_id": normalized_job_id,
+        "normalization": normalize_meta,
+        "data_quality": quality_meta,
     }
 
 # ==================================================
@@ -455,12 +598,17 @@ def ingest_rows(
     current_user = Depends(get_current_user),
 ):
     cleaned_rows = [_clean_json_row(row) for row in payload.rows]
-    deleted_rows, inserted_rows, normalized_job_id = _overwrite_rows_for_source_dataset(
+    normalized_rows, normalize_meta = normalize_partner_rows(
+        cleaned_rows,
+        source=payload.source,
+        dataset_type=payload.dataset_type,
+    )
+    deleted_rows, inserted_rows, normalized_job_id, quality_meta = _overwrite_rows_for_source_dataset(
         db=db,
         source=payload.source,
         dataset_type=payload.dataset_type,
         job_id=payload.job_id,
-        payloads=cleaned_rows,
+        payloads=normalized_rows,
     )
     _refresh_after_data_change(
         db=db,
@@ -469,7 +617,13 @@ def ingest_rows(
         job_id=normalized_job_id,
         action="ingest",
     )
-    return {"deleted_rows": deleted_rows, "rows_inserted": inserted_rows, "job_id": normalized_job_id}
+    return {
+        "deleted_rows": deleted_rows,
+        "rows_inserted": inserted_rows,
+        "job_id": normalized_job_id,
+        "normalization": normalize_meta,
+        "data_quality": quality_meta,
+    }
 
 
 _FILE_COLUMN_ALIAS_TARGETS: dict[str, str] = {
@@ -1592,34 +1746,38 @@ def _detect_dataset_from_text(text: str) -> str | None:
         return None
     if any(token in low for token in ("claim", "loss ratio", "settlement", "paid out")):
         return "claims"
-    if any(token in low for token in ("sale", "premium", "units sold", "earning")):
+    if any(token in low for token in ("sale", "premium", "units sold", "earning", "pricing", "price", "mrp")):
+        return "sales"
+    pricing_tokens = ("plan price", "plan pricing", "price by", "pricing by", "uplift", "rate card")
+    if any(token in low for token in pricing_tokens):
         return "sales"
     return None
 
 
-def _resolve_chatbot_source(payload: ChatbotPayload) -> str:
-    explicit = _normalize_source_key(payload.source or "")
-    if explicit:
-        return explicit
-
+def _resolve_chatbot_source_with_origin(payload: ChatbotPayload) -> tuple[str, str]:
     from_message = _detect_source_from_text(payload.message)
     if from_message:
-        return from_message
+        return from_message, "message"
 
     for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
         if (turn.role or "").strip().lower() != "user":
             continue
         inferred = _detect_source_from_text(turn.content)
         if inferred:
-            return inferred
-    return ""
+            return inferred, "history"
+
+    explicit = _normalize_source_key(payload.source or "")
+    if explicit:
+        return explicit, "payload"
+    return "", "none"
+
+
+def _resolve_chatbot_source(payload: ChatbotPayload) -> str:
+    source, _ = _resolve_chatbot_source_with_origin(payload)
+    return source
 
 
 def _resolve_chatbot_dataset_type(payload: ChatbotPayload) -> str:
-    explicit = (payload.dataset_type or "").strip().lower()
-    if explicit in {"sales", "claims"}:
-        return explicit
-
     inferred = _detect_dataset_from_text(payload.message)
     if inferred:
         return inferred
@@ -1630,6 +1788,10 @@ def _resolve_chatbot_dataset_type(payload: ChatbotPayload) -> str:
         inferred = _detect_dataset_from_text(turn.content)
         if inferred:
             return inferred
+
+    explicit = (payload.dataset_type or "").strip().lower()
+    if explicit in {"sales", "claims"}:
+        return explicit
     return "sales"
 
 
@@ -1781,6 +1943,10 @@ def _requests_global_scope(text: str) -> bool:
     if not low:
         return False
     scope_phrases = (
+        "all partners",
+        "all partner",
+        "across all partners",
+        "across partners",
         "all sources",
         "across all sources",
         "across sources",
@@ -1797,6 +1963,49 @@ def _requests_global_scope(text: str) -> bool:
         "whole database",
     )
     return any(phrase in low for phrase in scope_phrases)
+
+
+def _needs_partner_specification_prompt(
+    *,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> bool:
+    if not bool(context_payload.get("global_scope")):
+        return False
+    if _detect_source_from_text(payload.message):
+        return False
+    if _requests_global_scope(payload.message):
+        return False
+    source_origin = str(context_payload.get("source_origin") or "").strip().lower()
+    return source_origin in {"", "none", "payload"}
+
+
+def _prepend_partner_scope_prompt(
+    answer: str,
+    *,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return text
+    if not _needs_partner_specification_prompt(payload=payload, context_payload=context_payload):
+        return text
+
+    allowed_labels = context_payload.get("allowed_labels") or []
+    partner_labels = [
+        str(label).strip()
+        for label in allowed_labels
+        if str(label).strip() and str(label).strip().lower() != "all sources"
+    ]
+    if not partner_labels:
+        partner_labels = ["Samsung Croma", "Samsung Vijay Sales", "Reliance ResQ", "Godrej"]
+    partner_preview = ", ".join(partner_labels[:4])
+    prefix = (
+        "Partner is not specified. I am sharing combined insights across all available partners. "
+        f"For a partner-specific answer, mention one partner ({partner_preview})."
+    )
+    return f"{prefix}\n{text}"
 
 
 def _chatbot_available_scopes(
@@ -2223,8 +2432,11 @@ def _build_chatbot_global_context(
     from_date: str | None,
     to_date: str | None,
     job_id: str | None,
+    dataset_type: str = "all",
+    source_origin: str = "none",
 ) -> tuple[str, dict[str, Any]]:
     scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+    selected_dataset = dataset_type if dataset_type in {"sales", "claims"} else "all"
     date_label = (
         f"{from_date or 'n/a'} to {to_date or 'n/a'}"
         if (from_date or to_date)
@@ -2234,7 +2446,8 @@ def _build_chatbot_global_context(
     context_payload: dict[str, Any] = {
         "source": "",
         "source_label": "All Sources",
-        "dataset_type": "all",
+        "dataset_type": selected_dataset,
+        "source_origin": source_origin,
         "job_id": job_id,
         "from_date": from_date,
         "to_date": to_date,
@@ -2246,6 +2459,7 @@ def _build_chatbot_global_context(
 
     context_lines = [
         "Scope mode: cross-source analytics context using dashboard summaries plus underlying dataset records.",
+        f"Selected dataset: {selected_dataset}",
         f"Selected date range: {date_label}",
     ]
     if job_id:
@@ -2571,32 +2785,37 @@ def _build_chatbot_dashboard_context(
     db: Session,
     payload: ChatbotPayload,
 ) -> tuple[str, dict[str, Any]]:
-    source = _resolve_chatbot_source(payload)
+    source, source_origin = _resolve_chatbot_source_with_origin(payload)
     dataset_type = _resolve_chatbot_dataset_type(payload)
     from_date, to_date = _normalize_chatbot_date_range(payload.from_date, payload.to_date)
     job_id = _normalize_chatbot_job_id(payload.job_id)
+    message_requests_global_scope = _requests_global_scope(payload.message)
+    should_use_global_scope = bool(message_requests_global_scope or not source or source_origin == "payload")
 
     context_payload: dict[str, Any] = {
         "source": source,
         "source_label": _source_display_name(source),
         "dataset_type": dataset_type,
+        "source_origin": source_origin,
         "job_id": job_id,
         "from_date": from_date,
         "to_date": to_date,
         "rankings": [],
         "allowed_labels": [],
         "requested_dimensions": [],
-        "global_scope": bool(payload.global_scope),
+        "global_scope": should_use_global_scope,
         "ui_context": payload.ui_context if isinstance(payload.ui_context, dict) else {},
     }
 
-    if payload.global_scope or not source or _requests_global_scope(payload.message):
+    if should_use_global_scope:
         return _build_chatbot_global_context(
             db=db,
             payload=payload,
             from_date=from_date,
             to_date=to_date,
             job_id=job_id,
+            dataset_type=dataset_type,
+            source_origin=source_origin,
         )
 
     summary = get_precomputed_summary(
@@ -2891,6 +3110,8 @@ _SAMSUNG_PLAN_REFERENCE_LINES: tuple[str, ...] = (
     "Samsung plan glossary: ADLD = Accidental Damage and Liquid Damage; SP/SPP = Screen Protection Plan; EW = Extended Warranty; CPP = Comprehensive Protection Plan; Combo = ADLD + EW.",
     "Samsung products/devices covered: smartphones, tablets, laptops, and smartwatches (subject to Samsung terms and channel eligibility in India).",
     "Coverage summary: ADLD covers accidental/liquid damage; SPP covers screen/display damage; EW covers mechanical and electrical breakdown; CPP covers accidental damage plus mechanical/electrical breakdown.",
+    "Samsung fixed Device Plan Category x Plan Category matrix is treated as Zopper Share reference (used for earned premium and zopper earned premium derivation when share columns are missing).",
+    "Samsung gross premium basis uses plan sold price fields (Plan Selling Price/Plan MRP/Amount mapped to gross premium columns).",
     "Claims process summary: login via registered mobile OTP on Samsung unified portal, open Raise Claim for active policy, submit issue/carry-in details, choose service center and visit slot, pay processing fee where applicable, then receive claim ID.",
 )
 
@@ -3213,16 +3434,24 @@ def _build_claim_average_answer(
     if total_claim_count <= 0:
         period_label = month_window[2] if month_window else "the selected period"
         if location_token and (city_columns_seen or state_columns_seen):
-            return (
+            return _prepend_partner_scope_prompt(
                 f"I can’t confirm average claim raised for {location_token.title()} in {period_label} from current matched rows. "
-                "Recommendation: standardize city values and keep a city-level filter in claims data to close this gap."
+                "Recommendation: standardize city values and keep a city-level filter in claims data to close this gap.",
+                payload=payload,
+                context_payload=context_payload,
             )
         if location_token:
-            return (
+            return _prepend_partner_scope_prompt(
                 f"I can’t confirm average claim raised for {location_token.title()} in {period_label} because city/state location fields are not consistently available in this claims slice. "
-                "Recommendation: add a normalized city column and make it mandatory at claim intake."
+                "Recommendation: add a normalized city column and make it mandatory at claim intake.",
+                payload=payload,
+                context_payload=context_payload,
             )
-        return "I don’t have enough claims rows in the selected scope to compute a reliable average claim."
+        return _prepend_partner_scope_prompt(
+            "I don’t have enough claims rows in the selected scope to compute a reliable average claim.",
+            payload=payload,
+            context_payload=context_payload,
+        )
 
     avg_claim = total_net_claims / total_claim_count if total_claim_count > 0 else 0.0
     scope_label = (
@@ -3254,7 +3483,11 @@ def _build_claim_average_answer(
 
     if total_rows > 0:
         answer += f" Rows used: {total_rows:,}."
-    return answer
+    return _prepend_partner_scope_prompt(
+        answer,
+        payload=payload,
+        context_payload=context_payload,
+    )
 
 
 _SAMSUNG_MODEL_TO_DEVICE_PLAN_CATEGORY: dict[str, str] = {
@@ -3587,13 +3820,6 @@ def _build_pricing_recommendation_answer(
     if not _is_pricing_query(payload.message):
         return None
 
-    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
-    if dataset_type != "sales":
-        return (
-            "Pricing recommendations are meaningful for sales datasets. "
-            "Please switch to sales scope or ask a claims-specific optimization question."
-        )
-
     from_date = context_payload.get("from_date")
     to_date = context_payload.get("to_date")
     job_id = context_payload.get("job_id")
@@ -3622,7 +3848,11 @@ def _build_pricing_recommendation_answer(
         context_payload=context_payload,
     )
     if samsung_manual_price_answer:
-        return samsung_manual_price_answer
+        return _prepend_partner_scope_prompt(
+            samsung_manual_price_answer,
+            payload=payload,
+            context_payload=context_payload,
+        )
 
     dimension_used = ""
     revenue_by_category: dict[str, float] = {}
@@ -3679,9 +3909,11 @@ def _build_pricing_recommendation_answer(
             break
 
     if not dimension_used:
-        return (
+        return _prepend_partner_scope_prompt(
             "I can analyze pricing only when category-level gross premium and quantity are available. "
-            "That split is not currently available in the selected dataset scope."
+            "That split is not currently available in the selected dataset scope.",
+            payload=payload,
+            context_payload=context_payload,
         )
 
     rows: list[dict[str, float | str]] = []
@@ -3702,9 +3934,11 @@ def _build_pricing_recommendation_answer(
         )
 
     if len(rows) < 2 or total_revenue <= 0:
-        return (
+        return _prepend_partner_scope_prompt(
             "I can analyze pricing only when category-level gross premium and quantity are available. "
-            "That split is not currently available in the selected dataset scope."
+            "That split is not currently available in the selected dataset scope.",
+            payload=payload,
+            context_payload=context_payload,
         )
 
     rows.sort(key=lambda item: float(item["revenue"]), reverse=True)
@@ -3751,7 +3985,11 @@ def _build_pricing_recommendation_answer(
     lines.append(
         "This is a revenue-side scenario. Share margin targets and expected volume elasticity to optimize exact category-wise price changes."
     )
-    return "\n".join(lines)
+    return _prepend_partner_scope_prompt(
+        "\n".join(lines),
+        payload=payload,
+        context_payload=context_payload,
+    )
 
 
 _FORECAST_MONTH_MAP: dict[str, int] = {
@@ -4114,11 +4352,19 @@ def _build_time_series_forecast_answer(
         scope_label = f"{context_payload.get('source_label') or _source_display_name(source)} {dataset_type}"
 
     if len(series) < 2:
-        return "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast."
+        return _prepend_partner_scope_prompt(
+            "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast.",
+            payload=payload,
+            context_payload=context_payload,
+        )
 
     forecast = _predict_next_month_value(series)
     if forecast is None:
-        return "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast."
+        return _prepend_partner_scope_prompt(
+            "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast.",
+            payload=payload,
+            context_payload=context_payload,
+        )
 
     last_month, last_value = series[-1]
     next_month = _next_month_start(last_month)
@@ -4133,11 +4379,13 @@ def _build_time_series_forecast_answer(
     if from_date or to_date:
         range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
 
-    return (
+    return _prepend_partner_scope_prompt(
         f"Directional forecast for {scope_label}{range_suffix}: "
         f"{_pretty_label(metric)} is most likely around {_format_metric_value(metric, float(forecast['projected']))} in {next_label}, "
         f"based on month-on-month trend from {history_start} to {last_label}. "
-        f"Latest observed value is {_format_metric_value(metric, last_value)} and recent momentum implies a {trend_word} of {abs(growth_pct):.1f}% MoM."
+        f"Latest observed value is {_format_metric_value(metric, last_value)} and recent momentum implies a {trend_word} of {abs(growth_pct):.1f}% MoM.",
+        payload=payload,
+        context_payload=context_payload,
     )
 
 
@@ -4890,13 +5138,21 @@ def chatbot_message(
     rule_based_answer = _build_underperformance_answer(payload.message, context_payload)
     if rule_based_answer:
         return {
-            "response": rule_based_answer,
+            "response": _prepend_partner_scope_prompt(
+                rule_based_answer,
+                payload=payload,
+                context_payload=context_payload,
+            ),
             "model": "rule-based-dashboard",
         }
     dimension_stats_answer = _build_dimension_stats_answer(payload.message, context_payload)
     if dimension_stats_answer:
         return {
-            "response": dimension_stats_answer,
+            "response": _prepend_partner_scope_prompt(
+                dimension_stats_answer,
+                payload=payload,
+                context_payload=context_payload,
+            ),
             "model": "rule-based-dashboard",
         }
 
@@ -4919,6 +5175,15 @@ def chatbot_message(
         "End with a complete final sentence and close any opened bracket.",
         "For forecasting questions, estimate next-month values only from monthly history in context and mark it as directional.",
         "Avoid repetitive templates across turns; vary phrasing while keeping the answer concise and factual.",
+        (
+            "Honor partner scope from the user query: if a partner is named, answer only for that partner; "
+            "if user asks for all partners/sources, include all available partners."
+        ),
+        (
+            "If partner is not specified and scope is cross-partner, first ask user to name a partner for drill-down "
+            "and still provide the combined all-partner answer."
+        ),
+        "If the user asks for sales or claims explicitly, follow the asked dataset even if UI context is on the other dataset.",
         (
             "Apply source-specific taxonomy and mappings. Do not use Samsung glossary, Samsung fixed price matrix, "
             "or Samsung model-code mapping unless the selected source is Samsung."
@@ -5075,6 +5340,12 @@ def chatbot_message(
             num_ctx=num_ctx,
             num_thread=num_thread,
         )
+
+    response_text = _prepend_partner_scope_prompt(
+        response_text,
+        payload=payload,
+        context_payload=context_payload,
+    )
 
     response_payload = {
         "response": response_text,

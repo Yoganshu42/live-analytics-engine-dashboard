@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   BarChart3,
   CircleDollarSign,
@@ -27,6 +27,10 @@ import { fetchMasterDashboard, type MasterDashboardResponse } from "@/app/lib/ap
 
 type Props = {
   jobId?: string | null
+  fromDate?: string
+  toDate?: string
+  refreshTick?: number
+  onDateRangeApply?: (nextFrom: string, nextTo: string) => void
 }
 
 type Summary = {
@@ -158,6 +162,9 @@ const axisMoney = (value: number) => {
 }
 
 const percent = (value: number) => `${value.toFixed(2)}%`
+
+const toRequestKey = (jobId: string | null | undefined, fromDate?: string, toDate?: string) =>
+  `${jobId || ""}|${fromDate || ""}|${toDate || ""}`
 
 const monthToLabel = (date: Date) =>
   date.toLocaleString("en-US", { month: "short" }) + "-" + String(date.getFullYear()).slice(2)
@@ -466,7 +473,13 @@ function KpiStrip({
   )
 }
 
-export default function MasterDashboardView({ jobId }: Props) {
+export default function MasterDashboardView({
+  jobId,
+  fromDate = "",
+  toDate = "",
+  refreshTick = 0,
+  onDateRangeApply,
+}: Props) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<MasterData | null>(null)
@@ -476,12 +489,22 @@ export default function MasterDashboardView({ jobId }: Props) {
   const [defaultToDate, setDefaultToDate] = useState("")
   const [draftFromDate, setDraftFromDate] = useState("")
   const [draftToDate, setDraftToDate] = useState("")
+  const [localRefreshTick, setLocalRefreshTick] = useState(0)
+  const lastAutoSyncKeyRef = useRef("")
 
   const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
   const maxPickerDate = useMemo(
-    () => (defaultToDate && defaultToDate > todayIso ? defaultToDate : todayIso),
+    () => (defaultToDate ? (defaultToDate > todayIso ? todayIso : defaultToDate) : todayIso),
     [defaultToDate, todayIso]
   )
+  const orderedExternalRange = useMemo(() => {
+    const nextFrom = (fromDate || "").trim()
+    const nextTo = (toDate || "").trim()
+    if (nextFrom && nextTo && nextFrom > nextTo) {
+      return { from: nextTo, to: nextFrom }
+    }
+    return { from: nextFrom, to: nextTo }
+  }, [fromDate, toDate])
 
   const loadMasterData = useCallback(
     async (
@@ -521,22 +544,25 @@ export default function MasterDashboardView({ jobId }: Props) {
     let isCancelled = false
 
     const bootstrap = async () => {
-      const payload = await loadMasterData()
+      const payload = await loadMasterData(undefined, todayIso)
       if (isCancelled || !payload) {
         return
       }
       const min = String(payload.date_bounds?.min_date || "").trim()
-      const maxRaw = String(payload.date_bounds?.max_date || "").trim()
-      const max = maxRaw && maxRaw <= todayIso ? maxRaw : todayIso
+      const max = todayIso
       const effectiveMin = min
 
       setDefaultFromDate(effectiveMin)
       setDefaultToDate(max)
-      setDraftFromDate(effectiveMin)
-      setDraftToDate(max)
+      const nextFrom = orderedExternalRange.from || effectiveMin
+      const nextTo = orderedExternalRange.to || max
+      const defaultRequestKey = toRequestKey(jobId, nextFrom || undefined, nextTo || undefined)
+      lastAutoSyncKeyRef.current = `${defaultRequestKey}|${refreshTick}|${localRefreshTick}`
+      setDraftFromDate(nextFrom)
+      setDraftToDate(nextTo)
 
-      if (effectiveMin || max) {
-        void loadMasterData(effectiveMin || undefined, max || undefined, { silent: true })
+      if ((orderedExternalRange.from || orderedExternalRange.to) && (nextFrom !== effectiveMin || nextTo !== max)) {
+        void loadMasterData(nextFrom || undefined, nextTo || undefined, { silent: true })
       }
     }
 
@@ -547,7 +573,48 @@ export default function MasterDashboardView({ jobId }: Props) {
     return () => {
       isCancelled = true
     }
-  }, [jobId, todayIso, loadMasterData])
+  }, [jobId, todayIso, loadMasterData, orderedExternalRange.from, orderedExternalRange.to, refreshTick, localRefreshTick])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const handleRefresh = () => {
+      setLocalRefreshTick((prev) => prev + 1)
+    }
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === "dashboard_data_refresh_at") {
+        handleRefresh()
+      }
+    }
+    window.addEventListener("dashboard-data-refreshed", handleRefresh as EventListener)
+    window.addEventListener("storage", handleStorage)
+    return () => {
+      window.removeEventListener("dashboard-data-refreshed", handleRefresh as EventListener)
+      window.removeEventListener("storage", handleStorage)
+    }
+  }, [])
+
+  useEffect(() => {
+    const nextFrom = orderedExternalRange.from || defaultFromDate
+    const nextTo = orderedExternalRange.to || defaultToDate || todayIso
+    if (!nextFrom && !nextTo) return
+    const requestKey = toRequestKey(jobId, nextFrom || undefined, nextTo || undefined)
+    const syncKey = `${requestKey}|${refreshTick}|${localRefreshTick}`
+    if (syncKey === lastAutoSyncKeyRef.current) return
+    setDraftFromDate(nextFrom)
+    setDraftToDate(nextTo)
+    lastAutoSyncKeyRef.current = syncKey
+    void loadMasterData(nextFrom || undefined, nextTo || undefined, { silent: true })
+  }, [
+    jobId,
+    orderedExternalRange.from,
+    orderedExternalRange.to,
+    defaultFromDate,
+    defaultToDate,
+    todayIso,
+    refreshTick,
+    localRefreshTick,
+    loadMasterData,
+  ])
 
   const handleApplyDateRange = async (nextFromRaw: string, nextToRaw: string) => {
     const nextFrom = (nextFromRaw || "").trim()
@@ -556,12 +623,18 @@ export default function MasterDashboardView({ jobId }: Props) {
     const orderedTo = nextFrom && nextTo && nextFrom > nextTo ? nextFrom : nextTo
     setDraftFromDate(orderedFrom)
     setDraftToDate(orderedTo)
+    if (onDateRangeApply) {
+      onDateRangeApply(orderedFrom, orderedTo)
+    }
     await loadMasterData(orderedFrom || undefined, orderedTo || undefined)
   }
 
   const handleResetDateRange = async () => {
     setDraftFromDate(defaultFromDate)
     setDraftToDate(defaultToDate)
+    if (onDateRangeApply) {
+      onDateRangeApply(defaultFromDate, defaultToDate)
+    }
     await loadMasterData(defaultFromDate || undefined, defaultToDate || undefined)
   }
 

@@ -6,6 +6,9 @@ import threading
 import time
 from typing import Any
 
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models.precomputed_analytics import (
@@ -19,6 +22,11 @@ _precomputed_cache_lock = threading.Lock()
 _graph_cache: dict[tuple[str, ...], tuple[float, list[dict[str, Any]]]] = {}
 _summary_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
 _insights_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+
+
+def _is_postgres_session(db: Session) -> bool:
+    bind = db.get_bind()
+    return bool(bind is not None and getattr(bind.dialect, "name", "") == "postgresql")
 
 
 def _normalize_key(value: str | None) -> str:
@@ -304,45 +312,80 @@ def upsert_precomputed_graph(
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> None:
+    source_key = _normalize_key(source)
+    dataset_key = _normalize_key(dataset_type)
+    job_key = _normalize_job_key(job_id)
+    dimension_key = _normalize_key(dimension)
+    metric_key = _normalize_key(metric)
+    bucket_key = _normalize_optional(bucket)
+    from_key = _normalize_optional(from_date)
+    to_key = _normalize_optional(to_date)
     filters = (
         *_base_filters(PrecomputedGraph, source, dataset_type, job_id),
-        PrecomputedGraph.dimension == _normalize_key(dimension),
-        PrecomputedGraph.metric == _normalize_key(metric),
-        PrecomputedGraph.bucket == _normalize_optional(bucket),
-        PrecomputedGraph.from_date == _normalize_optional(from_date),
-        PrecomputedGraph.to_date == _normalize_optional(to_date),
+        PrecomputedGraph.dimension == dimension_key,
+        PrecomputedGraph.metric == metric_key,
+        PrecomputedGraph.bucket == bucket_key,
+        PrecomputedGraph.from_date == from_key,
+        PrecomputedGraph.to_date == to_key,
     )
-    obj = db.query(PrecomputedGraph).filter(*filters).first()
     payload = rows if isinstance(rows, list) else []
-    if obj is None:
-        obj = PrecomputedGraph(
-            source=_normalize_key(source),
-            dataset_type=_normalize_key(dataset_type),
-            job_key=_normalize_job_key(job_id),
-            dimension=_normalize_key(dimension),
-            metric=_normalize_key(metric),
-            bucket=_normalize_optional(bucket),
-            from_date=_normalize_optional(from_date),
-            to_date=_normalize_optional(to_date),
-            rows=payload,
+    if _is_postgres_session(db):
+        stmt = (
+            pg_insert(PrecomputedGraph)
+            .values(
+                source=source_key,
+                dataset_type=dataset_key,
+                job_key=job_key,
+                dimension=dimension_key,
+                metric=metric_key,
+                bucket=bucket_key,
+                from_date=from_key,
+                to_date=to_key,
+                rows=payload,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    "source",
+                    "dataset_type",
+                    "job_key",
+                    "dimension",
+                    "metric",
+                    "bucket",
+                    "from_date",
+                    "to_date",
+                ],
+                set_={
+                    "rows": payload,
+                    "updated_at": func.now(),
+                },
+            )
         )
-        db.add(obj)
-        # SessionLocal uses autoflush=False; flush immediately so subsequent
-        # upsert queries in the same transaction can see this row.
-        db.flush()
-        cache_key = _graph_cache_key(
-            source=source,
-            dataset_type=dataset_type,
-            job_id=job_id,
-            dimension=dimension,
-            metric=metric,
-            bucket=bucket,
-            from_date=from_date,
-            to_date=to_date,
-        )
-        _cache_set_list(_graph_cache, cache_key, payload)
-        return None
-    obj.rows = payload
+        db.execute(stmt)
+    else:
+        obj = db.query(PrecomputedGraph).filter(*filters).first()
+        if obj is None:
+            obj = PrecomputedGraph(
+                source=source_key,
+                dataset_type=dataset_key,
+                job_key=job_key,
+                dimension=dimension_key,
+                metric=metric_key,
+                bucket=bucket_key,
+                from_date=from_key,
+                to_date=to_key,
+                rows=payload,
+            )
+            db.add(obj)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                obj = db.query(PrecomputedGraph).filter(*filters).first()
+                if obj is not None:
+                    obj.rows = payload
+        else:
+            obj.rows = payload
+
     cache_key = _graph_cache_key(
         source=source,
         dataset_type=dataset_type,
@@ -405,36 +448,65 @@ def upsert_precomputed_summary(
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> None:
+    source_key = _normalize_key(source)
+    dataset_key = _normalize_key(dataset_type)
+    job_key = _normalize_job_key(job_id)
+    from_key = _normalize_optional(from_date)
+    to_key = _normalize_optional(to_date)
     filters = (
         *_base_filters(PrecomputedSummary, source, dataset_type, job_id),
-        PrecomputedSummary.from_date == _normalize_optional(from_date),
-        PrecomputedSummary.to_date == _normalize_optional(to_date),
+        PrecomputedSummary.from_date == from_key,
+        PrecomputedSummary.to_date == to_key,
     )
-    obj = db.query(PrecomputedSummary).filter(*filters).first()
     payload = summary if isinstance(summary, dict) else {}
-    if obj is None:
-        obj = PrecomputedSummary(
-            source=_normalize_key(source),
-            dataset_type=_normalize_key(dataset_type),
-            job_key=_normalize_job_key(job_id),
-            from_date=_normalize_optional(from_date),
-            to_date=_normalize_optional(to_date),
-            summary=payload,
+    if _is_postgres_session(db):
+        stmt = (
+            pg_insert(PrecomputedSummary)
+            .values(
+                source=source_key,
+                dataset_type=dataset_key,
+                job_key=job_key,
+                from_date=from_key,
+                to_date=to_key,
+                summary=payload,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    "source",
+                    "dataset_type",
+                    "job_key",
+                    "from_date",
+                    "to_date",
+                ],
+                set_={
+                    "summary": payload,
+                    "updated_at": func.now(),
+                },
+            )
         )
-        db.add(obj)
-        # SessionLocal uses autoflush=False; flush immediately so subsequent
-        # upsert queries in the same transaction can see this row.
-        db.flush()
-        cache_key = _summary_cache_key(
-            source=source,
-            dataset_type=dataset_type,
-            job_id=job_id,
-            from_date=from_date,
-            to_date=to_date,
-        )
-        _cache_set_dict(_summary_cache, cache_key, payload)
-        return None
-    obj.summary = payload
+        db.execute(stmt)
+    else:
+        obj = db.query(PrecomputedSummary).filter(*filters).first()
+        if obj is None:
+            obj = PrecomputedSummary(
+                source=source_key,
+                dataset_type=dataset_key,
+                job_key=job_key,
+                from_date=from_key,
+                to_date=to_key,
+                summary=payload,
+            )
+            db.add(obj)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                obj = db.query(PrecomputedSummary).filter(*filters).first()
+                if obj is not None:
+                    obj.summary = payload
+        else:
+            obj.summary = payload
+
     cache_key = _summary_cache_key(
         source=source,
         dataset_type=dataset_type,

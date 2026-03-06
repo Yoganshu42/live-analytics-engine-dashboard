@@ -3,14 +3,19 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react"
 import { Shield } from "lucide-react"
 import {
+  applyAdminFilterFile,
+  AdminFilterAnalyzeResponse,
   AdminFileItem,
   AdminUser,
+  analyzeAdminFilterFile,
   createAdminUser,
   deleteAdminFile,
   deleteAdminUser,
+  filterAndDownloadAdminFile,
   downloadAdminFile,
   fetchAdminFiles,
   fetchAdminUsers,
+  revertAdminFilterApply,
   updateAdminFile,
   updateAdminUserPassword,
 } from "@/app/lib/api"
@@ -20,7 +25,20 @@ type Props = {
   compact?: boolean
 }
 
-type AdminSection = "data" | "users"
+type AdminSection = "data" | "users" | "filter"
+
+function notifyDashboardDataRefresh() {
+  if (typeof window === "undefined") return
+  const refreshedAt = new Date().toISOString()
+  localStorage.setItem("dashboard_data_refresh_at", refreshedAt)
+  window.dispatchEvent(
+    new CustomEvent("dashboard-data-refreshed", {
+      detail: {
+        refreshedAt,
+      },
+    })
+  )
+}
 
 export default function AdminFileAccess({ isAdmin, compact = false }: Props) {
   const [open, setOpen] = useState(false)
@@ -80,10 +98,17 @@ export default function AdminFileAccess({ isAdmin, compact = false }: Props) {
               >
                 Create User
               </button>
+              <button
+                type="button"
+                onClick={() => setSection("filter")}
+                className={`rounded-lg px-3 py-2 text-xs font-bold ${section === "filter" ? "bg-indigo-600 text-white" : "border border-slate-300 bg-white text-slate-700"}`}
+              >
+                Filter File
+              </button>
             </div>
 
             <div className="flex-1 overflow-auto p-5">
-              {section === "data" ? <DataUpdationPanel /> : <UserManagementPanel />}
+              {section === "data" ? <DataUpdationPanel /> : section === "users" ? <UserManagementPanel /> : <FilterFilePanel />}
             </div>
           </div>
         </div>
@@ -108,7 +133,7 @@ function DataUpdationPanel() {
 
   const refreshDashboard = useCallback(() => {
     if (typeof window === "undefined") return
-    localStorage.setItem("dashboard_data_refresh_at", new Date().toISOString())
+    notifyDashboardDataRefresh()
     window.setTimeout(() => {
       window.location.reload()
     }, 350)
@@ -329,7 +354,7 @@ function UserManagementPanel() {
 
   const refreshDashboard = useCallback(() => {
     if (typeof window === "undefined") return
-    localStorage.setItem("dashboard_data_refresh_at", new Date().toISOString())
+    notifyDashboardDataRefresh()
     window.setTimeout(() => {
       window.location.reload()
     }, 350)
@@ -521,6 +546,361 @@ function UserManagementPanel() {
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+function FilterFilePanel() {
+  const [source, setSource] = useState("samsung")
+  const [datasetType, setDatasetType] = useState<"sales" | "claims">("sales")
+  const [outputFormat, setOutputFormat] = useState<"csv" | "xlsx">("csv")
+  const [jobId, setJobId] = useState("")
+  const [applyToDb, setApplyToDb] = useState(false)
+  const [file, setFile] = useState<File | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [message, setMessage] = useState("")
+  const [error, setError] = useState("")
+  const [analysis, setAnalysis] = useState<AdminFilterAnalyzeResponse | null>(null)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [analysisError, setAnalysisError] = useState("")
+  const [lastRevisionId, setLastRevisionId] = useState<number | null>(null)
+  const [applyLoading, setApplyLoading] = useState(false)
+
+  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "reliance", "godrej"], [])
+
+  const refreshDashboard = useCallback(() => {
+    if (!applyToDb || typeof window === "undefined") return
+    notifyDashboardDataRefresh()
+    window.setTimeout(() => {
+      window.location.reload()
+    }, 350)
+  }, [applyToDb])
+
+  const triggerAutoRefresh = useCallback((delayMs: number = 1800) => {
+    if (typeof window === "undefined") return
+    window.setTimeout(() => {
+      window.location.reload()
+    }, delayMs)
+  }, [])
+
+  const handleManualRefresh = useCallback(() => {
+    if (typeof window === "undefined") return
+    notifyDashboardDataRefresh()
+    window.location.reload()
+  }, [])
+
+  const handleAnalyze = useCallback(async () => {
+    if (!file) {
+      setAnalysisError("Select a file before running AI analysis.")
+      return
+    }
+    setAnalysisLoading(true)
+    setAnalysisError("")
+    try {
+      const result = await analyzeAdminFilterFile({
+        file,
+        source,
+        dataset_type: datasetType,
+      })
+      setAnalysis(result)
+      setMessage(result.ai_mapping?.message || "AI analysis completed.")
+    } catch (err) {
+      setAnalysis(null)
+      setAnalysisError(err instanceof Error ? err.message : "Failed to analyze file")
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }, [file, source, datasetType])
+
+  const handleRevert = useCallback(async () => {
+    setError("")
+    setMessage("")
+    try {
+      const res = await revertAdminFilterApply({
+        source,
+        dataset_type: datasetType,
+        job_id: jobId || undefined,
+        revision_id: lastRevisionId || undefined,
+      })
+      setMessage(`Reverted filter apply (revision ${res.revision_id}). Restored ${res.rows_inserted} rows.`)
+      setLastRevisionId(null)
+      if (typeof window !== "undefined") {
+        notifyDashboardDataRefresh()
+      }
+      triggerAutoRefresh(350)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to revert previous apply")
+    }
+  }, [source, datasetType, jobId, lastRevisionId, triggerAutoRefresh])
+
+  const handleApplyChangesToDb = useCallback(async () => {
+    if (!file) {
+      setError("Select a file to apply filtered changes into DB.")
+      return
+    }
+    setApplyLoading(true)
+    setError("")
+    setMessage("")
+    try {
+      const res = await applyAdminFilterFile({
+        file,
+        source,
+        dataset_type: datasetType,
+        job_id: jobId || undefined,
+      })
+      setLastRevisionId(res.revision_id ? Number(res.revision_id) : null)
+      setMessage(res.summary || `Applied ${res.rows_inserted} rows to database.`)
+      if (typeof window !== "undefined") {
+        notifyDashboardDataRefresh()
+      }
+      triggerAutoRefresh(500)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to apply filtered data to DB"
+      setError(msg)
+      if (msg.includes("HTTP 504")) {
+        setMessage("Request timed out while applying changes. Auto-refreshing page to sync latest state.")
+        triggerAutoRefresh(1800)
+      }
+    } finally {
+      setApplyLoading(false)
+    }
+  }, [file, source, datasetType, jobId, triggerAutoRefresh])
+
+  const handleFilterDownload = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    if (!file) {
+      setError("Select a file to filter")
+      return
+    }
+
+    setSubmitting(true)
+    setError("")
+    setMessage("")
+    try {
+      const { blob, filename, summary, revision_id } = await filterAndDownloadAdminFile({
+        file,
+        source,
+        dataset_type: datasetType,
+        output_format: outputFormat,
+        apply_to_db: applyToDb,
+        job_id: jobId || undefined,
+      })
+
+      const href = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = href
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(href)
+
+      setMessage(summary || `Downloaded ${filename}`)
+      setLastRevisionId(revision_id || null)
+      if (applyToDb) {
+        refreshDashboard()
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to filter and download file"
+      setError(msg)
+      if (msg.includes("HTTP 504")) {
+        setMessage("Filtering request timed out. Auto-refreshing page now to keep latest state.")
+        triggerAutoRefresh(1800)
+      }
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  useEffect(() => {
+    setAnalysis(null)
+    setAnalysisError("")
+    setLastRevisionId(null)
+  }, [source, datasetType, jobId, file])
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+      <div className="mb-3 flex items-start justify-between gap-2">
+        <div>
+          <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-700">Filter File And Download</h3>
+          <p className="mt-1 text-[10px] text-slate-500">
+            Applies smart partner mapping (columns, plan/device taxonomy, city-state normalization) and downloads filtered output.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={handleManualRefresh}
+          className="rounded border border-slate-300 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100"
+        >
+          Refresh
+        </button>
+      </div>
+
+      <form onSubmit={handleFilterDownload} className="space-y-2">
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+          <select
+            value={source}
+            onChange={(e) => setSource(e.target.value)}
+            className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+          >
+            {knownSources.map((src) => (
+              <option key={src} value={src}>
+                {src}
+              </option>
+            ))}
+          </select>
+          <select
+            value={datasetType}
+            onChange={(e) => setDatasetType(e.target.value as "sales" | "claims")}
+            className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+          >
+            <option value="sales">sales</option>
+            <option value="claims">claims</option>
+          </select>
+        </div>
+
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+          <select
+            value={outputFormat}
+            onChange={(e) => setOutputFormat(e.target.value as "csv" | "xlsx")}
+            className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+          >
+            <option value="csv">csv</option>
+            <option value="xlsx">xlsx</option>
+          </select>
+          <input
+            type="text"
+            value={jobId}
+            onChange={(e) => setJobId(e.target.value)}
+            placeholder="job_id tag (optional)"
+            className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+          />
+        </div>
+
+        <label className="flex items-center gap-2 text-[11px] text-slate-700">
+          <input
+            type="checkbox"
+            checked={applyToDb}
+            onChange={(e) => setApplyToDb(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          Apply filtered rows to database immediately
+        </label>
+
+        <input
+          type="file"
+          accept=".csv,.xlsx,.xls"
+          onChange={(e) => setFile(e.target.files?.[0] || null)}
+          className="w-full text-[11px] text-slate-600 file:mr-2 file:rounded file:border file:border-slate-300 file:bg-white file:px-2 file:py-1 file:text-[10px] file:font-semibold"
+        />
+
+        <button
+          type="submit"
+          disabled={submitting}
+          className="w-full rounded bg-indigo-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {submitting ? "Filtering..." : "Filter & Download"}
+        </button>
+
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+          <button
+            type="button"
+            onClick={handleAnalyze}
+            disabled={analysisLoading}
+            className="w-full rounded border border-slate-300 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {analysisLoading ? "Analyzing..." : "Analyze File With AI"}
+          </button>
+          <button
+            type="button"
+            onClick={handleRevert}
+            className="w-full rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-[11px] font-semibold text-amber-800 hover:bg-amber-100"
+          >
+            Revert Last Apply
+          </button>
+        </div>
+      </form>
+
+      {error && <p className="mt-2 text-[10px] font-semibold text-red-600">{error}</p>}
+      {message && <p className="mt-2 text-[10px] font-semibold text-emerald-700">{message}</p>}
+      {analysisError && <p className="mt-2 text-[10px] font-semibold text-red-600">{analysisError}</p>}
+
+      {analysis && (
+        <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-[11px] font-bold uppercase tracking-wider text-slate-700">AI Filter Diagnostics</h4>
+            <button
+              type="button"
+              onClick={handleApplyChangesToDb}
+              disabled={applyLoading || !file}
+              className="rounded border border-indigo-300 bg-indigo-50 px-2 py-1 text-[10px] font-bold text-indigo-700 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {applyLoading ? "Applying..." : "Apply Changes & Add To DB"}
+            </button>
+          </div>
+          <p className="mt-1 text-[10px] text-slate-600">
+            Coverage: {analysis.mapping_quality.required_found}/{analysis.mapping_quality.required_total} required fields
+            {" "}({Math.round((analysis.mapping_quality.coverage || 0) * 100)}%)
+          </p>
+          <p className="mt-1 text-[10px] text-slate-600">
+            Primary key: {analysis.key_detection.primary_key_name}
+            {analysis.key_detection.key_column ? ` via ${analysis.key_detection.key_column}` : " via fallback hash"}
+          </p>
+          <p className="mt-1 text-[10px] text-slate-600">
+            Candidate key columns: {(analysis.key_detection.key_candidates || []).slice(0, 6).join(", ") || "none"}
+          </p>
+
+          <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+            <div className="rounded border border-red-100 bg-red-50 p-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-red-700">What Is Wrong</div>
+              {analysis.issues.length ? (
+                <ul className="mt-1 space-y-1 text-[10px] text-red-800">
+                  {analysis.issues.map((item, idx) => (
+                    <li key={`issue-${idx}`}>- {item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 text-[10px] text-emerald-700">No blocking issue detected.</p>
+              )}
+            </div>
+            <div className="rounded border border-emerald-100 bg-emerald-50 p-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Changes AI Will Make</div>
+              <ul className="mt-1 space-y-1 text-[10px] text-emerald-800">
+                {analysis.planned_changes.map((item, idx) => (
+                  <li key={`plan-${idx}`}>- {item}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+            <div className="rounded border border-slate-200 bg-slate-50 p-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-slate-700">Right Mappings</div>
+              {analysis.right_mappings.length ? (
+                <ul className="mt-1 space-y-1 text-[10px] text-slate-700">
+                  {analysis.right_mappings.slice(0, 6).map((item, idx) => (
+                    <li key={`right-${idx}`}>- {item.field}: {item.column} ({Math.round((item.confidence || 0) * 100)}%)</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 text-[10px] text-slate-500">No high-confidence mappings yet.</p>
+              )}
+            </div>
+            <div className="rounded border border-slate-200 bg-slate-50 p-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-slate-700">Wrong / Low Confidence</div>
+              {analysis.wrong_mappings.length ? (
+                <ul className="mt-1 space-y-1 text-[10px] text-slate-700">
+                  {analysis.wrong_mappings.slice(0, 6).map((item, idx) => (
+                    <li key={`wrong-${idx}`}>- {item.field}: {item.issue || "Needs review"}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-1 text-[10px] text-emerald-700">No missing required mapping found.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

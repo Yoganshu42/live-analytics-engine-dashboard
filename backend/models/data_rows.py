@@ -11,4 +11,6 @@ class DataRow(Base):
     job_id = Column(String, index=True)
     source = Column(String, index=True)        # samsung / reliance / godrej
     dataset_type = Column(String, index=True)  # sales / claims
+    record_key = Column(String, index=True)
+    primary_key_name = Column(String, index=True)
     data = Column(JSON)                         # raw row data

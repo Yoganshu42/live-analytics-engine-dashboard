@@ -8,9 +8,9 @@ from sqlalchemy.orm import Session
 
 from authentication.deps import get_current_user
 from db.deps import get_db
-from services.deck_cache_service import get_or_generate_cached_partner_deck_pptx
-from services.deck_pptx_service import (
-    build_partner_deck_preview,
+from services.deck_cache_service import (
+    get_or_generate_cached_partner_deck_pptx,
+    get_or_generate_cached_partner_deck_preview,
 )
 
 router = APIRouter(
@@ -37,7 +37,7 @@ def preview_partner_deck(
     db: Session = Depends(get_db),
 ):
     try:
-        items = build_partner_deck_preview(
+        items = get_or_generate_cached_partner_deck_preview(
             db=db,
             partners=_parse_partners(partners),
             dataset_type=dataset_type,

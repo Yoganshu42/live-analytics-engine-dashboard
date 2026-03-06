@@ -66,6 +66,7 @@ DEVICE_PLAN_CATEGORY_ORDER = [
     "Luxury Flip",
     "Luxury Fold",
 ]
+PLAN_CATEGORY_ORDER = ["SP", "COMBO", "ADLD", "EW"]
 
 BACKGROUND_HEX = "EFEFEF"
 TITLE_HEX = "1B2246"
@@ -79,6 +80,7 @@ CARD_BG_HEX = "F5F7FA"
 SLIDE_WIDTH_IN = 13.33
 SLIDE_HEIGHT_IN = 7.5
 SLIDE_SAFE_MARGIN_IN = 0.18
+TABLE_BOTTOM_SAFE_IN = 6.95
 
 
 @dataclass
@@ -276,6 +278,7 @@ def _build_partner_preview_item(*, db: Session, scope: DeckScope) -> dict[str, A
     state_points = _merge_metric_points(
         _to_primary_points(state_gross_rows, "state", state_metric),
         _to_points(state_qty_rows, "state", "quantity"),
+        dimension="state",
     )
     state_points = sorted(state_points, key=lambda item: item.get("gross_premium", 0.0), reverse=True)[:8]
 
@@ -303,10 +306,11 @@ def _build_partner_preview_item(*, db: Session, scope: DeckScope) -> dict[str, A
         product_points = _merge_metric_points(
             _to_primary_points(product_gross_rows, "model_code", product_metric),
             _to_points(product_qty_rows, "model_code", "quantity"),
+            dimension="model_code",
         )
         product_points = sorted(product_points, key=lambda item: item.get("gross_premium", 0.0), reverse=True)[:8]
 
-    trend_points = _merge_metric_points(gross_points, quantity_points)
+    trend_points = _merge_metric_points(gross_points, quantity_points, dimension=trend_dimension)
     insights = _build_trend_insights(gross_rows, trend_dimension, gross_metric)
 
     return {
@@ -465,6 +469,7 @@ def _build_month_trend_points(*, db: Session, scope: DeckScope) -> list[dict[str
     month_points = _merge_metric_points(
         _to_primary_points(gross_rows, "month", gross_metric),
         _to_points(qty_rows, "month", "quantity"),
+        dimension="month",
     )
     if len(month_points) > 6:
         month_points = month_points[-6:]
@@ -495,6 +500,7 @@ def _build_dimension_points(*, db: Session, scope: DeckScope, dimension: str) ->
     points = _merge_metric_points(
         _to_primary_points(gross_rows, dimension, gross_metric),
         _to_points(qty_rows, dimension, "quantity"),
+        dimension=dimension,
     )
     if dimension == "device_plan_category":
         points = sorted(
@@ -533,6 +539,7 @@ def _build_state_points_full(*, db: Session, scope: DeckScope) -> list[dict[str,
     points = _merge_metric_points(
         _to_primary_points(gross_rows, "state", gross_metric),
         _to_points(qty_rows, "state", "quantity"),
+        dimension="state",
     )
     points = sorted(points, key=lambda item: item.get("gross_premium", 0.0), reverse=True)
     return _normalize_preview_rows(points, max_rows=20)
@@ -584,16 +591,16 @@ def _add_analysis_slide(
             slide,
             points=[(str(item.get("label") or ""), _to_float(item.get("gross_premium"))) for item in chart_rows],
             title=table_title,
-            top_in=6.16,
-            max_height_in=1.18,
-            max_rows=4,
+            top_in=6.06,
+            max_height_in=0.94,
+            max_rows=3,
         )
 
 
-def _build_asp_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_asp_points(rows: list[dict[str, Any]], *, dimension: str) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for row in rows:
-        label = str(row.get("label") or "").strip()
+        label = _canonical_dimension_label(str(row.get("label") or "").strip(), dimension)
         if not label:
             continue
         gross = _to_float(row.get("gross_premium"))
@@ -601,8 +608,14 @@ def _build_asp_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if qty <= 0:
             continue
         output.append({"label": label, "asp": gross / qty, "gross_premium": gross, "quantity": qty})
-    if len(output) > 8:
-        output = output[-8:]
+    if dimension == "plan_category":
+        order_map = {label: idx for idx, label in enumerate(PLAN_CATEGORY_ORDER)}
+        output = sorted(output, key=lambda row: (order_map.get(str(row.get("label") or ""), 99), -_to_float(row.get("asp"))))
+    elif dimension == "device_plan_category":
+        order_map = {label: idx for idx, label in enumerate(DEVICE_PLAN_CATEGORY_ORDER)}
+        output = sorted(output, key=lambda row: (order_map.get(str(row.get("label") or ""), 99), -_to_float(row.get("asp"))))
+    if len(output) > 10:
+        output = output[:10]
     return output
 
 
@@ -614,8 +627,8 @@ def _add_asp_dual_category_slide(
     device_rows: list[dict[str, Any]],
     title: str,
 ) -> None:
-    plan_asp_rows = _build_asp_points(plan_rows)[:8]
-    device_asp_rows = _build_asp_points(device_rows)[:8]
+    plan_asp_rows = _build_asp_points(plan_rows, dimension="plan_category")[:8]
+    device_asp_rows = _build_asp_points(device_rows, dimension="device_plan_category")[:8]
     if not plan_asp_rows and not device_asp_rows:
         return
 
@@ -649,8 +662,8 @@ def _add_asp_dual_category_slide(
             points=[(str(item.get("label") or ""), _to_float(item.get("asp"))) for item in left_rows],
             title="ASP by Plan Category",
             top_in=6.06,
-            max_height_in=1.14,
-            max_rows=3,
+            max_height_in=0.90,
+            max_rows=2,
         )
 
 
@@ -704,8 +717,8 @@ def _add_product_model_dual_slide(
             points=[(str(item.get("label") or ""), _to_float(item.get("gross_premium"))) for item in chart_rows[:5]],
             title="Top Product Model values",
             top_in=6.06,
-            max_height_in=1.14,
-            max_rows=3,
+            max_height_in=0.90,
+            max_rows=2,
         )
 
 
@@ -1066,7 +1079,12 @@ def _add_compact_table_summary(
     title_p.font.size = Pt(8.6)
     title_p.font.bold = True
     title_p.font.color.rgb = RGBColor.from_string("4A586F")
-    max_bottom_in = SLIDE_HEIGHT_IN - SLIDE_SAFE_MARGIN_IN
+    max_bottom_in = min(TABLE_BOTTOM_SAFE_IN, SLIDE_HEIGHT_IN - SLIDE_SAFE_MARGIN_IN)
+    min_total_height_in = title_height_in + gap_in + (row_height_in * 2)
+    max_top_in = max(SLIDE_SAFE_MARGIN_IN, max_bottom_in - min_total_height_in)
+    if safe_top > max_top_in:
+        safe_top = max_top_in
+
     table_top_in = safe_top + title_height_in + gap_in
     available_height_in = max(0.22, max_bottom_in - table_top_in)
 
@@ -1284,12 +1302,20 @@ def _fetch_samsung_week_rows(
     if df is None or df.empty:
         return []
 
-    date_col = _pick_first_column(df, WEEK_DATE_COLUMNS)
-    if date_col is None:
-        return []
-
     frame = df.copy()
-    frame["_week_date"] = _parse_date_like_series(frame[date_col])
+    coalesced_week_date = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    for candidate in WEEK_DATE_COLUMNS:
+        col = candidate if candidate in frame.columns else _pick_first_column(frame, [candidate])
+        if col is None or col not in frame.columns:
+            continue
+        parsed = _parse_date_like_series(frame[col])
+        if parsed.isna().all():
+            continue
+        coalesced_week_date = coalesced_week_date.where(coalesced_week_date.notna(), parsed)
+        if coalesced_week_date.notna().all():
+            break
+
+    frame["_week_date"] = coalesced_week_date
     frame = frame[frame["_week_date"].notna()].copy()
     if frame.empty:
         return []
@@ -1579,8 +1605,13 @@ def _add_data_table(
         width_in=width_in,
         height_in=max(max_height_in, min_total_height_in),
     )
+    max_bottom_in = min(TABLE_BOTTOM_SAFE_IN, SLIDE_HEIGHT_IN - SLIDE_SAFE_MARGIN_IN)
+    max_allowed_height = max(0.2, max_bottom_in - safe_top)
+    if safe_max_height > max_allowed_height:
+        safe_max_height = max_allowed_height
     if safe_max_height < min_total_height_in:
-        safe_max_height = min_total_height_in
+        safe_top = max(SLIDE_SAFE_MARGIN_IN, max_bottom_in - min_total_height_in)
+        safe_max_height = max(0.2, max_bottom_in - safe_top)
 
     table_top_in = safe_top + title_height_in + gap_in
     available_table_height_in = max(0.14, safe_max_height - (title_height_in + gap_in))
@@ -1643,7 +1674,7 @@ def _style_table_cell(cell, *, bold: bool = False, align_right: bool = False) ->
     fill.fore_color.rgb = RGBColor.from_string("F6F6F6" if bold else "FFFFFF")
     tf = cell.text_frame
     for paragraph in tf.paragraphs:
-        paragraph.font.size = Pt(8.2)
+        paragraph.font.size = Pt(7.8)
         paragraph.font.bold = bold
         paragraph.font.color.rgb = RGBColor.from_string(TEXT_HEX)
         paragraph.alignment = PP_ALIGN.RIGHT if align_right else PP_ALIGN.LEFT
@@ -1784,7 +1815,13 @@ def _render_mom_vertical_split_chart_image(
     )
 
     ax1.set_xticks(x)
-    ax1.set_xticklabels([_short_label(label, max_len=14) for label in labels], fontsize=8)
+    rotate_x = 16 if max((len(str(label or "")) for label in labels), default=0) > 12 else 0
+    ax1.set_xticklabels(
+        [_short_label(label, max_len=14) for label in labels],
+        fontsize=8,
+        rotation=rotate_x,
+        ha="right" if rotate_x else "center",
+    )
     ax1.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _axis_money_tick(value)))
     ax2.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _axis_quantity_tick(value)))
     ax1.set_ylabel(primary_label, fontsize=8, color="#4A586F")
@@ -1796,7 +1833,7 @@ def _render_mom_vertical_split_chart_image(
     gross_max = max(gross, default=0.0)
     qty_max = max(quantity, default=0.0)
     ax1.set_ylim(0, gross_max * 1.22 if gross_max > 0 else 1.0)
-    ax2.set_ylim(0, qty_max * 1.28 if qty_max > 0 else 1.0)
+    ax2.set_ylim(0, qty_max * 1.4 if qty_max > 0 else 1.0)
     ax1.set_xlim(-0.5, (len(labels) - 0.5) + 0.24)
 
     for side in ("top", "right"):
@@ -1840,14 +1877,17 @@ def _render_mom_vertical_split_chart_image(
     for idx, value in enumerate(quantity):
         if value <= 0:
             continue
+        label_y = value + (qty_max * 0.04 if qty_max > 0 else 0.0)
+        label_y = min(label_y, ax2.get_ylim()[1] * 0.98)
         ax2.text(
             line_x[idx],
-            value,
+            label_y,
             _format_quantity_number(value),
             ha="center",
             va="bottom",
             fontsize=7,
             color=f"#{SECONDARY_HEX}",
+            bbox={"boxstyle": "round,pad=0.12", "facecolor": "#EFEFEF", "edgecolor": "none", "alpha": 0.95},
         )
 
     image = BytesIO()
@@ -1954,11 +1994,18 @@ def _render_asp_chart_image(rows: list[dict[str, Any]], *, dimension: str, title
     ax.set_facecolor("#F5F7FA")
 
     x = list(range(len(labels)))
+    max_asp = max(asp_values, default=0.0)
+    zero_floor = max(max_asp * 0.015, 0.2) if max_asp > 0 else 0.2
     if dimension in {"month", "week"}:
         ax.plot(x, asp_values, color=f"#{SECONDARY_HEX}", marker="o", linewidth=2.2, markersize=4.5, zorder=3)
         ax.fill_between(x, asp_values, color=f"#{SECONDARY_HEX}", alpha=0.12, zorder=2)
     else:
-        ax.bar(x, asp_values, color=f"#{SECONDARY_HEX}", width=0.62, zorder=2)
+        display_values = [value if value > 0 else zero_floor for value in asp_values]
+        bars = ax.bar(x, display_values, color=f"#{SECONDARY_HEX}", width=0.62, zorder=2)
+        for idx, bar in enumerate(bars):
+            if asp_values[idx] > 0:
+                continue
+            bar.set_alpha(0.35)
 
     ax.set_xticks(x)
     ax.set_xticklabels([_short_label(label, max_len=14) for label in labels], fontsize=9, color="#4A5B74")
@@ -1967,6 +2014,8 @@ def _render_asp_chart_image(rows: list[dict[str, Any]], *, dimension: str, title
     ax.tick_params(axis="y", labelsize=9, colors="#4A5B74")
     ax.grid(axis="y", linestyle=(0, (3, 3)), linewidth=0.7, alpha=0.28, zorder=1)
     ax.set_title(title, fontsize=10, fontweight="bold", color=f"#{TITLE_HEX}", loc="left", pad=6)
+    y_max = max(max(asp_values, default=0.0), zero_floor) * 1.2
+    ax.set_ylim(0, y_max if y_max > 0 else 1.0)
 
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
@@ -1974,12 +2023,12 @@ def _render_asp_chart_image(rows: list[dict[str, Any]], *, dimension: str, title
     ax.spines["bottom"].set_alpha(0.3)
 
     for idx, value in enumerate(asp_values):
-        if value <= 0:
-            continue
+        label_value = value if value > 0 else 0.0
+        label_y = value if value > 0 else (max(max_asp * 0.04, 0.15))
         ax.text(
             x[idx],
-            value,
-            _compact_number(value),
+            label_y,
+            _compact_number(label_value),
             ha="center",
             va="bottom",
             fontsize=7,
@@ -2072,7 +2121,14 @@ def _render_combo_chart_image(rows: list[dict[str, Any]], *, primary_label: str 
     bars = ax1.bar(x, gross, color=f"#{ACCENT_HEX}", width=0.64, label=primary_label, zorder=2)
     ax1.grid(axis="y", linestyle=(0, (3, 3)), linewidth=0.7, alpha=0.28, zorder=1)
     ax1.set_xticks(x)
-    ax1.set_xticklabels([_short_label(label, max_len=14) for label in labels], fontsize=9, color="#4A5B74")
+    rotate_x = 16 if max((len(str(label or "")) for label in labels), default=0) > 12 else 0
+    ax1.set_xticklabels(
+        [_short_label(label, max_len=14) for label in labels],
+        fontsize=9,
+        color="#4A5B74",
+        rotation=rotate_x,
+        ha="right" if rotate_x else "center",
+    )
     ax1.yaxis.set_major_formatter(FuncFormatter(lambda value, _: _axis_money_tick(value)))
     ax1.set_ylabel(primary_label, fontsize=8.5, color="#4A5B74")
     ax1.tick_params(axis="y", labelsize=9, colors="#4A5B74")
@@ -2093,7 +2149,7 @@ def _render_combo_chart_image(rows: list[dict[str, Any]], *, primary_label: str 
     gross_max = max(gross, default=0.0)
     qty_max = max(quantity, default=0.0)
     ax1.set_ylim(0, gross_max * 1.2 if gross_max > 0 else 1.0)
-    ax2.set_ylim(0, qty_max * 1.28 if qty_max > 0 else 1.0)
+    ax2.set_ylim(0, qty_max * 1.4 if qty_max > 0 else 1.0)
     ax1.set_xlim(-0.5, (len(labels) - 0.5) + 0.24)
 
     legend_handles = [
@@ -2128,14 +2184,17 @@ def _render_combo_chart_image(rows: list[dict[str, Any]], *, primary_label: str 
     for idx, value in enumerate(quantity):
         if value <= 0:
             continue
+        label_y = value + (qty_max * 0.04 if qty_max > 0 else 0.0)
+        label_y = min(label_y, ax2.get_ylim()[1] * 0.98)
         ax2.text(
             line_x[idx],
-            value,
+            label_y,
             _format_quantity_number(value),
             ha="center",
             va="bottom",
             fontsize=7.2,
             color=f"#{SECONDARY_HEX}",
+            bbox={"boxstyle": "round,pad=0.12", "facecolor": "#F5F7FA", "edgecolor": "none", "alpha": 0.95},
         )
 
     image = BytesIO()
@@ -2159,26 +2218,34 @@ def _build_asp_insights(rows: list[dict[str, Any]], dimension: str) -> list[str]
         delta = latest - prev
         pct = (delta / prev * 100.0) if prev else 0.0
         direction = "up" if delta >= 0 else "down"
-        insights.append(f"Recent ASP trend: {latest_label} is {direction} by {_compact_number(abs(delta))} ({pct:+.1f}%) vs {prev_label}.")
+        insights.append(
+            f"In the latest period ({latest_label}), ASP moved {direction} by {_compact_number(abs(delta))} ({pct:+.1f}%) versus {prev_label}, indicating the most recent pricing direction."
+        )
 
         first_label, first = points[0]
         overall_dir = "increasing" if latest >= first else "softening"
-        insights.append(f"Overall ASP trend: {overall_dir} from {first_label} to {latest_label}.")
+        insights.append(
+            f"Across the selected date range, ASP is {overall_dir}, moving from {first_label} to {latest_label}."
+        )
 
     max_label, max_value = max(points, key=lambda item: item[1])
     min_label, min_value = min(points, key=lambda item: item[1])
-    insights.append(f"Highest ASP: {max_label} at {_compact_number(max_value)}; lowest ASP: {min_label} at {_compact_number(min_value)}.")
+    insights.append(
+        f"The highest ASP bucket is {max_label} at {_compact_number(max_value)}, while {min_label} is lowest at {_compact_number(min_value)}, showing the spread across categories."
+    )
 
     values = [value for _, value in points]
     avg = sum(values) / len(values)
     spread = max(values) - min(values)
-    insights.append(f"Average ASP is {_compact_number(avg)} with spread {_compact_number(spread)}.")
+    insights.append(
+        f"Average ASP stands at {_compact_number(avg)}, with an overall spread of {_compact_number(spread)} between the highest and lowest buckets."
+    )
 
     ordered = sorted(points, key=lambda item: item[1], reverse=True)
     top = ", ".join(label for label, _ in ordered[:3])
     bottom = ", ".join(label for label, _ in ordered[-3:]) if len(ordered) >= 3 else top
-    insights.append(f"Top ASP buckets: {top}.")
-    insights.append(f"Bottom ASP buckets: {bottom}.")
+    insights.append(f"Top ASP contributors are {top}.")
+    insights.append(f"Lower ASP contributors are {bottom}.")
     return insights[:7]
 
 
@@ -2202,50 +2269,58 @@ def _build_trend_insights(
         pct = (delta / prev_value * 100.0) if prev_value else 0.0
         direction = "up" if delta >= 0 else "down"
         insights.append(
-            f"Recent trend: {latest_label} is {direction} by {_compact_number(abs(delta))} ({pct:+.1f}%) vs {prev_label}."
+            f"In the latest period ({latest_label}), {display_metric} moved {direction} by {_compact_number(abs(delta))} ({pct:+.1f}%) versus {prev_label}, which defines the immediate trend shift."
         )
 
         first_label, first_value = points[0]
         overall_delta = latest_value - first_value
         overall_dir = "increasing" if overall_delta >= 0 else "softening"
         insights.append(
-            f"Overall trend: {display_metric} is {overall_dir} from {first_label} to {latest_label}."
+            f"Across the full selected timeline, {display_metric} is {overall_dir}, shifting from {first_label} to {latest_label}."
         )
     else:
         max_label, max_value = max(points, key=lambda item: item[1])
         min_label, min_value = min(points, key=lambda item: item[1])
         insights.append(
-            f"Top drilldown: {max_label} at {_compact_number(max_value)}; bottom drilldown: {min_label} at {_compact_number(min_value)}."
+            f"The leading drilldown is {max_label} at {_compact_number(max_value)}, while {min_label} remains at the lower end with {_compact_number(min_value)}."
         )
-        insights.append("Overall trend: drilldown spread indicates clear concentration in top contributors.")
+        if min_value > 0:
+            ratio = max_value / min_value
+            insights.append(
+                f"The top bucket contributes about {ratio:.1f}x the lowest bucket, indicating visible concentration in a few high-performing segments."
+            )
+        else:
+            insights.append("Contribution is highly skewed, with top segments carrying most of the selected metric.")
 
     sorted_points = sorted(points, key=lambda item: item[1], reverse=True)
     top_three = ", ".join(str(label) for label, _ in sorted_points[:3])
     bottom_three = ", ".join(str(label) for label, _ in sorted_points[-3:]) if len(sorted_points) >= 3 else top_three
-    insights.append(f"Top contributors: {top_three}.")
-    insights.append(f"Bottom contributors: {bottom_three}.")
+    insights.append(f"The top contributors are {top_three}.")
+    insights.append(f"The comparatively weaker contributors are {bottom_three}.")
 
     values = [v for _, v in points]
     avg = sum(values) / len(values)
     volatility = (max(values) - min(values)) if values else 0.0
     insights.append(
-        f"Trend point: average {display_metric} is {_compact_number(avg)} with spread {_compact_number(volatility)}."
+        f"Average {display_metric} is {_compact_number(avg)}, with a spread of {_compact_number(volatility)} from peak to trough."
     )
 
     if len(values) >= 3:
         top_total = sum(sorted(values, reverse=True)[:3])
         total = sum(values) or 1.0
         share = top_total / total * 100.0
-        insights.append(f"Concentration: top 3 buckets contribute {share:.1f}% of total {display_metric}.")
+        insights.append(f"The top 3 buckets together contribute {share:.1f}% of total {display_metric}.")
 
         median = float(pd.Series(values).median())
-        insights.append(f"Midpoint: median {display_metric} is {_compact_number(median)}.")
+        insights.append(f"The median bucket value for {display_metric} is {_compact_number(median)}.")
 
     if dimension in {"month", "week"} and len(values) >= 4:
         lead = sum(values[-2:]) / 2.0
         base = sum(values[:2]) / 2.0
         change = ((lead - base) / base * 100.0) if base else 0.0
-        insights.append(f"Momentum: latest periods are {change:+.1f}% versus the earliest baseline periods.")
+        insights.append(
+            f"Momentum check: recent periods are {change:+.1f}% versus the earliest baseline periods in the selected range."
+        )
 
     return insights[:7]
 
@@ -2282,22 +2357,80 @@ def _to_points(rows: list[dict[str, Any]], dimension: str, metric: str) -> list[
     return out
 
 
+def _canonical_plan_category_label(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text:
+        return ""
+    if "combo" in text:
+        return "COMBO"
+    if "adld" in text or "accidental" in text or "liquid" in text:
+        return "ADLD"
+    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text:
+        return "SP"
+    if re.search(r"\bew\b", text) or "extended warranty" in text or text.startswith("ew"):
+        return "EW"
+    return str(value or "").strip()
+
+
+def _canonical_device_plan_category_label(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text:
+        return ""
+    if "luxury" in text and "fold" in text:
+        return "Luxury Fold"
+    if "luxury" in text and "flip" in text:
+        return "Luxury Flip"
+    if "fold" in text:
+        return "Luxury Fold"
+    if "flip" in text:
+        return "Luxury Flip"
+    if "super" in text and "premium" in text:
+        return "Super Premium"
+    if text.startswith("premium") or ("premium" in text and "super" not in text):
+        return "Premium"
+    if text.startswith("high") or text == "high":
+        return "High"
+    if text.startswith("mid") or text == "mid":
+        return "Mid"
+    if text.startswith("mass") or text == "mass":
+        return "Mass"
+    return str(value or "").strip()
+
+
+def _canonical_dimension_label(label: str, dimension: str | None) -> str:
+    dim_key = _safe_key(str(dimension or ""))
+    raw = str(label or "").strip()
+    if not raw:
+        return ""
+    if dim_key == "plan_category":
+        return _canonical_plan_category_label(raw)
+    if dim_key == "device_plan_category":
+        return _canonical_device_plan_category_label(raw)
+    return raw
+
+
 def _merge_metric_points(
     gross_points: list[tuple[str, float]],
     quantity_points: list[tuple[str, float]],
+    *,
+    dimension: str | None = None,
 ) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     order: list[str] = []
 
     for label, value in gross_points:
-        key = str(label)
+        key = _canonical_dimension_label(str(label), dimension)
+        if not key:
+            continue
         if key not in merged:
             merged[key] = {"label": key, "gross_premium": 0.0, "quantity": 0.0}
             order.append(key)
         merged[key]["gross_premium"] = _to_float(value)
 
     for label, value in quantity_points:
-        key = str(label)
+        key = _canonical_dimension_label(str(label), dimension)
+        if not key:
+            continue
         if key not in merged:
             merged[key] = {"label": key, "gross_premium": 0.0, "quantity": 0.0}
             order.append(key)
