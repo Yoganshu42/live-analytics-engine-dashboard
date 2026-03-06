@@ -408,25 +408,39 @@ def _build_filter_ai_diagnostics(
     missing_keys = int(key_meta.get("missing_key_values") or 0)
     strategy = str(key_meta.get("strategy") or "composite_hash")
     key_column = key_meta.get("key_column")
+    key_columns = [
+        str(value).strip()
+        for value in (key_meta.get("key_columns") or [])
+        if str(value).strip()
+    ]
+    key_columns_text = ", ".join(key_columns[:4])
 
     issues: list[str] = []
     if required_total > 0 and required_found < required_total:
         issues.append(f"AI mapping found {required_found}/{required_total} required fields.")
-    if strategy != "natural_column":
-        issues.append("No reliable Plan ID / Claim ID column detected, so composite row hash key will be used.")
+    if strategy == "composite_hash":
+        issues.append(
+            "No reliable unique business key was detected, so fallback row hash matching will be used. "
+            "If row values change between uploads, DB may add new rows instead of merging."
+        )
+    elif strategy == "composite_candidate_columns" and key_columns_text:
+        issues.append(f"Rows will be matched using a composite business key built from: {key_columns_text}.")
     if missing_keys > 0:
         issues.append(f"{missing_keys} rows have blank values in the detected primary key column.")
     if duplicates > 0:
-        issues.append(f"{duplicates} duplicate rows detected in file for the same record key.")
+        issues.append(f"{duplicates} rows share the same detected business key with another row in this file.")
 
     planned_changes: list[str] = [
         f"Smart mapping fills canonical columns for {int((smart_meta or {}).get('applied') or 0)} fields.",
         f"Normalization will touch {int(normalize_meta.get('columns_touched') or 0)} columns to align partner schema.",
-        f"Data quality stage keeps {int(key_meta.get('rows_out') or 0)} rows from {int(key_meta.get('rows_in') or 0)} input rows.",
-        f"Primary key strategy: {strategy} ({'column ' + str(key_column) if key_column else 'fallback composite key'}).",
+        f"Record-key staging keeps {int(key_meta.get('rows_out') or 0)} rows from {int(key_meta.get('rows_in') or 0)} input rows.",
+        (
+            f"Primary key strategy: {strategy} "
+            f"({'column ' + str(key_column) if key_column else ('columns ' + key_columns_text if key_columns_text else 'fallback composite key')})."
+        ),
     ]
     if duplicates > 0:
-        planned_changes.append(f"Duplicate records removed in-file: {duplicates}.")
+        planned_changes.append(f"Duplicate business keys preserved as separate row instances: {duplicates} extra row(s).")
 
     return {
         "mapping_quality": {
@@ -437,6 +451,7 @@ def _build_filter_ai_diagnostics(
         "key_detection": {
             "primary_key_name": key_meta.get("primary_key_name"),
             "key_column": key_column,
+            "key_columns": key_columns,
             "strategy": strategy,
             "key_candidates": key_meta.get("key_candidates") or [],
             "missing_key_values": missing_keys,
@@ -447,6 +462,60 @@ def _build_filter_ai_diagnostics(
         "wrong_mappings": wrong_mappings,
         "issues": issues,
         "planned_changes": planned_changes,
+    }
+
+
+def _build_existing_row_match_preview(
+    db: Session,
+    *,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    storage_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    scoped_query = _apply_tag_filter(db.query(DataRow.id), source, dataset_type, job_id)
+    rows_in_scope = int(scoped_query.count() or 0)
+
+    incoming_keys = [
+        str(item.get("record_key") or "").strip()
+        for item in storage_rows
+        if isinstance(item, dict) and str(item.get("record_key") or "").strip()
+    ]
+    unique_incoming_keys = list(dict.fromkeys(incoming_keys))
+    if not unique_incoming_keys:
+        return {
+            "rows_in_scope": rows_in_scope,
+            "existing_rows_matched": 0,
+            "new_rows_detected": 0,
+            "match_ratio": 0.0,
+        }
+
+    existing_keys: set[str] = set()
+    chunk_size = 2000
+    for offset in range(0, len(unique_incoming_keys), chunk_size):
+        chunk = unique_incoming_keys[offset : offset + chunk_size]
+        query = db.query(DataRow.record_key).filter(
+            DataRow.source == source,
+            DataRow.dataset_type == dataset_type,
+            DataRow.record_key.in_(chunk),
+        )
+        if job_id is None:
+            query = query.filter(DataRow.job_id.is_(None))
+        else:
+            query = query.filter(DataRow.job_id == job_id)
+        for (record_key,) in query.all():
+            key = str(record_key or "").strip()
+            if key:
+                existing_keys.add(key)
+
+    existing_rows_matched = sum(1 for key in incoming_keys if key in existing_keys)
+    new_rows_detected = max(0, len(incoming_keys) - existing_rows_matched)
+    match_ratio = (existing_rows_matched / max(len(incoming_keys), 1)) if incoming_keys else 0.0
+    return {
+        "rows_in_scope": rows_in_scope,
+        "existing_rows_matched": int(existing_rows_matched),
+        "new_rows_detected": int(new_rows_detected),
+        "match_ratio": round(float(match_ratio), 4),
     }
 
 
@@ -853,9 +922,12 @@ async def analyze_filter_file(
     file: UploadFile = File(...),
     source: str = Form(...),
     dataset_type: str = Form(...),
+    job_id: str | None = Form(None),
+    db: Session = Depends(get_db),
 ):
     source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
+    job_norm = _normalize(job_id)
     if source_norm is None or dataset_norm is None:
         raise HTTPException(status_code=400, detail="source and dataset_type are required")
     if dataset_norm not in {"sales", "claims"}:
@@ -877,23 +949,32 @@ async def analyze_filter_file(
         dataset_type=dataset_norm,
     )
     payloads = dataframe_to_payload_rows(normalized_df)
-    _, key_meta = prepare_rows_for_storage(payloads, source=source_norm, dataset_type=dataset_norm)
+    storage_rows, key_meta = prepare_rows_for_storage(payloads, source=source_norm, dataset_type=dataset_norm)
     diagnostics = _build_filter_ai_diagnostics(
         suggestion=suggestion,
         normalize_meta=normalize_meta,
         key_meta=key_meta,
+    )
+    db_match = _build_existing_row_match_preview(
+        db,
+        source=source_norm,
+        dataset_type=dataset_norm,
+        job_id=job_norm,
+        storage_rows=storage_rows,
     )
 
     return {
         "file_name": file.filename or "",
         "source": source_norm,
         "dataset_type": dataset_norm,
+        "job_id": job_norm,
         "rows_in": int(len(raw_df)),
         "rows_after_filter": int(key_meta.get("rows_out") or 0),
         "ai_mapping": {
             "message": suggestion.get("message"),
             "can_reverse_map": bool(suggestion.get("can_reverse_map")),
         },
+        "db_match": db_match,
         **diagnostics,
         "primary_key_candidates": get_primary_key_candidate_order(
             source=source_norm,
@@ -1074,13 +1155,14 @@ async def filter_and_apply_file(
         "job_id": job_norm,
         "deleted_rows": int(replaced_rows),
         "rows_inserted": int(inserted_rows),
+        "rows_updated": int(quality_meta.get("updated_rows") or 0),
         "revision_id": int(revision_id) if revision_id is not None else None,
         "normalization": normalize_meta,
         "data_quality": quality_meta,
         "key_detection": key_meta,
         "summary": (
             f"Applied filtered dataset to DB for {source_norm}:{dataset_norm}. "
-            f"Rows inserted {int(inserted_rows)} after dedupe."
+            f"New rows {int(inserted_rows)}, existing rows updated {int(quality_meta.get('updated_rows') or 0)}."
         ),
     }
 
@@ -1124,6 +1206,7 @@ async def filter_and_download_file(
 
     replaced_rows = 0
     inserted_rows = int(len(filtered_payloads))
+    updated_rows = 0
     revision_id: int | None = None
     if apply_to_db:
         _validate_payload_schema(
@@ -1140,7 +1223,7 @@ async def filter_and_download_file(
             ).all()
         )
         before_snapshot = _snapshot_rows(before_rows)
-        replaced_rows, inserted_rows, _ = _replace_tag_rows(
+        replaced_rows, inserted_rows, quality_meta = _replace_tag_rows(
             db,
             source=source_norm,
             dataset_type=dataset_norm,
@@ -1148,6 +1231,7 @@ async def filter_and_download_file(
             payloads=filtered_payloads,
             mode="merge",
         )
+        updated_rows = int(quality_meta.get("updated_rows") or 0)
         revision_id = _save_filter_revision(
             db,
             source=source_norm,
@@ -1174,10 +1258,14 @@ async def filter_and_download_file(
         f"Filtered {len(filtered_payloads)} rows for {source_norm}:{dataset_norm}. "
         f"Smart mapping applied {int((normalize_meta.get('smart_mapping') or {}).get('applied', 0))} fields. "
         f"Columns touched {int(normalize_meta.get('columns_touched') or 0)}. "
-        f"Primary key strategy {key_meta.get('strategy')}, key field {key_meta.get('key_column') or key_meta.get('primary_key_name')}."
+        f"Primary key strategy {key_meta.get('strategy')}, key field "
+        f"{key_meta.get('key_column') or ', '.join(key_meta.get('key_columns') or []) or key_meta.get('primary_key_name')}."
     )
     if apply_to_db:
-        summary += f" Merged into database: {int(inserted_rows)} new rows added, {int(replaced_rows)} rows deleted."
+        summary += (
+            f" Merged into database: {int(inserted_rows)} new rows added, "
+            f"{int(updated_rows)} existing rows updated."
+        )
 
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',

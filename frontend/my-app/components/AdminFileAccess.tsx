@@ -16,6 +16,7 @@ import {
   fetchAdminFiles,
   fetchAdminUsers,
   revertAdminFilterApply,
+  transformChatbotFile,
   updateAdminFile,
   updateAdminUserPassword,
 } from "@/app/lib/api"
@@ -38,6 +39,20 @@ function notifyDashboardDataRefresh() {
       },
     })
   )
+}
+
+const FILTER_AI_INSTRUCTION_EXAMPLES = [
+  "keep rows from 2025-01-01 to 2025-03-31",
+  "keep only rows for Jan 2026",
+  "fill missing Plan Category with ADLD",
+  "remove duplicates from column Policy Number",
+]
+
+function inferTransformOutputFormat(file: File): "csv" | "xlsx" | undefined {
+  const name = String(file.name || "").trim().toLowerCase()
+  if (name.endsWith(".csv")) return "csv"
+  if (name.endsWith(".xlsx") || name.endsWith(".xls")) return "xlsx"
+  return undefined
 }
 
 export default function AdminFileAccess({ isAdmin, compact = false }: Props) {
@@ -565,6 +580,8 @@ function FilterFilePanel() {
   const [analysisError, setAnalysisError] = useState("")
   const [lastRevisionId, setLastRevisionId] = useState<number | null>(null)
   const [applyLoading, setApplyLoading] = useState(false)
+  const [aiInstruction, setAiInstruction] = useState("")
+  const [instructionSummary, setInstructionSummary] = useState("")
 
   const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "reliance", "godrej"], [])
 
@@ -589,6 +606,27 @@ function FilterFilePanel() {
     window.location.reload()
   }, [])
 
+  const prepareFileForWorkflow = useCallback(async (currentFile: File) => {
+    const trimmedInstruction = aiInstruction.trim()
+    if (!trimmedInstruction) {
+      setInstructionSummary("")
+      return currentFile
+    }
+
+    const transformed = await transformChatbotFile({
+      file: currentFile,
+      instruction: trimmedInstruction,
+      source,
+      dataset_type: datasetType,
+      output_format: inferTransformOutputFormat(currentFile),
+    })
+    setInstructionSummary(transformed.summary || "AI instruction applied to uploaded file.")
+    return new File([transformed.blob], transformed.filename || currentFile.name, {
+      type: transformed.blob.type || currentFile.type,
+      lastModified: Date.now(),
+    })
+  }, [aiInstruction, datasetType, source])
+
   const handleAnalyze = useCallback(async () => {
     if (!file) {
       setAnalysisError("Select a file before running AI analysis.")
@@ -597,10 +635,12 @@ function FilterFilePanel() {
     setAnalysisLoading(true)
     setAnalysisError("")
     try {
+      const preparedFile = await prepareFileForWorkflow(file)
       const result = await analyzeAdminFilterFile({
-        file,
+        file: preparedFile,
         source,
         dataset_type: datasetType,
+        job_id: jobId || undefined,
       })
       setAnalysis(result)
       setMessage(result.ai_mapping?.message || "AI analysis completed.")
@@ -610,7 +650,7 @@ function FilterFilePanel() {
     } finally {
       setAnalysisLoading(false)
     }
-  }, [file, source, datasetType])
+  }, [file, source, datasetType, jobId, prepareFileForWorkflow])
 
   const handleRevert = useCallback(async () => {
     setError("")
@@ -642,8 +682,9 @@ function FilterFilePanel() {
     setError("")
     setMessage("")
     try {
+      const preparedFile = await prepareFileForWorkflow(file)
       const res = await applyAdminFilterFile({
-        file,
+        file: preparedFile,
         source,
         dataset_type: datasetType,
         job_id: jobId || undefined,
@@ -664,7 +705,7 @@ function FilterFilePanel() {
     } finally {
       setApplyLoading(false)
     }
-  }, [file, source, datasetType, jobId, triggerAutoRefresh])
+  }, [file, source, datasetType, jobId, triggerAutoRefresh, prepareFileForWorkflow])
 
   const handleFilterDownload = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -677,8 +718,9 @@ function FilterFilePanel() {
     setError("")
     setMessage("")
     try {
+      const preparedFile = await prepareFileForWorkflow(file)
       const { blob, filename, summary, revision_id } = await filterAndDownloadAdminFile({
-        file,
+        file: preparedFile,
         source,
         dataset_type: datasetType,
         output_format: outputFormat,
@@ -716,7 +758,8 @@ function FilterFilePanel() {
     setAnalysis(null)
     setAnalysisError("")
     setLastRevisionId(null)
-  }, [source, datasetType, jobId, file])
+    setInstructionSummary("")
+  }, [source, datasetType, jobId, file, aiInstruction])
 
   return (
     <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -794,6 +837,35 @@ function FilterFilePanel() {
           className="w-full text-[11px] text-slate-600 file:mr-2 file:rounded file:border file:border-slate-300 file:bg-white file:px-2 file:py-1 file:text-[10px] file:font-semibold"
         />
 
+        <div className="rounded border border-slate-200 bg-white p-2">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-700">AI Instructions (Optional)</div>
+          <p className="mt-1 text-[10px] text-slate-500">
+            Applied before analysis and DB upsert. Use this to keep a period, remove duplicates, or fill missing fields.
+          </p>
+          <textarea
+            value={aiInstruction}
+            onChange={(e) => setAiInstruction(e.target.value)}
+            placeholder="Example: keep rows from 2025-01-01 to 2025-03-31"
+            rows={3}
+            className="mt-2 w-full rounded border border-slate-300 bg-white px-2 py-1.5 text-[11px] text-slate-700 outline-none ring-indigo-500 focus:border-indigo-300 focus:ring-2"
+          />
+          <div className="mt-2 flex flex-wrap gap-1">
+            {FILTER_AI_INSTRUCTION_EXAMPLES.map((example) => (
+              <button
+                key={example}
+                type="button"
+                onClick={() => setAiInstruction(example)}
+                className="rounded-full border border-cyan-200 bg-cyan-50 px-2 py-1 text-[10px] font-semibold text-cyan-800 hover:bg-cyan-100"
+              >
+                {example}
+              </button>
+            ))}
+          </div>
+          {instructionSummary && (
+            <p className="mt-2 text-[10px] font-semibold text-cyan-700">{instructionSummary}</p>
+          )}
+        </div>
+
         <button
           type="submit"
           disabled={submitting}
@@ -835,7 +907,7 @@ function FilterFilePanel() {
               disabled={applyLoading || !file}
               className="rounded border border-indigo-300 bg-indigo-50 px-2 py-1 text-[10px] font-bold text-indigo-700 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {applyLoading ? "Applying..." : "Apply Changes & Add To DB"}
+              {applyLoading ? "Applying..." : "Apply Changes & Upsert To DB"}
             </button>
           </div>
           <p className="mt-1 text-[10px] text-slate-600">
@@ -843,12 +915,36 @@ function FilterFilePanel() {
             {" "}({Math.round((analysis.mapping_quality.coverage || 0) * 100)}%)
           </p>
           <p className="mt-1 text-[10px] text-slate-600">
+            Uploaded rows: {analysis.rows_in} | Rows prepared for DB: {analysis.rows_after_filter}
+          </p>
+          <p className="mt-1 text-[10px] text-slate-600">
             Primary key: {analysis.key_detection.primary_key_name}
-            {analysis.key_detection.key_column ? ` via ${analysis.key_detection.key_column}` : " via fallback hash"}
+            {analysis.key_detection.key_column
+              ? ` via ${analysis.key_detection.key_column}`
+              : analysis.key_detection.key_columns?.length
+                ? ` via ${analysis.key_detection.key_columns.join(", ")}`
+                : " via fallback hash"}
           </p>
           <p className="mt-1 text-[10px] text-slate-600">
             Candidate key columns: {(analysis.key_detection.key_candidates || []).slice(0, 6).join(", ") || "none"}
           </p>
+          {analysis.db_match && (
+            <div className="mt-2 rounded border border-blue-100 bg-blue-50 p-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-blue-700">DB Match Preview</div>
+              <div className="mt-1 text-[10px] text-blue-900">
+                Existing rows in scope: {analysis.db_match.rows_in_scope} | Matched existing rows: {analysis.db_match.existing_rows_matched} | New rows: {analysis.db_match.new_rows_detected}
+              </div>
+              <div className="mt-1 text-[10px] text-blue-800">
+                Match ratio: {Math.round((analysis.db_match.match_ratio || 0) * 100)}%
+              </div>
+            </div>
+          )}
+          {aiInstruction.trim() && (
+            <div className="mt-2 rounded border border-cyan-100 bg-cyan-50 p-2 text-[10px] text-cyan-900">
+              <div className="font-bold uppercase tracking-wider text-cyan-800">Active AI Instruction</div>
+              <div className="mt-1 whitespace-pre-wrap">{aiInstruction.trim()}</div>
+            </div>
+          )}
 
           <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
             <div className="rounded border border-red-100 bg-red-50 p-2">

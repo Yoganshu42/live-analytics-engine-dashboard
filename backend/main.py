@@ -668,6 +668,55 @@ _SET_INSTRUCTION_PATTERN = re.compile(
 _IS_INSTRUCTION_PATTERN = re.compile(r"^(?P<target>.+?)\s+(?:will\s+be|is|=)\s+(?P<value>.+)$", re.IGNORECASE)
 _DUPLICATE_INTENT_PATTERN = re.compile(r"\bduplicate(?:s|d|ing)?\b", re.IGNORECASE)
 _DEDUPE_ACTION_PATTERN = re.compile(r"\b(?:remove|drop|delete|dedupe|deduplicate|clean)\b", re.IGNORECASE)
+_NEGATED_DEDUPE_PATTERN = re.compile(
+    r"\b(?:do\s+not|don't|dont|not|no|without|keep)\b[^.;,\n]{0,80}\b(?:remove|drop|delete|dedupe|deduplicate|clean)\b",
+    re.IGNORECASE,
+)
+_ROW_COUNT_INTENT_PATTERN = re.compile(
+    r"\b(?:how\s+many\s+rows(?:\s+are\s+there)?|row\s+count|count\s+rows|number\s+of\s+rows|total\s+rows)\b",
+    re.IGNORECASE,
+)
+_DATE_FILTER_ACTION_PATTERN = re.compile(r"\b(?:keep|filter|include|use|add)\b", re.IGNORECASE)
+_DATE_FILTER_RANGE_PATTERN = re.compile(
+    r"\b(?:from|between)\s+(?P<start>.+?)\s+(?:to|and)\s+(?P<end>.+)$",
+    re.IGNORECASE,
+)
+_DATE_FILTER_AFTER_PATTERN = re.compile(
+    r"\b(?:on\s+or\s+after|after|since)\s+(?P<start>.+)$",
+    re.IGNORECASE,
+)
+_DATE_FILTER_BEFORE_PATTERN = re.compile(
+    r"\b(?:on\s+or\s+before|before|until|upto|up\s+to|till)\s+(?P<end>.+)$",
+    re.IGNORECASE,
+)
+_DATE_FILTER_SINGLE_PATTERN = re.compile(r"\b(?:for|in)\s+(?P<value>.+)$", re.IGNORECASE)
+_DATE_TOKEN_HINT_PATTERN = re.compile(
+    r"(?:\d{4}-\d{2}-\d{2}|\d{4}/\d{2}/\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{6}|\d{4}-\d{2}|[A-Za-z]{3,9}[-\s]\d{2,4})",
+    re.IGNORECASE,
+)
+_DATE_FILTER_COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "sales": (
+        "Date",
+        "Month",
+        "Start_Date",
+        "Start Date",
+        "Plan Start Date",
+        "Invoice Date",
+        "Invoice_Date_",
+        "Purchase Date",
+        "Warranty Start Date",
+    ),
+    "claims": (
+        "Claim Date",
+        "Date",
+        "Month",
+        "Payment Date",
+        "Payment_date",
+        "Call Date",
+        "Call_Date",
+        "Day of Call_Date",
+    ),
+}
 _UNSAFE_TRANSFORM_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -887,6 +936,49 @@ def _extract_deduplicate_column_label(request_text: str) -> str | None:
     return None
 
 
+def _is_negated_deduplicate_request(text: str) -> bool:
+    request_text = str(text or "").strip()
+    if not request_text:
+        return False
+    if not _DUPLICATE_INTENT_PATTERN.search(request_text):
+        return False
+    return bool(_NEGATED_DEDUPE_PATTERN.search(request_text))
+
+
+def _build_noop_instruction_result(df, line: str) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+
+    row_count_requested = bool(_ROW_COUNT_INTENT_PATTERN.search(text))
+    dedupe_blocked = _is_negated_deduplicate_request(text)
+    duplicate_columns_only = bool(
+        re.search(r"\bduplicate\s+columns?\b", text, re.IGNORECASE)
+        and not _extract_deduplicate_column_label(text)
+    )
+
+    if not any([row_count_requested, dedupe_blocked, duplicate_columns_only]):
+        return None
+
+    details: list[str] = []
+    if dedupe_blocked:
+        details.append("duplicate removal not applied")
+    if duplicate_columns_only and not dedupe_blocked:
+        details.append("duplicate column cleanup not applied")
+    if row_count_requested:
+        details.append(f"current row count {int(len(df))}")
+
+    description = "kept uploaded rows unchanged"
+    if details:
+        description += " (" + "; ".join(details) + ")"
+
+    return {
+        "description": description,
+        "rows_affected": 0,
+        "columns_touched": [],
+    }
+
+
 def _apply_deduplicate_instruction(
     df,
     line: str,
@@ -894,6 +986,12 @@ def _apply_deduplicate_instruction(
 ) -> dict[str, Any] | None:
     text = (line or "").strip()
     if not text:
+        return None
+
+    if _is_negated_deduplicate_request(text):
+        return None
+
+    if re.search(r"\bduplicate\s+columns?\b", text, re.IGNORECASE) and not _extract_deduplicate_column_label(text):
         return None
 
     if not (_DEDUPE_ACTION_PATTERN.search(text) and _DUPLICATE_INTENT_PATTERN.search(text)):
@@ -989,6 +1087,12 @@ def _analyze_duplicate_instruction(
     request_text: str,
     alias_map: dict[str, str],
 ) -> dict[str, Any] | None:
+    if _is_negated_deduplicate_request(request_text):
+        return None
+
+    if re.search(r"\bduplicate\s+columns?\b", request_text or "", re.IGNORECASE) and not _extract_explicit_duplicate_column_label(request_text):
+        return None
+
     if not _DUPLICATE_INTENT_PATTERN.search(request_text or ""):
         return None
 
@@ -1274,10 +1378,514 @@ def _apply_constant_instruction(
     }
 
 
-def _apply_instruction_line(df, line: str, alias_map: dict[str, str]) -> dict[str, Any] | None:
+def _parse_instruction_datetime_series(series):
+    import pandas as pd
+
+    raw = series.astype(str).str.strip()
+    raw = raw.replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "None": pd.NA, "null": pd.NA})
+    cleaned = raw.astype("string").str.replace(r"\.0$", "", regex=True)
+    normalized = (
+        cleaned.str.replace("/", "-", regex=False)
+        .str.replace(r"\s+", "-", regex=True)
+        .str.strip("-")
+    )
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+
+    mask_ymd = cleaned.str.fullmatch(r"\d{8}", na=False)
+    if mask_ymd.any():
+        ymd = pd.to_datetime(cleaned.where(mask_ymd), format="%Y%m%d", errors="coerce")
+        parsed = parsed.where(parsed.notna(), ymd)
+
+    mask_ym = cleaned.str.fullmatch(r"\d{6}", na=False)
+    if mask_ym.any():
+        ym = pd.to_datetime(cleaned.where(mask_ym), format="%Y%m", errors="coerce")
+        parsed = parsed.where(parsed.notna(), ym)
+
+    mask_mon_yy = normalized.str.fullmatch(r"[A-Za-z]{3,9}-\d{2}", na=False)
+    if mask_mon_yy.any():
+        mon_yy = pd.to_datetime(normalized.where(mask_mon_yy), format="%b-%y", errors="coerce")
+        parsed = parsed.where(parsed.notna(), mon_yy)
+
+    mask_mon_yyyy = normalized.str.fullmatch(r"[A-Za-z]{3,9}-\d{4}", na=False)
+    if mask_mon_yyyy.any():
+        mon_yyyy = pd.to_datetime(normalized.where(mask_mon_yyyy), format="%b-%Y", errors="coerce")
+        parsed = parsed.where(parsed.notna(), mon_yyyy)
+
+    try:
+        generic = pd.to_datetime(cleaned, format="mixed", errors="coerce")
+        generic_dayfirst = pd.to_datetime(cleaned, format="mixed", errors="coerce", dayfirst=True)
+    except TypeError:
+        generic = pd.to_datetime(cleaned, errors="coerce")
+        generic_dayfirst = pd.to_datetime(cleaned, errors="coerce", dayfirst=True)
+
+    if int(generic_dayfirst.notna().sum()) > int(generic.notna().sum()):
+        generic = generic_dayfirst
+    parsed = parsed.where(parsed.notna(), generic)
+    return parsed
+
+
+def _clean_date_filter_value(value: str) -> str:
+    cleaned = _clean_instruction_part(value)
+    cleaned = re.sub(
+        r"(?i)\b(?:rows?|data|dataset|period|time|month|date|only|selected|current|the)\b",
+        " ",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;")
+    return cleaned
+
+
+def _parse_instruction_date_value(value: str, *, boundary: str):
+    import pandas as pd
+
+    raw_cleaned = _clean_instruction_part(value)
+    raw_lowered = raw_cleaned.lower()
+    if raw_lowered in {"this month", "current month"}:
+        today = pd.Timestamp(datetime.utcnow()).normalize()
+        parsed = today.replace(day=1)
+        return parsed + pd.offsets.MonthEnd(0) if boundary == "end" else parsed
+
+    cleaned = _clean_date_filter_value(value)
+    if not cleaned:
+        return None
+
+    month_only = bool(
+        re.fullmatch(r"[A-Za-z]{3,9}[-\s]\d{2,4}", cleaned)
+        or re.fullmatch(r"\d{4}[-/]\d{2}", cleaned)
+        or re.fullmatch(r"\d{6}", cleaned)
+    )
+
+    format_attempts = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%y",
+        "%d/%m/%y",
+        "%b-%y",
+        "%b-%Y",
+        "%b %y",
+        "%b %Y",
+        "%Y-%m",
+        "%Y/%m",
+        "%Y%m",
+    ]
+    parsed = None
+    for fmt in format_attempts:
+        try:
+            parsed = pd.Timestamp(datetime.strptime(cleaned, fmt))
+            break
+        except ValueError:
+            continue
+
+    if parsed is None:
+        parsed_direct = pd.to_datetime(cleaned, errors="coerce")
+        parsed_dayfirst = pd.to_datetime(cleaned, errors="coerce", dayfirst=True)
+        if pd.isna(parsed_direct) or (
+            not pd.isna(parsed_dayfirst) and pd.isna(parsed_direct)
+        ):
+            parsed = parsed_dayfirst if not pd.isna(parsed_dayfirst) else None
+        else:
+            parsed = parsed_direct
+
+    if parsed is None or pd.isna(parsed):
+        return None
+
+    normalized = pd.Timestamp(parsed).normalize()
+    if month_only:
+        if boundary == "end":
+            return normalized + pd.offsets.MonthEnd(0)
+        return normalized.replace(day=1)
+    return normalized
+
+
+def _resolve_instruction_period_column(df, dataset_type: str):
+    best_col = None
+    best_series = None
+    best_count = 0
+    dataset_key = "claims" if str(dataset_type or "").strip().lower() == "claims" else "sales"
+
+    candidate_columns = list(_DATE_FILTER_COLUMN_CANDIDATES.get(dataset_key, ()))
+    candidate_columns.extend(str(col) for col in df.columns if str(col) not in candidate_columns)
+
+    for col in candidate_columns:
+        if col not in df.columns:
+            continue
+        parsed = _parse_instruction_datetime_series(df[col])
+        parsed_count = int(parsed.notna().sum())
+        if parsed_count > best_count:
+            best_col = str(col)
+            best_series = parsed
+            best_count = parsed_count
+
+    if best_col is None or best_series is None or best_count <= 0:
+        return None, None
+    return best_col, best_series
+
+
+def _apply_date_filter_instruction(
+    df,
+    line: str,
+    dataset_type: str,
+) -> dict[str, Any] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+
+    lower_text = text.lower()
+    has_date_hint = bool(_DATE_TOKEN_HINT_PATTERN.search(text)) or any(
+        token in lower_text for token in ["month", "period", "date", "time"]
+    )
+    if not has_date_hint or not _DATE_FILTER_ACTION_PATTERN.search(text):
+        return None
+
+    start_value = None
+    end_value = None
+    label = None
+
+    range_match = _DATE_FILTER_RANGE_PATTERN.search(text)
+    if range_match:
+        start_token = range_match.group("start")
+        end_token = range_match.group("end")
+        start_value = _parse_instruction_date_value(start_token, boundary="start")
+        end_value = _parse_instruction_date_value(end_token, boundary="end")
+        label = f"{_clean_date_filter_value(start_token)} to {_clean_date_filter_value(end_token)}"
+    else:
+        after_match = _DATE_FILTER_AFTER_PATTERN.search(text)
+        before_match = _DATE_FILTER_BEFORE_PATTERN.search(text)
+        single_match = _DATE_FILTER_SINGLE_PATTERN.search(text)
+        if after_match:
+            start_token = after_match.group("start")
+            start_value = _parse_instruction_date_value(start_token, boundary="start")
+            label = f"after {_clean_date_filter_value(start_token)}"
+        elif before_match:
+            end_token = before_match.group("end")
+            end_value = _parse_instruction_date_value(end_token, boundary="end")
+            label = f"before {_clean_date_filter_value(end_token)}"
+        elif single_match:
+            single_token = single_match.group("value")
+            start_value = _parse_instruction_date_value(single_token, boundary="start")
+            end_value = _parse_instruction_date_value(single_token, boundary="end")
+            label = _clean_date_filter_value(single_token)
+
+    if start_value is None and end_value is None:
+        return None
+
+    date_col, parsed_series = _resolve_instruction_period_column(df, dataset_type)
+    if date_col is None or parsed_series is None:
+        return {
+            "description": "Date filter skipped: no usable date or period column was found in the uploaded file.",
+            "rows_affected": 0,
+            "columns_touched": [],
+        }
+
+    mask = parsed_series.notna()
+    if start_value is not None:
+        mask = mask & (parsed_series >= start_value)
+    if end_value is not None:
+        mask = mask & (parsed_series <= end_value)
+
+    before = int(len(df))
+    df.drop(index=df.index[~mask], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    removed = max(0, before - int(len(df)))
+    range_label = label or "selected period"
+    return {
+        "description": f"kept {int(len(df))} row(s) from `{date_col}` for {range_label}",
+        "rows_affected": removed,
+        "columns_touched": [date_col],
+    }
+
+
+def _coerce_instruction_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _extract_json_object_from_text(text: str) -> dict[str, Any] | None:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return None
+
+    candidates: list[str] = []
+    fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", raw_text, flags=re.IGNORECASE | re.DOTALL)
+    candidates.extend(block.strip() for block in fenced_blocks if block.strip())
+    candidates.append(raw_text)
+
+    for candidate in candidates:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end < start:
+            continue
+        snippet = candidate[start : end + 1]
+        try:
+            parsed = json.loads(snippet)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _should_try_llm_transform_plan(request_text: str, instructions: list[str]) -> bool:
+    if not os.getenv("SARVAM_API_KEY", "").strip():
+        return False
+
+    text = str(request_text or "").strip().lower()
+    if not text:
+        return False
+
+    if len(instructions) != 1:
+        return False
+
+    compound_markers = [
+        " and ",
+        " also ",
+        " then ",
+        " plus ",
+        " as well as ",
+        " along with ",
+        " now ",
+        " instead ",
+        " rather than ",
+        " but ",
+    ]
+    if any(marker in text for marker in compound_markers):
+        return True
+
+    if not (
+        _DATE_FILTER_ACTION_PATTERN.search(text)
+        or _SET_INSTRUCTION_PATTERN.match(text)
+        or _IS_INSTRUCTION_PATTERN.match(text)
+        or any(pattern.match(text) for pattern in _COPY_INSTRUCTION_PATTERNS)
+        or _DUPLICATE_INTENT_PATTERN.search(text)
+        or _ROW_COUNT_INTENT_PATTERN.search(text)
+    ):
+        return True
+
+    return False
+
+
+def _plan_transform_instructions_with_llm(
+    df,
+    *,
+    request_text: str,
+    source: str | None,
+    dataset_type: str,
+) -> list[dict[str, Any]] | None:
+    if not os.getenv("SARVAM_API_KEY", "").strip():
+        return None
+
+    columns = [str(col) for col in list(df.columns)[:80]]
+    columns_json = json.dumps(columns, ensure_ascii=True)
+    if len(df.columns) > len(columns):
+        columns_json = f"{columns_json} (truncated from {len(df.columns)} columns)"
+
+    system_prompt = (
+        "You convert spreadsheet file-edit requests into a strict JSON execution plan. "
+        "Return only one JSON object and no markdown. "
+        "Preserve negations exactly. "
+        "Supported operation types are: noop, date_filter, set_value, copy_column, "
+        "remove_duplicates, analyze_duplicates. "
+        "Use multiple operations when the user asks for multiple actions. "
+        "Prefer exact column names from the provided list. "
+        "If the user asks to keep data unchanged or only asks a question like row count, use noop. "
+        "If the user wants to inspect duplicates without deleting them, use analyze_duplicates. "
+        "Schema: "
+        "{\"operations\":[{\"type\":\"noop|date_filter|set_value|copy_column|remove_duplicates|analyze_duplicates\","
+        "\"target_column\":null,\"source_column\":null,\"column\":null,\"value\":null,"
+        "\"only_missing\":false,\"start_date\":null,\"end_date\":null,"
+        "\"report_row_count\":false,\"notes\":null}]}"
+    )
+    prompt = (
+        f"User instruction:\n{request_text.strip()}\n\n"
+        f"Source: {(source or 'unknown').strip() or 'unknown'}\n"
+        f"Dataset type: {(dataset_type or 'sales').strip().lower() or 'sales'}\n"
+        f"Available columns: {columns_json}\n\n"
+        "Interpret flexible phrasing like 'should actually come from', 'for blanks use', "
+        "'only keep January rows', 'do not remove duplicates', or 'tell me how many rows are there'. "
+        "Output only valid JSON."
+    )
+
+    try:
+        model_name, response_text, _ = _call_llm(
+            system_prompt,
+            prompt,
+            model=_resolve_llm_model("CHATBOT_MODEL", "SARVAM_MODEL"),
+            temperature=0.0,
+            num_predict=420,
+            timeout_seconds=25,
+        )
+    except Exception:
+        logger.exception("LLM file instruction planning failed")
+        return None
+
+    parsed = _extract_json_object_from_text(response_text)
+    if not isinstance(parsed, dict):
+        logger.warning("LLM file instruction planner returned non-JSON output model=%s", model_name)
+        return None
+
+    operations = parsed.get("operations")
+    if not isinstance(operations, list):
+        return None
+
+    cleaned_ops = [item for item in operations if isinstance(item, dict)]
+    return cleaned_ops or None
+
+
+def _apply_planned_transform_operation(
+    df,
+    operation: dict[str, Any],
+    *,
+    alias_map: dict[str, str],
+    dataset_type: str,
+) -> dict[str, Any] | None:
+    op_type = _normalize_file_key(operation.get("type") or operation.get("op") or "")
+    if not op_type:
+        return None
+
+    if op_type == "datefilter":
+        start_token = str(operation.get("start_date") or operation.get("from_date") or "").strip()
+        end_token = str(operation.get("end_date") or operation.get("to_date") or "").strip()
+        if start_token and end_token:
+            text = f"keep rows from {start_token} to {end_token}"
+        elif start_token:
+            text = f"keep rows after {start_token}"
+        elif end_token:
+            text = f"keep rows before {end_token}"
+        else:
+            return None
+        return _apply_date_filter_instruction(df, text, dataset_type)
+
+    if op_type == "copycolumn":
+        source_label = _clean_instruction_part(operation.get("source_column") or operation.get("source") or "")
+        target_label = _clean_instruction_part(operation.get("target_column") or operation.get("target") or "")
+        if not source_label or not target_label:
+            return None
+        return _apply_copy_instruction(
+            df,
+            source_label=source_label,
+            target_label=target_label,
+            alias_map=alias_map,
+            only_missing=_coerce_instruction_bool(operation.get("only_missing")),
+        )
+
+    if op_type == "setvalue":
+        target_label = _clean_instruction_part(operation.get("target_column") or operation.get("target") or "")
+        if not target_label:
+            return None
+
+        target_col = _resolve_target_column(df, target_label, alias_map)
+        if target_col is None:
+            return None
+        if target_col not in df.columns:
+            df[target_col] = None
+
+        raw_value = operation["value"] if "value" in operation else None
+        if isinstance(raw_value, str):
+            value = _parse_constant_value(raw_value)
+        else:
+            value = raw_value
+
+        only_missing = _coerce_instruction_bool(operation.get("only_missing"))
+        if only_missing:
+            mask = _missing_mask(df[target_col])
+            df.loc[mask, target_col] = value
+            rows = int(mask.sum())
+            mode = "filled missing"
+        else:
+            df[target_col] = value
+            rows = int(len(df))
+            mode = "set"
+
+        alias_map[_normalize_file_key(target_label)] = target_col
+        alias_map[_normalize_file_key(target_col)] = target_col
+        return {
+            "description": f"{mode} `{target_col}` = {repr(value)}",
+            "rows_affected": rows,
+            "columns_touched": [target_col],
+        }
+
+    if op_type == "removeduplicates":
+        column_label = _clean_instruction_part(
+            operation.get("column") or operation.get("target_column") or operation.get("target") or ""
+        )
+        text = f"remove duplicates from column {column_label}" if column_label else "remove duplicates"
+        return _apply_deduplicate_instruction(df, text, alias_map)
+
+    if op_type == "analyzeduplicates":
+        column_label = _clean_instruction_part(
+            operation.get("column") or operation.get("target_column") or operation.get("target") or ""
+        )
+        text = f"check duplicates in column {column_label}" if column_label else "check duplicates"
+        analysis = _analyze_duplicate_instruction(df, text, alias_map)
+        if analysis is None:
+            return None
+        return {
+            "description": str(analysis.get("summary") or "Duplicate scan completed."),
+            "rows_affected": 0,
+            "columns_touched": [str(col) for col in (analysis.get("columns_touched") or []) if str(col).strip()],
+        }
+
+    if op_type == "noop":
+        notes = str(operation.get("notes") or "").strip()
+        report_row_count = _coerce_instruction_bool(operation.get("report_row_count"))
+        details: list[str] = []
+        if notes:
+            details.append(notes)
+        if report_row_count:
+            details.append(f"current row count {int(len(df))}")
+
+        description = "kept uploaded rows unchanged"
+        if details:
+            description += " (" + "; ".join(details) + ")"
+        return {
+            "description": description,
+            "rows_affected": 0,
+            "columns_touched": [],
+        }
+
+    return None
+
+
+def _execute_planned_transform_operations(
+    df,
+    operations: list[dict[str, Any]],
+    *,
+    alias_map: dict[str, str],
+    dataset_type: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    applied_ops: list[dict[str, Any]] = []
+    skipped_ops: list[str] = []
+
+    for operation in operations:
+        result = _apply_planned_transform_operation(
+            df,
+            operation,
+            alias_map=alias_map,
+            dataset_type=dataset_type,
+        )
+        if result is None:
+            skipped_ops.append(json.dumps(operation, ensure_ascii=True, default=str))
+            continue
+        applied_ops.append(result)
+
+    return applied_ops, skipped_ops
+
+
+def _apply_instruction_line(df, line: str, alias_map: dict[str, str], dataset_type: str) -> dict[str, Any] | None:
     text = line.strip()
     if not text:
         return None
+
+    date_filter_result = _apply_date_filter_instruction(df, text, dataset_type)
+    if date_filter_result is not None:
+        return date_filter_result
 
     dedupe_result = _apply_deduplicate_instruction(df, text, alias_map)
     if dedupe_result is not None:
@@ -1348,7 +1956,7 @@ def _apply_instruction_line(df, line: str, alias_map: dict[str, str]) -> dict[st
                 only_missing=False,
             )
 
-    return None
+    return _build_noop_instruction_result(df, text)
 
 
 def _resolve_output_extension(input_ext: str, requested: str | None) -> str:
@@ -1397,24 +2005,71 @@ async def chatbot_file_transform(
 
     applied_ops: list[dict[str, Any]] = []
     skipped_ops: list[str] = []
-    for line in instructions:
-        result = _apply_instruction_line(df, line, alias_map)
-        if result is None:
+    used_llm_request_plan = False
+
+    if _should_try_llm_transform_plan(request_text, instructions):
+        planned_ops = _plan_transform_instructions_with_llm(
+            df,
+            request_text=request_text,
+            source=resolved_source or None,
+            dataset_type=resolved_dataset,
+        )
+        if planned_ops:
+            planned_applied, planned_skipped = _execute_planned_transform_operations(
+                df,
+                planned_ops,
+                alias_map=alias_map,
+                dataset_type=resolved_dataset,
+            )
+            if planned_applied:
+                applied_ops.extend(planned_applied)
+                skipped_ops.extend(planned_skipped)
+                used_llm_request_plan = True
+
+    if not used_llm_request_plan:
+        for line in instructions:
+            result = _apply_instruction_line(df, line, alias_map, resolved_dataset)
+            if result is not None:
+                applied_ops.append(result)
+                continue
+
+            planned_ops = _plan_transform_instructions_with_llm(
+                df,
+                request_text=line,
+                source=resolved_source or None,
+                dataset_type=resolved_dataset,
+            )
+            if planned_ops:
+                planned_applied, planned_skipped = _execute_planned_transform_operations(
+                    df,
+                    planned_ops,
+                    alias_map=alias_map,
+                    dataset_type=resolved_dataset,
+                )
+                if planned_applied:
+                    applied_ops.extend(planned_applied)
+                    skipped_ops.extend(planned_skipped)
+                    continue
+
             skipped_ops.append(line)
-            continue
-        applied_ops.append(result)
 
     analysis_result: dict[str, Any] | None = None
     if not applied_ops:
         analysis_result = _analyze_duplicate_instruction(df, request_text, alias_map)
         if analysis_result is None:
+            llm_enabled = bool(os.getenv("SARVAM_API_KEY", "").strip())
+            if llm_enabled:
+                detail = (
+                    "Could not interpret the instruction after rule-based and AI parsing. "
+                    "Try describing the row filter, fill, copy, duplicate handling, or row-count request in plain English."
+                )
+            else:
+                detail = (
+                    "Could not interpret the instruction. AI parsing is unavailable because SARVAM_API_KEY is not configured."
+                )
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Could not parse the instruction. Use formats like: "
-                    "'fill Brand with Samsung', 'copy Article_Brand to Brand', "
-                    "'Plan Price will be Total Billing Amount', or 'remove duplicates from column Item_Serial_Number'."
-                ),
+                detail=detail,
             )
         skipped_ops = []
 

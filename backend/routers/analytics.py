@@ -1740,29 +1740,42 @@ def analytics_by_dimension(
             resolved_source == "godrej"
             and normalized_dataset == "sales"
             and dimension_key == "month"
-            and from_date
+            and (from_date or to_date)
         ):
-            from_dt = pd.to_datetime(from_date, errors="coerce")
-            if from_dt is not None and from_dt is not pd.NaT:
-                from_month = pd.Timestamp(from_dt).to_period("M").to_timestamp()
-                month_points: list[pd.Timestamp] = []
-                for row in cached:
-                    if not isinstance(row, dict):
-                        continue
-                    safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
-                    month_col = safe_map.get("month") or safe_map.get(dimension_key)
-                    raw_month = row.get(month_col) if month_col is not None else row.get("month")
-                    if raw_month is None:
-                        continue
-                    parsed = pd.to_datetime(raw_month, errors="coerce")
-                    if pd.isna(parsed):
-                        continue
-                    month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+            from_dt = pd.to_datetime(from_date, errors="coerce") if from_date else None
+            to_dt = pd.to_datetime(to_date, errors="coerce") if to_date else None
+            from_month = (
+                pd.Timestamp(from_dt).to_period("M").to_timestamp()
+                if from_dt is not None and from_dt is not pd.NaT
+                else None
+            )
+            to_month = (
+                pd.Timestamp(to_dt).to_period("M").to_timestamp()
+                if to_dt is not None and to_dt is not pd.NaT
+                else None
+            )
 
-                if month_points:
-                    cached_min_month = min(month_points)
-                    if from_month < cached_min_month:
-                        is_stale_godrej_sales_month_mismatch = True
+            month_points: list[pd.Timestamp] = []
+            for row in cached:
+                if not isinstance(row, dict):
+                    continue
+                safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                month_col = safe_map.get("month") or safe_map.get(dimension_key)
+                raw_month = row.get(month_col) if month_col is not None else row.get("month")
+                if raw_month is None:
+                    continue
+                parsed = pd.to_datetime(raw_month, errors="coerce")
+                if pd.isna(parsed):
+                    continue
+                month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+
+            if month_points:
+                cached_min_month = min(month_points)
+                cached_max_month = max(month_points)
+                if from_month is not None and from_month < cached_min_month:
+                    is_stale_godrej_sales_month_mismatch = True
+                if to_month is not None and cached_max_month > to_month:
+                    is_stale_godrej_sales_month_mismatch = True
 
         if (
             is_stale_cached_shape
@@ -2471,22 +2484,6 @@ def compute_summary_values(
             to_date=to_date,
         )
         summary = engine.compute_summary()
-
-        # For Godrej sales, Gross Premium and Units Sold must always be global totals,
-        # irrespective of date range or selected tag.
-        if resolved_source == "godrej" and dataset_type == "sales":
-            global_engine = engine_cls(
-                db=db,
-                job_id=None,
-                source=resolved_source,
-                dataset_type=dataset_type,
-                from_date=None,
-                to_date=None,
-            )
-            global_summary = global_engine.compute_summary()
-            summary["gross_premium"] = float(global_summary.get("gross_premium", 0) or 0)
-            summary["units_sold"] = int(global_summary.get("units_sold", 0) or 0)
-
         return summary
 
     df = get_dataframe(
@@ -2608,6 +2605,68 @@ def _extract_month_from_dimension_row(row: dict[str, Any]) -> pd.Timestamp | Non
             if not parsed.empty:
                 return parsed.iloc[0]
     return None
+
+
+def _rows_have_month_window_mismatch(
+    rows: list[dict[str, Any]] | None,
+    *,
+    from_date: str | None,
+    to_date: str | None,
+) -> bool:
+    if not rows or not (from_date or to_date):
+        return False
+
+    from_dt = pd.to_datetime(from_date, errors="coerce") if from_date else None
+    to_dt = pd.to_datetime(to_date, errors="coerce") if to_date else None
+    from_month = (
+        pd.Timestamp(from_dt).to_period("M").to_timestamp()
+        if from_dt is not None and pd.notna(from_dt)
+        else None
+    )
+    to_month = (
+        pd.Timestamp(to_dt).to_period("M").to_timestamp()
+        if to_dt is not None and pd.notna(to_dt)
+        else None
+    )
+
+    month_points: list[pd.Timestamp] = []
+    for row in rows:
+        parsed = _extract_month_from_dimension_row(row)
+        if parsed is None:
+            continue
+        month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+
+    if not month_points:
+        return False
+
+    cached_min_month = min(month_points)
+    cached_max_month = max(month_points)
+    if from_month is not None and from_month < cached_min_month:
+        return True
+    if to_month is not None and cached_max_month > to_month:
+        return True
+    return False
+
+
+def _master_payload_has_godrej_sales_month_mismatch(
+    payload: dict[str, Any] | None,
+    *,
+    from_date: str | None,
+    to_date: str | None,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    row_sets = payload.get("rows")
+    if not isinstance(row_sets, dict):
+        return False
+    for key in ("godrej_gross", "godrej_earned", "godrej_zopper"):
+        if _rows_have_month_window_mismatch(
+            row_sets.get(key),
+            from_date=from_date,
+            to_date=to_date,
+        ):
+            return True
+    return False
 
 
 def _bounds_from_master_rows(row_sets: list[list[dict[str, Any]]]) -> tuple[str | None, str | None]:
@@ -2867,6 +2926,7 @@ def _load_master_metric_rows(
     selected_rows: list[dict[str, Any]] = []
     for candidate_job_id in ordered_candidates:
         rows = None
+        should_recompute_live = False
         if not force_live_rows:
             rows = get_precomputed_graph(
                 db=db,
@@ -2879,7 +2939,25 @@ def _load_master_metric_rows(
                 from_date=from_date,
                 to_date=to_date,
             )
-        if rows is None:
+            if (
+                rows is not None
+                and source_key == "godrej"
+                and dataset_type == "sales"
+                and _rows_have_month_window_mismatch(
+                    rows,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            ):
+                logger.warning(
+                    "Stale master metric graph detected; recomputing live source=%s dataset=%s metric=%s job_id=%s",
+                    source,
+                    dataset_type,
+                    metric,
+                    candidate_job_id,
+                )
+                should_recompute_live = True
+        if rows is None or should_recompute_live:
             rows = compute_by_dimension_rows(
                 db=db,
                 job_id=candidate_job_id,
@@ -3161,13 +3239,25 @@ def analytics_master_dashboard(
             cache_is_fresh = True
         else:
             cache_is_fresh = pd.Timestamp(cache_updated_at) >= pd.Timestamp(latest_marker_updated_at)
+    cache_has_godrej_sales_month_mismatch = _master_payload_has_godrej_sales_month_mismatch(
+        cached,
+        from_date=from_date,
+        to_date=to_date,
+    )
 
-    if _is_valid_master_payload(cached) and cache_is_fresh:
+    if _is_valid_master_payload(cached) and cache_is_fresh and not cache_has_godrej_sales_month_mismatch:
         logger.info(
             "TIMING analytics.master_dashboard mode=precomputed duration_ms=%.2f",
             (time.perf_counter() - started) * 1000,
         )
         return cached
+    if cache_has_godrej_sales_month_mismatch:
+        logger.warning(
+            "Stale master dashboard cache detected; recomputing live source=%s from=%s to=%s",
+            cache_source,
+            from_date,
+            to_date,
+        )
 
     payload = _build_master_dashboard_payload(
         db=db,
@@ -3213,7 +3303,10 @@ def analytics_summary(
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
-    force_live_summary = resolved_source.startswith("samsung") and normalized_dataset == "sales"
+    force_live_summary = (
+        (resolved_source.startswith("samsung") and normalized_dataset == "sales")
+        or (resolved_source == "godrej" and normalized_dataset == "sales")
+    )
 
     if resolved_source == "samsung" and not force_live_summary:
         partner_rows: list[dict[str, Any]] = []
@@ -3322,7 +3415,7 @@ def analytics_summary(
             return cached
     elif cached is not None and force_live_summary:
         logger.info(
-            "Bypassing precomputed summary for Godrej sales; recomputing live source=%s dataset=%s from=%s to=%s",
+            "Bypassing precomputed summary; recomputing live source=%s dataset=%s from=%s to=%s",
             resolved_source,
             normalized_dataset,
             from_date,

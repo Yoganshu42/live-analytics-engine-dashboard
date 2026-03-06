@@ -171,6 +171,168 @@ def _key_score(series: pd.Series) -> tuple[float, int, int, float]:
     return (score, non_null, unique_count, ratio)
 
 
+COMPOSITE_KEY_SUPPORT_CANDIDATES: dict[str, list[str]] = {
+    "sales": [
+        "Invoice Number",
+        "Invoice No",
+        "Order ID",
+        "Transaction ID",
+        "Contract ID",
+        "Serial Number",
+        "IMEI",
+        "Model Code",
+        "Date",
+        "Month",
+        "Start Date",
+        "Plan Start Date",
+        "State",
+        "City",
+    ],
+    "claims": [
+        "Claim Date",
+        "Date",
+        "Month",
+        "Case ID",
+        "Ticket ID",
+        "Reference Number",
+        "SR Number",
+        "Serial Number",
+        "IMEI",
+        "State",
+        "City",
+    ],
+}
+
+
+def _normalize_key_component(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"nan", "none", "null", "na"}:
+        return ""
+    return lowered
+
+
+def _combined_key_score(
+    df: pd.DataFrame,
+    columns: list[str],
+) -> tuple[float, int, int, float, float]:
+    if not columns:
+        return (0.0, 0, 0, 0.0, 0.0)
+
+    normalized_parts: list[pd.Series] = []
+    mask = pd.Series(False, index=df.index, dtype=bool)
+    for col in columns:
+        if col not in df.columns:
+            continue
+        part = df[col].map(_normalize_key_component)
+        normalized_parts.append(part)
+        mask = mask | part.ne("")
+
+    if not normalized_parts:
+        return (0.0, 0, 0, 0.0, 0.0)
+
+    non_null = int(mask.sum())
+    if non_null <= 0:
+        return (0.0, 0, 0, 0.0, 0.0)
+
+    combined = normalized_parts[0].astype(str)
+    for part in normalized_parts[1:]:
+        combined = combined + "|" + part.astype(str)
+
+    filtered = combined[mask]
+    unique_count = int(filtered.nunique(dropna=True))
+    duplicate_count = max(0, non_null - unique_count)
+    ratio = (unique_count / non_null) if non_null else 0.0
+    coverage = (non_null / max(len(df), 1)) if len(df) else 0.0
+    score = (ratio * 1000.0) + (coverage * 40.0) - (duplicate_count * 0.15)
+    return (score, non_null, unique_count, ratio, coverage)
+
+
+def _choose_composite_key_columns(
+    df: pd.DataFrame,
+    *,
+    source: str,
+    dataset_type: str,
+) -> tuple[list[str], tuple[float, int, int, float, float]]:
+    source_key = _normalize_source(source)
+    dataset_key = _normalize_dataset_type(dataset_type)
+
+    primary_candidates = _resolve_columns(
+        df,
+        get_primary_key_candidate_order(source=source_key, dataset_type=dataset_key),
+    )
+    support_candidates = [
+        col
+        for col in _resolve_columns(df, COMPOSITE_KEY_SUPPORT_CANDIDATES.get(dataset_key, []))
+        if col not in primary_candidates
+    ]
+    candidate_pool = primary_candidates + support_candidates
+    if len(candidate_pool) < 2:
+        return [], (0.0, 0, 0, 0.0, 0.0)
+
+    ranked_columns: list[tuple[float, str, tuple[float, int, int, float, float]]] = []
+    for idx, col in enumerate(candidate_pool):
+        stats = _combined_key_score(df, [col])
+        if stats[1] <= 0:
+            continue
+        priority_bonus = max(0, len(candidate_pool) - idx) * 0.01
+        ranked_columns.append((stats[0] + priority_bonus, col, stats))
+
+    if not ranked_columns:
+        return [], (0.0, 0, 0, 0.0, 0.0)
+
+    ranked_columns.sort(key=lambda item: item[0], reverse=True)
+    selected = [ranked_columns[0][1]]
+    selected_stats = ranked_columns[0][2]
+    remaining = [col for col in candidate_pool if col not in selected]
+
+    while remaining and len(selected) < 4:
+        best_next: tuple[float, str, tuple[float, int, int, float, float]] | None = None
+        for col in remaining:
+            trial = selected + [col]
+            trial_stats = _combined_key_score(df, trial)
+            if trial_stats[1] <= 0:
+                continue
+            ratio_gain = trial_stats[3] - selected_stats[3]
+            score_gain = trial_stats[0] - selected_stats[0]
+            if ratio_gain <= 0.01 and score_gain <= 1.0:
+                continue
+            candidate_score = trial_stats[0] + (8.0 if col in primary_candidates else 0.0)
+            if best_next is None or candidate_score > best_next[0]:
+                best_next = (candidate_score, col, trial_stats)
+
+        if best_next is None:
+            break
+
+        _, next_col, next_stats = best_next
+        selected.append(next_col)
+        selected_stats = next_stats
+        remaining = [col for col in remaining if col != next_col]
+        if selected_stats[3] >= 0.98:
+            break
+
+    can_use_composite = (
+        len(selected) >= 2
+        and (
+            selected_stats[3] >= 0.72
+            or (
+                selected_stats[3] >= 0.62
+                and any(col in primary_candidates for col in selected)
+            )
+        )
+    )
+    return (selected if can_use_composite else []), selected_stats
+
+
 def _choose_primary_key_column(
     df: pd.DataFrame,
     *,
@@ -282,6 +444,43 @@ def _build_row_hash_payload(row: dict[str, Any], candidate_cols: list[str]) -> d
     return out or row
 
 
+def _assign_record_instances(
+    base_record_keys: list[str],
+    rows: list[dict[str, Any]],
+) -> tuple[list[str], int]:
+    if not base_record_keys:
+        return [], 0
+
+    grouped_indexes: dict[str, list[int]] = {}
+    for idx, key in enumerate(base_record_keys):
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        grouped_indexes.setdefault(normalized_key, []).append(idx)
+
+    row_fingerprints = [
+        _stable_hash(row if isinstance(row, dict) else {"value": row})
+        for row in rows
+    ]
+
+    resolved_keys = [str(key or "").strip() for key in base_record_keys]
+    duplicate_keys = 0
+    for base_key, indexes in grouped_indexes.items():
+        if len(indexes) == 1:
+            resolved_keys[indexes[0]] = base_key
+            continue
+
+        duplicate_keys += len(indexes) - 1
+        ordered_indexes = sorted(indexes, key=lambda idx: (row_fingerprints[idx], idx))
+        for occurrence, row_idx in enumerate(ordered_indexes, start=1):
+            if occurrence == 1:
+                resolved_keys[row_idx] = base_key
+                continue
+            resolved_keys[row_idx] = f"{base_key}:dup:{occurrence:04d}"
+
+    return resolved_keys, int(duplicate_keys)
+
+
 def prepare_rows_for_storage(
     rows: list[dict[str, Any]],
     *,
@@ -298,6 +497,7 @@ def prepare_rows_for_storage(
             "primary_key_name": "claim_id" if dataset_key == "claims" else "plan_id",
             "strategy": "composite_hash",
             "key_column": None,
+            "key_columns": [],
             "key_candidates": get_primary_key_candidate_order(source=source_key, dataset_type=dataset_key),
             "rows_in": 0,
             "rows_out": 0,
@@ -312,14 +512,34 @@ def prepare_rows_for_storage(
         source=source_key,
         dataset_type=dataset_key,
     )
+    composite_key_columns, composite_stats = _choose_composite_key_columns(
+        working_df,
+        source=source_key,
+        dataset_type=dataset_key,
+    )
 
     normalized_rows = rows
     record_keys: list[str] = []
     missing_key_values = 0
     hash_candidates = FALLBACK_HASH_CANDIDATES.get(dataset_key, [])
-    role = str(key_meta.get("primary_key_name") or ("claim_id" if dataset_key == "claims" else "plan_id"))
+    natural_key_selected = key_meta.get("strategy") == "natural_column" and bool(key_col)
+    active_strategy = "natural_column"
+    active_key_columns: list[str] = [str(key_col)] if natural_key_selected and key_col else []
+    active_uniqueness_ratio = float(key_meta.get("uniqueness_ratio") or 0.0)
 
-    if key_meta.get("strategy") == "natural_column" and key_col:
+    if not active_key_columns and composite_key_columns:
+        active_strategy = "composite_candidate_columns"
+        active_key_columns = list(composite_key_columns)
+        active_uniqueness_ratio = round(float(composite_stats[3] or 0.0), 4)
+    elif not active_key_columns:
+        active_strategy = "composite_hash"
+
+    role = str(
+        _classify_key_role(dataset_key, active_key_columns[0] if active_key_columns else None)
+        or ("claim_id" if dataset_key == "claims" else "plan_id")
+    )
+
+    if active_strategy == "natural_column" and key_col:
         series = working_df[key_col]
         missing_mask = _missing_mask(series)
         missing_key_values = int(missing_mask.sum())
@@ -332,44 +552,52 @@ def prepare_rows_for_storage(
             else:
                 fallback_payload = _build_row_hash_payload(row, hash_candidates)
                 record_keys.append(f"{role}:row:{_stable_hash(fallback_payload)[:24]}")
+    elif active_strategy == "composite_candidate_columns" and active_key_columns:
+        normalized_key_frame = working_df[active_key_columns].copy()
+        for col in active_key_columns:
+            normalized_key_frame[col] = normalized_key_frame[col].map(_normalize_key_component)
+        missing_mask = normalized_key_frame.eq("").all(axis=1)
+        missing_key_values = int(missing_mask.sum())
+        for idx, row in enumerate(normalized_rows):
+            if not bool(missing_mask.iloc[idx]):
+                key_payload = _build_row_hash_payload(row, active_key_columns)
+                digest = _stable_hash(key_payload)
+                record_keys.append(f"{role}:composite:{digest[:24]}")
+            else:
+                fallback_payload = _build_row_hash_payload(row, hash_candidates)
+                record_keys.append(f"{role}:row:{_stable_hash(fallback_payload)[:24]}")
     else:
         for row in normalized_rows:
             fallback_payload = _build_row_hash_payload(row, hash_candidates)
             record_keys.append(f"{role}:row:{_stable_hash(fallback_payload)[:24]}")
 
+    record_keys, duplicate_keys = _assign_record_instances(record_keys, normalized_rows)
     with_keys: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    duplicate_keys = 0
-    # keep latest row for duplicate record keys to make overwrite deterministic
-    for idx in range(len(normalized_rows) - 1, -1, -1):
+    for idx, row in enumerate(normalized_rows):
         rk = str(record_keys[idx] or "").strip()
         if not rk:
             continue
-        if rk in seen:
-            duplicate_keys += 1
-            continue
-        seen.add(rk)
         with_keys.append(
             {
-                "data": normalized_rows[idx],
+                "data": row,
                 "record_key": rk,
                 "primary_key_name": role,
             }
         )
-    with_keys.reverse()
 
     metadata = {
         "source": source_key,
         "dataset_type": dataset_key,
         "primary_key_name": role,
-        "strategy": str(key_meta.get("strategy") or "composite_hash"),
-        "key_column": key_meta.get("key_column"),
+        "strategy": active_strategy,
+        "key_column": key_col if active_strategy == "natural_column" else None,
+        "key_columns": active_key_columns,
         "key_candidates": get_primary_key_candidate_order(source=source_key, dataset_type=dataset_key),
         "rows_in": int(len(normalized_rows)),
         "rows_out": int(len(with_keys)),
         "duplicate_keys_in_file": int(duplicate_keys),
         "missing_key_values": int(missing_key_values),
-        "uniqueness_ratio": float(key_meta.get("uniqueness_ratio") or 0.0),
+        "uniqueness_ratio": float(active_uniqueness_ratio or 0.0),
     }
     return with_keys, metadata
 

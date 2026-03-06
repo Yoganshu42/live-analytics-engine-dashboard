@@ -39,6 +39,7 @@ const INITIAL_ASSISTANT_MESSAGE: ChatMessage = {
 }
 
 const FILE_INSTRUCTION_EXAMPLES = [
+  "keep rows from 2025-01-01 to 2025-03-31",
   "Plan Price will be Total Billing Amount",
   "Brand is Article_Brand",
   "fill missing Plan Category with ADLD",

@@ -136,11 +136,18 @@ export type AdminFilterAnalyzeResponse = {
   file_name: string
   source: string
   dataset_type: "sales" | "claims"
+  job_id?: string
   rows_in: number
   rows_after_filter: number
   ai_mapping: {
     message?: string
     can_reverse_map: boolean
+  }
+  db_match?: {
+    rows_in_scope: number
+    existing_rows_matched: number
+    new_rows_detected: number
+    match_ratio: number
   }
   mapping_quality: {
     required_found: number
@@ -150,6 +157,7 @@ export type AdminFilterAnalyzeResponse = {
   key_detection: {
     primary_key_name: string
     key_column: string | null
+    key_columns?: string[]
     strategy: string
     key_candidates: string[]
     missing_key_values: number
@@ -171,6 +179,7 @@ export type AdminFilterApplyResponse = {
   job_id?: string
   deleted_rows: number
   rows_inserted: number
+  rows_updated?: number
   revision_id?: number | null
   summary?: string
 }
@@ -744,11 +753,13 @@ export async function analyzeAdminFilterFile(payload: {
   file: File
   source: string
   dataset_type: "sales" | "claims"
+  job_id?: string
 }): Promise<AdminFilterAnalyzeResponse> {
   const form = new FormData()
   form.append("file", payload.file)
   form.append("source", payload.source)
   form.append("dataset_type", payload.dataset_type)
+  if (payload.job_id) form.append("job_id", payload.job_id)
   return fetchJsonWithFallback("/admin/files/filter-analyze", "", {
     method: "POST",
     body: form,

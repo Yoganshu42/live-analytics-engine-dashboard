@@ -163,23 +163,13 @@ export default function KpiCardsRow({
   useEffect(() => {
     let mounted = true
 
-    const sourceKey = (source || "").trim().toLowerCase()
-    const isGodrejSales =
-      datasetType === "sales" &&
-      (sourceKey === "godrej" || sourceKey === "goodrej" || sourceKey === "goddrej")
-
-    const summaryParams: Parameters<typeof fetchSummary>[0] = isGodrejSales
-      ? {
-          source,
-          dataset_type: datasetType,
-        }
-      : {
-          job_id: jobId,
-          source,
-          dataset_type: datasetType,
-          from_date: fromDate,
-          to_date: toDate,
-        }
+    const summaryParams: Parameters<typeof fetchSummary>[0] = {
+      job_id: jobId,
+      source,
+      dataset_type: datasetType,
+      from_date: fromDate,
+      to_date: toDate,
+    }
 
     const freshnessParams: Parameters<typeof fetchLastUpdated>[0] = {
       job_id: jobId,

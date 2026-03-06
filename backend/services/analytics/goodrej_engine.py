@@ -643,7 +643,20 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 else:
                     parsed = parsed.where(~bad_year, pd.NaT)
 
-        return parsed
+        return self._clip_month_series_to_report_window(parsed)
+
+    def _clip_month_series_to_report_window(self, series: pd.Series) -> pd.Series:
+        if series is None or series.empty or not self.apply_date_filter:
+            return series
+
+        out = series.copy()
+        if self.report_start is not None and self.report_start is not pd.NaT:
+            lower = pd.Timestamp(self.report_start).to_period("M").to_timestamp()
+            out = out.where(out >= lower, pd.NaT)
+        if self.report_end is not None and self.report_end is not pd.NaT:
+            upper = pd.Timestamp(self.report_end).to_period("M").to_timestamp(how="end")
+            out = out.where(out <= upper, pd.NaT)
+        return out
 
     def _resolve_dimension(
         self,
