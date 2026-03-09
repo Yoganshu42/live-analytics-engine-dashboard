@@ -29,6 +29,11 @@ from services.precomputed_repository import (
     upsert_precomputed_summary,
 )
 from services.manual_update_service import mark_manual_update
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_SOURCES,
+    SAMSUNG_SOURCE_VARIANTS,
+    normalize_samsung_source,
+)
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 logger = logging.getLogger(__name__)
 
@@ -36,10 +41,9 @@ logger = logging.getLogger(__name__)
 def _normalize_source(source: str) -> tuple[str, str]:
     source_key = source.lower().strip()
     # normalize known aliases
-    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung vs", "samsung vijay sales", "vijay sales"}:
-        resolved = "samsung_vs"
-    elif source_key in {"samsung_croma", "samsung croma", "croma"}:
-        resolved = "samsung_croma"
+    samsung_source = normalize_samsung_source(source_key)
+    if samsung_source:
+        resolved = samsung_source
     elif source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         resolved = "reliance"
     elif source_key in {"godrej", "goodrej", "goddrej"}:
@@ -588,7 +592,7 @@ def _load_city_breakdown_dataframe(
 ) -> pd.DataFrame:
     if resolved_source == "samsung":
         frames: list[pd.DataFrame] = []
-        for src in ["samsung_vs", "samsung_croma"]:
+        for src in SAMSUNG_PARTNER_SOURCES:
             frame = get_dataframe(
                 db=db,
                 job_id=job_id,
@@ -1050,7 +1054,7 @@ def _is_samsung_claims_loss_ratio_cache_suspicious(
 
         value_candidates: list[Any] = []
         if overview_mode:
-            value_candidates.extend([row.get("samsung_vs"), row.get("samsung_croma")])
+            value_candidates.extend([row.get(partner_key) for partner_key in SAMSUNG_PARTNER_SOURCES])
         else:
             metric_col = safe_map.get(metric_key) or safe_map.get(_to_safe_key(metric or ""))
             value_candidates.append(row.get(metric_col) if metric_col is not None else row.get(metric))
@@ -1332,13 +1336,13 @@ def compute_by_dimension_rows(
 
             # Run sequentially in-request: avoids thread-unsafe Session sharing and
             # prevents intermittent DB SSL/connection failures under load.
-            _fetch_and_merge("samsung_vs", "samsung_vs")
-            _fetch_and_merge("samsung_croma", "samsung_croma")
+            for partner_key in SAMSUNG_PARTNER_SOURCES:
+                _fetch_and_merge(partner_key, partner_key)
 
             out_rows = list(merged.values())
             for row in out_rows:
-                row["samsung_vs"] = row.get("samsung_vs", 0.0)
-                row["samsung_croma"] = row.get("samsung_croma", 0.0)
+                for partner_key in SAMSUNG_PARTNER_SOURCES:
+                    row[partner_key] = row.get(partner_key, 0.0)
 
             if dim_key in {"month", "date"}:
                 out_rows.sort(key=lambda r: str(r.get(dim_key, "")))
@@ -1488,17 +1492,17 @@ def analytics_by_dimension(
 
     metric_key = _to_safe_key(metric or "")
     dimension_key = _to_safe_key(dimension or "")
-    force_live_samsung_sales_earned = (
+    force_live_samsung_sales_metrics = (
         resolved_source.startswith("samsung")
         and normalized_dataset == "sales"
-        and metric_key in {"earned_premium", "zopper_earned_premium"}
+        and metric_key in {"gross_premium", "earned_premium", "zopper_earned_premium"}
     )
     force_live_samsung_claims_trend = (
         resolved_source.startswith("samsung")
         and normalized_dataset == "claims"
         and dimension_key in {"month", "date"}
     )
-    cached = None if (force_live_samsung_sales_earned or force_live_samsung_claims_trend) else get_precomputed_graph(
+    cached = None if (force_live_samsung_sales_metrics or force_live_samsung_claims_trend) else get_precomputed_graph(
         db=db,
         source=resolved_source,
         dataset_type=normalized_dataset,
@@ -1521,13 +1525,12 @@ def analytics_by_dimension(
         dimension_key = _to_safe_key(dimension or "")
         if isinstance(cached[0], dict):
             row_keys = {_to_safe_key(str(k)) for k in cached[0].keys()}
-            has_compare_keys = "samsung_vs" in row_keys or "samsung_croma" in row_keys
+            has_compare_keys = any(partner_key in row_keys for partner_key in SAMSUNG_PARTNER_SOURCES)
             is_samsung_overview_shape = (
                 resolved_source == "samsung"
-                and "samsung_vs" in row_keys
-                and "samsung_croma" in row_keys
+                and all(partner_key in row_keys for partner_key in SAMSUNG_PARTNER_SOURCES)
             )
-            if resolved_source in {"samsung_vs", "samsung_croma"} and has_compare_keys and metric_key not in row_keys:
+            if resolved_source in SAMSUNG_PARTNER_SOURCES and has_compare_keys and metric_key not in row_keys:
                 is_stale_cached_shape = True
             if metric_key and metric_key not in row_keys and not is_samsung_overview_shape:
                 is_stale_cached_shape = True
@@ -1546,7 +1549,10 @@ def analytics_by_dimension(
 
         if resolved_source == "samsung":
             merged_dim_values: set[str] = set()
-            merged_partner_totals = {"samsung_vs": 0.0, "samsung_croma": 0.0}
+            merged_partner_totals = {
+                partner_key: 0.0
+                for partner_key in SAMSUNG_PARTNER_SOURCES
+            }
 
             for row in cached:
                 if not isinstance(row, dict):
@@ -1562,7 +1568,7 @@ def analytics_by_dimension(
                 if dim_val is not None:
                     merged_dim_values.add(str(dim_val))
 
-                for partner_key in ("samsung_vs", "samsung_croma"):
+                for partner_key in SAMSUNG_PARTNER_SOURCES:
                     try:
                         partner_value = float(row.get(partner_key, 0) or 0)
                     except Exception:
@@ -1612,15 +1618,12 @@ def analytics_by_dimension(
 
                 return partner_dims, has_non_zero
 
-            vs_dims, vs_has_non_zero = _partner_snapshot("samsung_vs")
-            croma_dims, croma_has_non_zero = _partner_snapshot("samsung_croma")
-
-            if (vs_dims - merged_dim_values) or (croma_dims - merged_dim_values):
-                is_stale_samsung_partner_mismatch = True
-            if vs_has_non_zero and merged_partner_totals["samsung_vs"] <= 1e-12:
-                is_stale_samsung_partner_mismatch = True
-            if croma_has_non_zero and merged_partner_totals["samsung_croma"] <= 1e-12:
-                is_stale_samsung_partner_mismatch = True
+            for partner_key in SAMSUNG_PARTNER_SOURCES:
+                partner_dims, partner_has_non_zero = _partner_snapshot(partner_key)
+                if partner_dims - merged_dim_values:
+                    is_stale_samsung_partner_mismatch = True
+                if partner_has_non_zero and merged_partner_totals[partner_key] <= 1e-12:
+                    is_stale_samsung_partner_mismatch = True
             if (
                 normalized_dataset == "claims"
                 and metric_key == "loss_ratio"
@@ -2459,7 +2462,7 @@ def compute_summary_values(
                 "zopper_earned_premium": 0.0,
                 "units_sold": 0,
             }
-            for src in ["samsung_vs", "samsung_croma"]:
+            for src in SAMSUNG_PARTNER_SOURCES:
                 engine = engine_cls(
                     db=db,
                     job_id=job_id,
@@ -2819,7 +2822,7 @@ def _master_source_bounds(
     min_dt: pd.Timestamp | None = None
     max_dt: pd.Timestamp | None = None
 
-    for source_key in ["samsung_vs", "samsung_croma", "reliance", "godrej"]:
+    for source_key in [*SAMSUNG_PARTNER_SOURCES, "reliance", "godrej"]:
         for dataset_key in ["sales", "claims"]:
             for candidate_job_id in _master_job_candidates(source_key, job_id):
                 local_min, local_max = _date_bounds_for_source_dataset(
@@ -2862,7 +2865,7 @@ def _load_master_summary(
     to_date: str | None,
 ) -> tuple[dict[str, Any], str | None]:
     source_key = (source or "").strip().lower()
-    force_live_summary = source_key in {"samsung_vs", "samsung_croma"} and dataset_type in {"sales", "claims"}
+    force_live_summary = source_key in SAMSUNG_PARTNER_SOURCES and dataset_type in {"sales", "claims"}
     selected_summary: dict[str, Any] = {}
     selected_job_id: str | None = candidate_job_ids[0] if candidate_job_ids else None
     for candidate_job_id in candidate_job_ids:
@@ -2915,7 +2918,7 @@ def _load_master_metric_rows(
     to_date: str | None,
 ) -> list[dict[str, Any]]:
     source_key = (source or "").strip().lower()
-    force_live_rows = source_key in {"samsung_vs", "samsung_croma"} and dataset_type in {"sales", "claims"}
+    force_live_rows = source_key in SAMSUNG_PARTNER_SOURCES and dataset_type in {"sales", "claims"}
     ordered_candidates: list[str | None] = []
     if preferred_job_id in candidate_job_ids:
         ordered_candidates.append(preferred_job_id)
@@ -3021,6 +3024,7 @@ def _build_master_dashboard_payload(
     source_configs = [
         ("samsung_vs", "samsung_vs"),
         ("samsung_croma", "samsung_croma"),
+        ("samsung_reliance_digital", "samsung_reliance_digital"),
         ("reliance", "reliance"),
         ("godrej", "godrej"),
     ]
@@ -3128,10 +3132,12 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "samsung_claims",
         "samsung_vs_sales",
         "samsung_croma_sales",
+        "samsung_reliance_digital_sales",
         "reliance_sales",
         "godrej_sales",
         "samsung_vs_claims",
         "samsung_croma_claims",
+        "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
     }
@@ -3144,6 +3150,9 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "samsung_croma_gross",
         "samsung_croma_earned",
         "samsung_croma_zopper",
+        "samsung_reliance_digital_gross",
+        "samsung_reliance_digital_earned",
+        "samsung_reliance_digital_zopper",
         "reliance_gross",
         "reliance_earned",
         "reliance_zopper",
@@ -3152,6 +3161,7 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "godrej_zopper",
         "samsung_vs_claims",
         "samsung_croma_claims",
+        "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
     }
@@ -3189,6 +3199,7 @@ def _latest_master_marker_updated_at(
         "samsung",
         "samsung_vs",
         "samsung_croma",
+        "samsung_reliance_digital",
         "samsung_vijay_sales",
         "reliance",
         "godrej",
@@ -3310,7 +3321,7 @@ def analytics_summary(
 
     if resolved_source == "samsung" and not force_live_summary:
         partner_rows: list[dict[str, Any]] = []
-        for partner_source in ["samsung_vs", "samsung_croma"]:
+        for partner_source in SAMSUNG_PARTNER_SOURCES:
             partner_summary = get_precomputed_summary(
                 db=db,
                 source=partner_source,
@@ -3359,7 +3370,7 @@ def analytics_summary(
         )
 
         source_variants = (
-            ["samsung_vs", "samsung_croma", "samsung_vijay_sales", "samsung"]
+            list(SAMSUNG_SOURCE_VARIANTS)
             if resolved_source == "samsung"
             else [resolved_source]
         )
@@ -3472,7 +3483,7 @@ def analytics_last_updated(
     job_key = (job_id or "").strip()
 
     source_variants = (
-        ["samsung", "samsung_vs", "samsung_croma", "samsung_vijay_sales"]
+        list(SAMSUNG_SOURCE_VARIANTS)
         if resolved_source == "samsung"
         else [resolved_source]
     )
@@ -3561,20 +3572,19 @@ def analytics_date_bounds(
     dataset_key = (dataset_type or "").strip().lower()
 
     if resolved_source == "samsung":
-        vs_min, vs_max = _date_bounds_for_source_dataset(
-            db=db,
-            source="samsung_vs",
-            dataset_type=dataset_key,
-            job_id=job_id,
-        )
-        cr_min, cr_max = _date_bounds_for_source_dataset(
-            db=db,
-            source="samsung_croma",
-            dataset_type=dataset_key,
-            job_id=job_id,
-        )
-        min_date = min(d for d in [vs_min, cr_min] if d is not None) if (vs_min or cr_min) else None
-        max_date = max(d for d in [vs_max, cr_max] if d is not None) if (vs_max or cr_max) else None
+        bounds = [
+            _date_bounds_for_source_dataset(
+                db=db,
+                source=partner_source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+            )
+            for partner_source in SAMSUNG_PARTNER_SOURCES
+        ]
+        min_candidates = [local_min for local_min, _local_max in bounds if local_min is not None]
+        max_candidates = [local_max for _local_min, local_max in bounds if local_max is not None]
+        min_date = min(min_candidates) if min_candidates else None
+        max_date = max(max_candidates) if max_candidates else None
     else:
         min_date, max_date = _date_bounds_for_source_dataset(
             db=db,

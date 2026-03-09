@@ -31,6 +31,11 @@ from services.partner_filter_service import (
     dataframe_to_payload_rows,
     normalize_partner_dataframe,
 )
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_SOURCES,
+    is_samsung_source,
+    normalize_samsung_source,
+)
 
 router = APIRouter(
     prefix="/admin/files",
@@ -51,10 +56,9 @@ def _normalize_source_key(value: str | None) -> str | None:
     source_key = _normalize(value)
     if source_key is None:
         return None
-    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung vs", "samsung vijay sales", "vijay sales"}:
-        return "samsung_vs"
-    if source_key in {"samsung_croma", "samsung croma", "croma"}:
-        return "samsung_croma"
+    samsung_source = normalize_samsung_source(source_key)
+    if samsung_source:
+        return samsung_source
     if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         return "reliance"
     if source_key in {"godrej", "goodrej", "goddrej"}:
@@ -64,7 +68,7 @@ def _normalize_source_key(value: str | None) -> str | None:
 
 def _normalize_source_for_mapper(source: str) -> str:
     source_key = _normalize_source_key(source) or ""
-    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
+    if is_samsung_source(source_key):
         return "samsung"
     return source_key
 
@@ -368,6 +372,7 @@ def _build_filter_ai_diagnostics(
 
     right_mappings: list[dict[str, Any]] = []
     wrong_mappings: list[dict[str, Any]] = []
+    canonical_fields = normalize_meta.get("canonical_fields") if isinstance(normalize_meta, dict) else {}
     for item in mappings:
         if not isinstance(item, dict):
             continue
@@ -378,6 +383,10 @@ def _build_filter_ai_diagnostics(
         column = str(item.get("suggested_column") or "").strip()
         reason = item.get("reasoning") if isinstance(item.get("reasoning"), list) else []
         reason_text = ", ".join([str(v) for v in reason if str(v).strip()][:2])
+        canonical_status = canonical_fields.get(field) if isinstance(canonical_fields, dict) else None
+        canonical_column = str((canonical_status or {}).get("column") or "").strip()
+        canonical_fill_ratio = float((canonical_status or {}).get("fill_ratio") or 0.0)
+        canonical_available = bool((canonical_status or {}).get("available"))
 
         if found and column and confidence >= 0.55:
             right_mappings.append(
@@ -389,21 +398,43 @@ def _build_filter_ai_diagnostics(
             )
             continue
 
+        if canonical_available and canonical_column and canonical_fill_ratio >= 0.55:
+            right_mappings.append(
+                {
+                    "field": field,
+                    "column": canonical_column,
+                    "confidence": round(max(confidence, canonical_fill_ratio), 3),
+                }
+            )
+            continue
+
         if required and (not found or confidence < 0.55):
             wrong_mappings.append(
                 {
                     "field": field,
-                    "column": column or None,
-                    "confidence": round(confidence, 3),
+                    "column": column or canonical_column or None,
+                    "confidence": round(max(confidence, canonical_fill_ratio), 3),
                     "issue": "Required mapping is missing" if not found else "Low-confidence mapping",
                     "reason": reason_text or "Insufficient signal in uploaded column values",
                 }
             )
 
     smart_meta = normalize_meta.get("smart_mapping") if isinstance(normalize_meta, dict) else {}
-    required_found = int((smart_meta or {}).get("required_found") or 0)
-    required_total = int((smart_meta or {}).get("required_total") or 0)
-    coverage = float((smart_meta or {}).get("coverage") or 0.0)
+    required_found = int(
+        suggestion.get("required_fields_found")
+        or (smart_meta or {}).get("required_found")
+        or 0
+    )
+    required_total = int(
+        suggestion.get("required_fields_total")
+        or (smart_meta or {}).get("required_total")
+        or 0
+    )
+    coverage = float(
+        suggestion.get("coverage")
+        or (smart_meta or {}).get("coverage")
+        or 0.0
+    )
     duplicates = int(key_meta.get("duplicate_keys_in_file") or 0)
     missing_keys = int(key_meta.get("missing_key_values") or 0)
     strategy = str(key_meta.get("strategy") or "composite_hash")
@@ -463,6 +494,82 @@ def _build_filter_ai_diagnostics(
         "issues": issues,
         "planned_changes": planned_changes,
     }
+
+
+def _merge_effective_mapping_with_normalization(
+    *,
+    suggestion: dict[str, Any],
+    normalize_meta: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(suggestion, dict):
+        return {
+            "required_fields_found": 0,
+            "required_fields_total": 0,
+            "coverage": 0.0,
+            "can_reverse_map": False,
+            "message": "Required fields were not recognized. Please verify source or column headers.",
+            "mappings": [],
+        }
+
+    canonical_fields = normalize_meta.get("canonical_fields") if isinstance(normalize_meta, dict) else {}
+    raw_mappings = suggestion.get("mappings") if isinstance(suggestion.get("mappings"), list) else []
+    mappings: list[dict[str, Any]] = []
+    required_total = 0
+    required_found = 0
+
+    for raw_item in raw_mappings:
+        if not isinstance(raw_item, dict):
+            continue
+
+        item = dict(raw_item)
+        field = str(item.get("field") or "").strip()
+        required = bool(item.get("required"))
+        found = bool(item.get("found"))
+        confidence = float(item.get("confidence") or 0.0)
+        suggested_column = str(item.get("suggested_column") or "").strip() or None
+        reasoning = item.get("reasoning") if isinstance(item.get("reasoning"), list) else []
+
+        canonical_status = canonical_fields.get(field) if isinstance(canonical_fields, dict) else None
+        canonical_column = str((canonical_status or {}).get("column") or "").strip() or None
+        canonical_available = bool((canonical_status or {}).get("available"))
+        canonical_fill_ratio = float((canonical_status or {}).get("fill_ratio") or 0.0)
+
+        if canonical_available and canonical_column:
+            found = True
+            if field == "device_plan_category" or not suggested_column or confidence < 0.55:
+                suggested_column = canonical_column
+            confidence = max(confidence, canonical_fill_ratio, 0.56)
+            if "backend canonical normalization populated this field" not in reasoning:
+                reasoning = [*reasoning, "backend canonical normalization populated this field"]
+
+        item["found"] = found
+        item["suggested_column"] = suggested_column
+        item["confidence"] = round(confidence, 4)
+        item["reasoning"] = reasoning
+        mappings.append(item)
+
+        if required:
+            required_total += 1
+            if found:
+                required_found += 1
+
+    coverage = 1.0 if required_total == 0 else float(required_found) / float(required_total)
+    can_reverse_map = coverage >= 0.999
+    if can_reverse_map:
+        message = "Reverse mapping is possible for this upload."
+    elif required_found == 0:
+        message = "Required fields were not recognized. Please verify source or column headers."
+    else:
+        message = "Partial mapping found. Backend normalization will auto-fill the remaining recognized fields."
+
+    merged = dict(suggestion)
+    merged["required_fields_found"] = int(required_found)
+    merged["required_fields_total"] = int(required_total)
+    merged["coverage"] = round(coverage, 4)
+    merged["can_reverse_map"] = bool(can_reverse_map)
+    merged["message"] = message
+    merged["mappings"] = mappings
+    return merged
 
 
 def _build_existing_row_match_preview(
@@ -542,10 +649,8 @@ def _post_file_update(
     )
 
     refresh_sources: list[str] = [source_norm]
-    if source_norm in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
+    if source_norm in SAMSUNG_PARTNER_SOURCES:
         refresh_sources.append("samsung")
-    if source_norm == "samsung_vijay_sales":
-        refresh_sources.append("samsung_vs")
     refresh_sources = list(dict.fromkeys(refresh_sources))
 
     # Refresh both the exact tag and the aggregate ("all tags") view when a job-specific
@@ -913,8 +1018,17 @@ async def reverse_map_file(
         source=mapped_source,
         dataset_type=dataset_norm,
     )
-    suggestion["file_name"] = file.filename or ""
-    return suggestion
+    _, normalize_meta = normalize_partner_dataframe(
+        df,
+        source=source_norm,
+        dataset_type=dataset_norm,
+    )
+    effective_suggestion = _merge_effective_mapping_with_normalization(
+        suggestion=suggestion,
+        normalize_meta=normalize_meta,
+    )
+    effective_suggestion["file_name"] = file.filename or ""
+    return effective_suggestion
 
 
 @router.post("/filter-analyze")
@@ -948,10 +1062,14 @@ async def analyze_filter_file(
         source=source_norm,
         dataset_type=dataset_norm,
     )
+    effective_suggestion = _merge_effective_mapping_with_normalization(
+        suggestion=suggestion,
+        normalize_meta=normalize_meta,
+    )
     payloads = dataframe_to_payload_rows(normalized_df)
     storage_rows, key_meta = prepare_rows_for_storage(payloads, source=source_norm, dataset_type=dataset_norm)
     diagnostics = _build_filter_ai_diagnostics(
-        suggestion=suggestion,
+        suggestion=effective_suggestion,
         normalize_meta=normalize_meta,
         key_meta=key_meta,
     )
@@ -971,8 +1089,8 @@ async def analyze_filter_file(
         "rows_in": int(len(raw_df)),
         "rows_after_filter": int(key_meta.get("rows_out") or 0),
         "ai_mapping": {
-            "message": suggestion.get("message"),
-            "can_reverse_map": bool(suggestion.get("can_reverse_map")),
+            "message": effective_suggestion.get("message"),
+            "can_reverse_map": bool(effective_suggestion.get("can_reverse_map")),
         },
         "db_match": db_match,
         **diagnostics,

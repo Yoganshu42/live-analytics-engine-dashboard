@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from routers.analytics import compute_by_dimension_rows, compute_summary_values
 from services.analytics_engine import filter_by_date_range
 from services.analytics_repository import get_dataframe
+from services.samsung_partner_config import SAMSUNG_PARTNER_LABELS, SAMSUNG_PARTNER_SOURCES
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -29,8 +30,7 @@ from matplotlib.ticker import FuncFormatter  # noqa: E402
 
 
 PARTNER_DISPLAY = {
-    "samsung_vs": "Samsung Vijay Sales",
-    "samsung_croma": "Samsung Croma",
+    **SAMSUNG_PARTNER_LABELS,
     "reliance": "Reliance ResQ",
     "godrej": "Godrej",
 }
@@ -38,15 +38,17 @@ PARTNER_DISPLAY = {
 PARTNER_LOGO = {
     "samsung_vs": "vs_logo.jpg",
     "samsung_croma": "croma_logo.jpg",
+    "samsung_reliance_digital": "reliance_digital_logo.png",
     "reliance": "resq.png",
     "godrej": "Group 1244833444.png",
 }
 
-DEFAULT_PARTNERS = ["samsung_vs", "samsung_croma", "reliance", "godrej"]
+DEFAULT_PARTNERS = [*SAMSUNG_PARTNER_SOURCES, "reliance", "godrej"]
 
 DIMENSION_CANDIDATES = {
     "samsung_vs": ["month", "state", "plan_category", "device_plan_category", "model_code"],
     "samsung_croma": ["month", "state", "plan_category", "device_plan_category", "model_code"],
+    "samsung_reliance_digital": ["month", "state", "plan_category", "device_plan_category", "model_code"],
     "reliance": ["month", "state", "plan_category", "article_brand"],
     "godrej": ["month", "state", "channel", "product_category"],
 }
@@ -99,12 +101,15 @@ def resolve_partners(raw_partners: list[str] | None) -> list[str]:
         return list(DEFAULT_PARTNERS)
 
     aliases = {
-        "samsung": ["samsung_vs", "samsung_croma"],
+        "samsung": list(SAMSUNG_PARTNER_SOURCES),
         "samsung_vs": ["samsung_vs"],
         "samsung_vijay_sales": ["samsung_vs"],
         "vijay sales": ["samsung_vs"],
         "samsung_croma": ["samsung_croma"],
         "croma": ["samsung_croma"],
+        "samsung_reliance_digital": ["samsung_reliance_digital"],
+        "samsung reliance digital": ["samsung_reliance_digital"],
+        "reliance digital": ["samsung_reliance_digital"],
         "reliance": ["reliance"],
         "reliance_resq": ["reliance"],
         "resq": ["reliance"],
@@ -225,7 +230,7 @@ def _build_partner_preview_item(*, db: Session, scope: DeckScope) -> dict[str, A
         to_date=scope.to_date,
     )
 
-    if scope.dataset_type == "sales" and scope.source in {"samsung_vs", "samsung_croma"}:
+    if scope.dataset_type == "sales" and scope.source in SAMSUNG_PARTNER_SOURCES:
         week_gross = _fetch_samsung_week_rows(
             db=db,
             source=scope.source,
@@ -283,7 +288,7 @@ def _build_partner_preview_item(*, db: Session, scope: DeckScope) -> dict[str, A
     state_points = sorted(state_points, key=lambda item: item.get("gross_premium", 0.0), reverse=True)[:8]
 
     product_points: list[dict[str, Any]] = []
-    if scope.source in {"samsung_vs", "samsung_croma"}:
+    if scope.source in SAMSUNG_PARTNER_SOURCES:
         product_gross_rows, product_metric = _fetch_primary_metric_rows(
             db=db,
             source=scope.source,
@@ -1282,7 +1287,7 @@ def _fetch_samsung_week_rows(
     from_date: str | None,
     to_date: str | None,
 ) -> list[dict[str, Any]]:
-    if dataset_type != "sales" or source not in {"samsung_vs", "samsung_croma"}:
+    if dataset_type != "sales" or source not in SAMSUNG_PARTNER_SOURCES:
         return []
 
     try:

@@ -16,7 +16,9 @@ import Sidebar from "@/components/Sidebar"
 import Tabs from "@/components/Tabs"
 import { clearGraphDataCache } from "@/components/GraphView"
 import DateRangePicker from "@/components/DateRangePicker"
+import HomeParticleField from "@/components/HomeParticleField"
 import { fetchDateBounds, fetchAuthMe } from "./lib/api"
+import { normalizeSamsungSource } from "@/lib/samsungPartners"
 
 const GraphSection = dynamic(() => import("@/components/GraphSection"), {
   ssr: false,
@@ -63,12 +65,12 @@ const staggerContainer: Variants = {
 }
 
 const cardHover: Variants = {
-  initial: { scale: 1, y: 0, boxShadow: "0px 18px 44px rgba(148,163,184,0.2)" },
-  hover: { 
-    scale: 1.018, 
-    y: -10, 
-    boxShadow: "0px 28px 80px rgba(14,165,233,0.16)",
-    transition: { duration: 0.4, ease: "easeOut" } 
+  initial: { scale: 1, y: 0, boxShadow: "0px 26px 72px rgba(94,118,160,0.12)" },
+  hover: {
+    scale: 1.01,
+    y: -6,
+    boxShadow: "0px 34px 88px rgba(109,137,179,0.18)",
+    transition: { duration: 0.32, ease: [0.22, 1, 0.36, 1] }
   }
 }
 
@@ -89,21 +91,12 @@ type NeuralGlowField = {
   blur: number
 }
 
-type NeuralNode = {
-  left: string
+type HomeWave = {
   top: string
-  size: number
-  color: string
-  duration: number
-  delay: number
-}
-
-type NeuralConnection = {
-  left: string
-  top: string
-  width: number
-  rotate: number
-  color: string
+  path: string
+  stroke: string
+  opacity: number
+  strokeWidth: number
   duration: number
   delay: number
 }
@@ -123,79 +116,86 @@ type AnalyticalPanel = {
 }
 
 const NEURAL_GLOW_FIELDS: NeuralGlowField[] = [
-  { left: "4%", top: "8%", size: 210, color: "rgba(56,189,248,0.14)", dx: 18, dy: -14, duration: 14.8, delay: 0.3, blur: 20 },
-  { left: "22%", top: "54%", size: 190, color: "rgba(99,102,241,0.1)", dx: -14, dy: -20, duration: 17.1, delay: 1.0, blur: 18 },
-  { left: "38%", top: "18%", size: 230, color: "rgba(59,130,246,0.12)", dx: 16, dy: -16, duration: 18.3, delay: 0.5, blur: 22 },
-  { left: "58%", top: "34%", size: 200, color: "rgba(20,184,166,0.12)", dx: 20, dy: -12, duration: 16.5, delay: 1.4, blur: 19 },
-  { left: "78%", top: "12%", size: 190, color: "rgba(125,211,252,0.11)", dx: -18, dy: -20, duration: 15.9, delay: 0.8, blur: 18 },
-  { left: "72%", top: "72%", size: 220, color: "rgba(14,165,233,0.12)", dx: 16, dy: -18, duration: 17.7, delay: 0.9, blur: 21 },
-  { left: "12%", top: "78%", size: 180, color: "rgba(15,23,42,0.08)", dx: 22, dy: -14, duration: 15.6, delay: 1.3, blur: 17 },
+  { left: "-7%", top: "1%", size: 460, color: "rgba(255,255,255,0.94)", dx: 14, dy: -8, duration: 26, delay: 0.2, blur: 52 },
+  { left: "10%", top: "14%", size: 360, color: "rgba(132,211,255,0.18)", dx: 12, dy: -10, duration: 24, delay: 0.7, blur: 42 },
+  { left: "33%", top: "10%", size: 460, color: "rgba(255,255,255,0.88)", dx: 12, dy: -6, duration: 23, delay: 0.45, blur: 48 },
+  { left: "56%", top: "8%", size: 360, color: "rgba(189,181,255,0.18)", dx: -10, dy: -8, duration: 24, delay: 1, blur: 38 },
+  { left: "74%", top: "11%", size: 430, color: "rgba(240,245,255,0.92)", dx: -14, dy: -10, duration: 26, delay: 0.35, blur: 44 },
+  { left: "73%", top: "45%", size: 460, color: "rgba(126,187,255,0.15)", dx: -10, dy: -10, duration: 22, delay: 1.25, blur: 44 },
+  { left: "4%", top: "58%", size: 410, color: "rgba(255,255,255,0.86)", dx: 8, dy: -6, duration: 28, delay: 0.65, blur: 46 },
+  { left: "31%", top: "72%", size: 360, color: "rgba(255,255,255,0.9)", dx: 10, dy: -6, duration: 24, delay: 1.05, blur: 36 },
 ]
 
-const NEURAL_CONNECTIONS: NeuralConnection[] = [
-  { left: "10%", top: "28%", width: 190, rotate: 14, color: "rgba(56,189,248,0.2)", duration: 6.8, delay: 0.2 },
-  { left: "18%", top: "44%", width: 165, rotate: -11, color: "rgba(59,130,246,0.18)", duration: 6.2, delay: 0.9 },
-  { left: "34%", top: "24%", width: 200, rotate: 16, color: "rgba(99,102,241,0.18)", duration: 5.9, delay: 0.4 },
-  { left: "48%", top: "52%", width: 210, rotate: -9, color: "rgba(20,184,166,0.2)", duration: 6.5, delay: 1.1 },
-  { left: "62%", top: "20%", width: 185, rotate: 12, color: "rgba(14,165,233,0.16)", duration: 5.6, delay: 0.7 },
-  { left: "70%", top: "64%", width: 170, rotate: -17, color: "rgba(6,182,212,0.18)", duration: 6.1, delay: 0.6 },
-  { left: "56%", top: "74%", width: 150, rotate: 10, color: "rgba(15,23,42,0.14)", duration: 5.7, delay: 1.3 },
-]
-
-const NEURAL_NODES: NeuralNode[] = [
-  { left: "12%", top: "26%", size: 12, color: "rgba(56,189,248,0.9)", duration: 4.3, delay: 0.2 },
-  { left: "20%", top: "41%", size: 9, color: "rgba(59,130,246,0.84)", duration: 3.9, delay: 0.7 },
-  { left: "31%", top: "22%", size: 11, color: "rgba(99,102,241,0.88)", duration: 4.5, delay: 0.3 },
-  { left: "44%", top: "34%", size: 8, color: "rgba(20,184,166,0.86)", duration: 3.8, delay: 1.0 },
-  { left: "51%", top: "50%", size: 10, color: "rgba(14,165,233,0.82)", duration: 4.1, delay: 1.2 },
-  { left: "63%", top: "24%", size: 10, color: "rgba(125,211,252,0.82)", duration: 4.6, delay: 0.9 },
-  { left: "71%", top: "40%", size: 9, color: "rgba(59,130,246,0.84)", duration: 3.7, delay: 0.5 },
-  { left: "78%", top: "62%", size: 11, color: "rgba(6,182,212,0.88)", duration: 4.0, delay: 0.6 },
-  { left: "60%", top: "76%", size: 8, color: "rgba(30,41,59,0.6)", duration: 3.6, delay: 1.4 },
-  { left: "87%", top: "28%", size: 12, color: "rgba(20,184,166,0.8)", duration: 4.4, delay: 1.1 },
+const HOME_WAVES: HomeWave[] = [
+  {
+    top: "10%",
+    path: "M-140 184 C 44 76, 214 268, 472 170 S 916 92, 1248 170 S 1528 284, 1760 160",
+    stroke: "rgba(255,255,255,0.7)",
+    opacity: 0.64,
+    strokeWidth: 1.35,
+    duration: 30,
+    delay: 0.1,
+  },
+  {
+    top: "24%",
+    path: "M-170 228 C 54 114, 258 294, 536 224 S 960 124, 1226 216 S 1542 310, 1772 220",
+    stroke: "rgba(178,224,255,0.54)",
+    opacity: 0.58,
+    strokeWidth: 1.18,
+    duration: 34,
+    delay: 0.8,
+  },
+  {
+    top: "42%",
+    path: "M-128 252 C 124 164, 330 336, 580 256 S 948 160, 1220 236 S 1532 326, 1750 230",
+    stroke: "rgba(255,255,255,0.62)",
+    opacity: 0.52,
+    strokeWidth: 1.08,
+    duration: 32,
+    delay: 1.2,
+  },
+  {
+    top: "58%",
+    path: "M-126 268 C 86 188, 278 342, 520 282 S 938 198, 1202 260 S 1504 366, 1726 276",
+    stroke: "rgba(195,227,255,0.48)",
+    opacity: 0.46,
+    strokeWidth: 1,
+    duration: 38,
+    delay: 0.5,
+  },
 ]
 
 const ANALYTICAL_PANELS: AnalyticalPanel[] = [
   {
-    left: "5%",
-    top: "18%",
-    width: 220,
-    height: 138,
+    left: "0.5%",
+    top: "15%",
+    width: 238,
+    height: 152,
     rotate: -8,
     delay: 0.2,
     label: "Flow Signal",
-    bars: [18, 30, 26, 42, 58, 46],
-    accent: "rgba(37,99,235,0.82)",
-    secondary: "rgba(125,211,252,0.46)",
-    trendPath: "M6 82 C 24 70, 38 72, 54 58 S 92 42, 122 46 S 162 54, 194 20",
+    bars: [22, 40, 30, 58, 82, 50],
+    accent: "rgba(101,198,255,0.94)",
+    secondary: "rgba(214,235,255,0.9)",
+    trendPath: "M8 82 C 28 74, 42 78, 60 62 S 98 42, 126 46 S 166 60, 198 30",
   },
   {
-    left: "78%",
-    top: "26%",
-    width: 212,
-    height: 132,
-    rotate: 7,
+    left: "79.7%",
+    top: "24%",
+    width: 230,
+    height: 148,
+    rotate: 8,
     delay: 0.7,
     label: "Node Load",
-    bars: [24, 18, 36, 54, 44, 62],
-    accent: "rgba(8,145,178,0.82)",
-    secondary: "rgba(165,243,252,0.42)",
-    trendPath: "M8 76 C 30 56, 52 64, 74 48 S 114 28, 142 34 S 176 58, 194 26",
-  },
-  {
-    left: "12%",
-    top: "72%",
-    width: 230,
-    height: 144,
-    rotate: 6,
-    delay: 1.1,
-    label: "Forecast Grid",
-    bars: [28, 36, 30, 48, 54, 68],
-    accent: "rgba(13,148,136,0.8)",
-    secondary: "rgba(153,246,228,0.4)",
-    trendPath: "M6 86 C 28 72, 50 62, 70 58 S 112 40, 140 46 S 176 66, 206 24",
+    bars: [18, 24, 22, 44, 36, 76],
+    accent: "rgba(126,194,255,0.95)",
+    secondary: "rgba(219,240,255,0.88)",
+    trendPath: "M10 78 C 30 64, 50 74, 74 56 S 116 30, 146 42 S 180 56, 200 48",
   },
 ]
+
+const HOME_DESKTOP_CONTENT_WIDTH = 1280
+const HOME_DESKTOP_CONTENT_FALLBACK_HEIGHT = 860
 
 type InitialDashboardState = {
   view: "home" | "master" | "dashboard"
@@ -229,6 +229,8 @@ export default function DashboardPage() {
     if (key === "reliance resq" || key === "reliance_resq" || key === "reliance-resq" || key === "resq") {
       return "reliance"
     }
+    const samsungSource = normalizeSamsungSource(key)
+    if (samsungSource && samsungSource !== key) return samsungSource
     return key
   }
 
@@ -301,34 +303,49 @@ export default function DashboardPage() {
   const [isLoggingOut, setIsLoggingOut] = useState(false)
   const [jobId] = useState<string | null>(initialDashboardState.jobId)
   const effectiveJobId = jobId
-  const [authRole, setAuthRole] = useState<"admin" | "employee" | null>(null)
-  const [authName, setAuthName] = useState<string>("")
-  const [authReady, setAuthReady] = useState(false)
+  const [authRole, setAuthRole] = useState<"admin" | "employee" | null>(() => {
+    if (typeof window === "undefined") return null
+    const storedRole = localStorage.getItem("auth_role")
+    return storedRole === "admin" || storedRole === "employee" ? storedRole : null
+  })
+  const [authName, setAuthName] = useState<string>(() => {
+    if (typeof window === "undefined") return ""
+    return localStorage.getItem("auth_name") || ""
+  })
+  const [authReady, setAuthReady] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return Boolean(normalizeToken(localStorage.getItem("auth_token")))
+  })
   const prefersReducedMotion = useReducedMotion()
   const homeViewportRef = useRef<HTMLDivElement | null>(null)
+  const homeFitContentRef = useRef<HTMLDivElement | null>(null)
   const { scrollYProgress: homeScrollProgress } = useScroll({ container: homeViewportRef })
   const homePointerX = useMotionValue(0.5)
   const homePointerY = useMotionValue(0.5)
   const homePointerXSpring = useSpring(homePointerX, { stiffness: 180, damping: 24, mass: 0.45 })
   const homePointerYSpring = useSpring(homePointerY, { stiffness: 180, damping: 24, mass: 0.45 })
-  const homeHeroY = useTransform(homeScrollProgress, [0, 1], [0, -132])
-  const homeHeroOpacity = useTransform(homeScrollProgress, [0, 0.85, 1], [1, 0.92, 0.62])
-  const homeCardsY = useTransform(homeScrollProgress, [0, 1], [0, -56])
-  const homeCardsRotateX = useTransform(homeScrollProgress, [0, 1], [0, 10])
-  const homeBackgroundY = useTransform(homeScrollProgress, [0, 1], [0, -120])
-  const homeNetworkX = useTransform(homePointerXSpring, [0, 1], [-32, 32])
-  const homeNetworkY = useTransform(homePointerYSpring, [0, 1], [-24, 24])
-  const homeGlowX = useTransform(homePointerXSpring, [0, 1], [-18, 18])
-  const homeGlowY = useTransform(homePointerYSpring, [0, 1], [-14, 14])
+  const homeHeroY = useTransform(homeScrollProgress, [0, 1], [0, -34])
+  const homeHeroOpacity = useTransform(homeScrollProgress, [0, 0.7, 1], [1, 0.985, 0.92])
+  const homeCardsY = useTransform(homeScrollProgress, [0, 1], [0, -16])
+  const homeCardsRotateX = useTransform(homeScrollProgress, [0, 1], [0, 2.4])
+  const homeNetworkX = useTransform(homePointerXSpring, [0, 1], [-10, 10])
+  const homeNetworkY = useTransform(homePointerYSpring, [0, 1], [-8, 8])
+  const homeGlowX = useTransform(homePointerXSpring, [0, 1], [-14, 14])
+  const homeGlowY = useTransform(homePointerYSpring, [0, 1], [-12, 12])
   const homeCursorPrimaryX = useTransform(homePointerXSpring, [0, 1], ["18%", "82%"])
-  const homeCursorPrimaryY = useTransform(homePointerYSpring, [0, 1], ["16%", "78%"])
-  const homeCursorSecondaryX = useTransform(homePointerXSpring, [0, 1], ["80%", "26%"])
-  const homeCursorSecondaryY = useTransform(homePointerYSpring, [0, 1], ["74%", "22%"])
-  const homeCursorGlow = useMotionTemplate`radial-gradient(circle at ${homeCursorPrimaryX} ${homeCursorPrimaryY}, rgba(56,189,248,0.16), transparent 24%), radial-gradient(circle at ${homeCursorSecondaryX} ${homeCursorSecondaryY}, rgba(20,184,166,0.14), transparent 28%)`
+  const homeCursorPrimaryY = useTransform(homePointerYSpring, [0, 1], ["18%", "76%"])
+  const homeCursorSecondaryX = useTransform(homePointerXSpring, [0, 1], ["76%", "22%"])
+  const homeCursorSecondaryY = useTransform(homePointerYSpring, [0, 1], ["64%", "22%"])
+  const homeCursorGlow = useMotionTemplate`radial-gradient(circle at ${homeCursorPrimaryX} ${homeCursorPrimaryY}, rgba(123, 208, 255, 0.26), transparent 18%), radial-gradient(circle at ${homeCursorSecondaryX} ${homeCursorSecondaryY}, rgba(178, 167, 255, 0.22), transparent 21%), radial-gradient(circle at 50% 52%, rgba(255,255,255,0.52), transparent 40%)`
   const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() => {
     if (typeof window === "undefined") return false
     return window.innerWidth < 768
   })
+  const [homeViewportSize, setHomeViewportSize] = useState(() => ({
+    width: typeof window === "undefined" ? HOME_DESKTOP_CONTENT_WIDTH : window.innerWidth,
+    height: typeof window === "undefined" ? HOME_DESKTOP_CONTENT_FALLBACK_HEIGHT : window.innerHeight,
+  }))
+  const [homeContentHeight, setHomeContentHeight] = useState(HOME_DESKTOP_CONTENT_FALLBACK_HEIGHT)
   const [isMobileFiltersCollapsed, setIsMobileFiltersCollapsed] = useState(false)
 
   const [fromDate, setFromDate] = useState<string>(initialDashboardState.from)
@@ -367,6 +384,10 @@ export default function DashboardPage() {
     const handleResize = () => {
       const mobile = window.innerWidth < 768
       setIsMobileViewport(mobile)
+      setHomeViewportSize({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      })
       if (!mobile) {
         setIsMobileFiltersCollapsed(false)
       }
@@ -377,6 +398,34 @@ export default function DashboardPage() {
       window.removeEventListener("resize", handleResize)
     }
   }, [])
+
+  useEffect(() => {
+    if (typeof window === "undefined" || isMobileViewport || view !== "home") return
+
+    const node = homeFitContentRef.current
+    if (!node) return
+
+    const updateMeasuredHeight = () => {
+      const nextHeight = Math.ceil(node.offsetHeight)
+      if (!nextHeight) return
+      setHomeContentHeight((prev) => (prev === nextHeight ? prev : nextHeight))
+    }
+
+    const frame = window.requestAnimationFrame(updateMeasuredHeight)
+    const observer =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            updateMeasuredHeight()
+          })
+        : null
+
+    observer?.observe(node)
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      observer?.disconnect()
+    }
+  }, [isMobileViewport, view])
 
   const forceFilterRefresh = useCallback(() => {
     clearGraphDataCache()
@@ -421,6 +470,8 @@ export default function DashboardPage() {
         if (!active) return
         setAuthRole(profile.role)
         setAuthName(profile.email)
+        localStorage.setItem("auth_role", profile.role)
+        localStorage.setItem("auth_name", profile.email)
         setAuthReady(true)
       })
       .catch((err: unknown) => {
@@ -669,6 +720,7 @@ export default function DashboardPage() {
       samsung: "Samsung Overview",
       samsung_vs: "Samsung Vijay Sales",
       samsung_croma: "Samsung Croma",
+      samsung_reliance_digital: "Samsung Reliance Digital",
       reliance: "Reliance ResQ",
       godrej: "Godrej"
     }
@@ -713,6 +765,16 @@ export default function DashboardPage() {
         className: "h-5 w-auto object-contain",
       },
     ],
+    samsung_reliance_digital: [
+      samsungProtectMaxLogo,
+      {
+        src: "/reliance_digital_logo.png",
+        alt: "Reliance Digital logo",
+        width: 108,
+        height: 28,
+        className: "h-5 w-auto object-contain",
+      },
+    ],
     reliance: [
       {
         src: "/resq.png",
@@ -750,6 +812,13 @@ export default function DashboardPage() {
       className: "h-5 w-auto object-contain",
     },
     {
+      src: "/reliance_digital_logo.png",
+      alt: "Reliance Digital logo",
+      width: 108,
+      height: 28,
+      className: "h-5 w-auto object-contain",
+    },
+    {
       src: "/resq.png",
       alt: "Reliance ResQ logo",
       width: 96,
@@ -771,10 +840,72 @@ export default function DashboardPage() {
   const isHomeView = view === "home"
 
   const brandConfigs = [
-    { label: "Samsung", value: "samsung", logo: "/WhatsApp Image 2026-02-04 at 11.14.29.jpeg", caption: "B2C Protect Max Analysis" },
-    { label: "Reliance ResQ", value: "reliance", logo: "/resq.png", caption: "Reliance ResQ Analysis" },
-    { label: "Godrej", value: "godrej", logo: "/Group 1244833444.png", caption: "Godrej Care Plus Analysis" },
+    {
+      label: "Samsung Care Services",
+      value: "samsung",
+      logo: "/WhatsApp Image 2026-02-04 at 11.14.29.jpeg",
+      surfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.62),rgba(240,245,252,0.54),rgba(231,239,249,0.48))]",
+      logoSurfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,255,255,0.88))]",
+      logoClass: "max-h-[78px] max-w-[88%] object-contain",
+    },
+    {
+      label: "Reliance resQ",
+      value: "reliance",
+      logo: "/resq.png",
+      surfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.64),rgba(236,246,253,0.55),rgba(230,238,248,0.48))]",
+      logoSurfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,255,255,0.88))]",
+      logoClass: "max-h-[94px] max-w-[90%] object-contain scale-[1.08]",
+    },
+    {
+      label: "Godrej",
+      value: "godrej",
+      logo: "/Group 1244833444.png",
+      surfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.63),rgba(243,241,250,0.56),rgba(231,238,247,0.48))]",
+      logoSurfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,255,255,0.88))]",
+      logoClass: "max-h-[92px] max-w-[88%] object-contain",
+    },
   ]
+
+  const homeLayoutScale = useMemo(() => {
+    if (isMobileViewport || view !== "home") return 1
+
+    const horizontalPadding = homeViewportSize.width >= 1024 ? 64 : 36
+    const headerHeight = homeViewportSize.width >= 640 ? 86 : 68
+    const verticalPadding = homeViewportSize.width >= 1024 ? 28 : 20
+    const availableWidth = Math.max(homeViewportSize.width - horizontalPadding, 320)
+    const availableHeight = Math.max(homeViewportSize.height - headerHeight - verticalPadding, 320)
+    const widthScale = availableWidth / HOME_DESKTOP_CONTENT_WIDTH
+    const heightScale = availableHeight / Math.max(homeContentHeight, 1)
+
+    return Math.min(1, widthScale, heightScale)
+  }, [homeContentHeight, homeViewportSize.height, homeViewportSize.width, isMobileViewport, view])
+
+  const homeScaledWrapperStyle = isMobileViewport || view !== "home"
+    ? undefined
+    : {
+        width: `${Math.round(HOME_DESKTOP_CONTENT_WIDTH * homeLayoutScale)}px`,
+        minHeight: `${Math.round(homeContentHeight * homeLayoutScale)}px`,
+        position: "relative" as const,
+      }
+
+  const homeScaledContentStyle = isMobileViewport || view !== "home"
+    ? undefined
+    : {
+        width: `${HOME_DESKTOP_CONTENT_WIDTH}px`,
+        position: "absolute" as const,
+        left: "50%",
+        top: 0,
+        transform: `translateX(-50%) scale(${homeLayoutScale})`,
+        transformOrigin: "top center",
+      }
+
+  const homeDisplayName = authName || "analytics@zopper.com"
+  const homeProfileInitials = homeDisplayName
+    .split(/[@._\-\s]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || "")
+    .join("") || "ZA"
 
   if (!authReady) {
     return (
@@ -792,10 +923,10 @@ export default function DashboardPage() {
   }
 
   return (
-    <div
-      className={`smooth-surface h-[100dvh] min-h-screen flex flex-col font-sans overflow-hidden ${
+      <div
+        className={`smooth-surface h-[100dvh] min-h-screen flex flex-col font-sans overflow-hidden ${
         isHomeView
-          ? "bg-[#f6f9fc] text-slate-900 selection:bg-sky-100"
+          ? "bg-white text-slate-900 selection:bg-sky-100"
           : "bg-[#fbfcfd] text-slate-900 selection:bg-indigo-100"
       }`}
     >
@@ -806,7 +937,7 @@ export default function DashboardPage() {
         animate="animate"
         className={`sticky top-0 z-40 flex h-16 items-center justify-between border-b px-3 backdrop-blur-2xl sm:h-20 sm:px-6 lg:px-10 ${
           isHomeView
-            ? "border-slate-200/80 bg-white/72"
+            ? "relative border-slate-200/75 bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(246,248,252,0.9))] shadow-[0_12px_28px_rgba(125,145,177,0.08)] before:absolute before:inset-x-0 before:top-0 before:h-[5px] before:bg-[#526074] before:content-['']"
             : "border-slate-200 bg-white/80"
         }`}
       >
@@ -826,7 +957,7 @@ export default function DashboardPage() {
           </motion.button>
           <div className={`hidden h-8 w-[1px] sm:block ${isHomeView ? "bg-slate-200" : "bg-slate-200"}`} />
           <h1 className="hidden items-center gap-3 sm:flex">
-            <span className={`${isHomeView ? "text-sky-700" : theme.accent} font-black uppercase text-[11px] tracking-[0.4em]`}>
+            <span className={`${isHomeView ? "text-[#3279bf]" : theme.accent} font-black uppercase text-[11px] tracking-[0.4em]`}>
               Analytics 
             </span>
           </h1>
@@ -872,12 +1003,19 @@ export default function DashboardPage() {
           </AnimatePresence>
 
           <div className="flex items-center gap-3">
-            {authRole && (
+            {isHomeView ? (
+              <div className="hidden items-center gap-3 sm:flex">
+                <p className="text-sm font-medium text-[#2a3957]">{homeDisplayName}</p>
+                <div className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200/80 bg-[linear-gradient(180deg,#ffffff,#eef3fb)] text-sm font-semibold text-[#2b3d5d] shadow-[0_8px_22px_rgba(120,140,172,0.12)]">
+                  {homeProfileInitials}
+                </div>
+              </div>
+            ) : authRole ? (
               <div className="mr-2 hidden text-right sm:block">
                 <p className={`mb-1 text-[10px] font-black uppercase tracking-tighter leading-none ${isHomeView ? "text-slate-400" : "text-slate-400"}`}>{authRole}</p>
                 <p className={`text-xs font-bold ${isHomeView ? "text-slate-700" : "text-slate-700"}`}>{authName}</p>
               </div>
-            )}
+            ) : null}
             <motion.button
               whileHover={{ backgroundColor: isHomeView ? "rgba(255,255,255,0.96)" : "#f1f5f9" }}
               whileTap={{ scale: 0.95 }}
@@ -890,7 +1028,7 @@ export default function DashboardPage() {
               }}
               className={`rounded-full border p-2 transition-colors sm:p-2.5 ${
                 isHomeView
-                  ? "border-slate-200 bg-white/80 text-slate-500 hover:text-slate-900"
+                  ? "border-slate-200/90 bg-white/92 text-slate-500 shadow-[0_8px_22px_rgba(120,140,172,0.1)] hover:text-slate-900"
                   : "border-slate-200 bg-white text-slate-500 hover:text-slate-900"
               }`}
             >
@@ -924,23 +1062,17 @@ export default function DashboardPage() {
             }}
             className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden"
           >
-            <div className="absolute inset-0 -z-20 bg-[linear-gradient(180deg,#f8fbfe_0%,#f4f8fc_48%,#f7fafc_100%)]" />
-
-            <div className="pointer-events-none absolute inset-0 z-0 overflow-hidden">
+            <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+              <div className="absolute inset-0 bg-[linear-gradient(180deg,#f4f7fb_0%,#edf3fb_20%,#e7f1fb_44%,#e8ecfa_72%,#f3f4fa_100%)]" />
+              <div className="absolute inset-0 bg-[radial-gradient(circle_at_16%_16%,rgba(255,255,255,0.96),transparent_18%),radial-gradient(circle_at_78%_18%,rgba(229,235,255,0.72),transparent_24%),radial-gradient(circle_at_50%_44%,rgba(255,255,255,0.92),transparent_26%),radial-gradient(circle_at_18%_74%,rgba(227,242,255,0.7),transparent_24%),radial-gradient(circle_at_82%_70%,rgba(226,233,255,0.76),transparent_26%)]" />
               <motion.div
-                className="absolute inset-0"
-                style={prefersReducedMotion ? undefined : { y: homeBackgroundY }}
-              >
-                <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.98),transparent_34%),radial-gradient(circle_at_16%_18%,rgba(56,189,248,0.12),transparent_28%),radial-gradient(circle_at_84%_20%,rgba(59,130,246,0.12),transparent_28%),radial-gradient(circle_at_68%_74%,rgba(20,184,166,0.1),transparent_34%)]" />
-                <motion.div
-                  className="absolute inset-0 opacity-90"
-                  style={prefersReducedMotion ? undefined : { background: homeCursorGlow }}
-                />
-                <div className="absolute inset-0 bg-[radial-gradient(rgba(148,163,184,0.16)_1px,transparent_1px)] bg-[size:24px_24px] opacity-26 [mask-image:linear-gradient(180deg,black,transparent_92%)]" />
-              </motion.div>
+                className="absolute inset-0 opacity-95"
+                style={prefersReducedMotion ? undefined : { background: homeCursorGlow }}
+              />
+              <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(255,255,255,0.3)_0%,rgba(255,255,255,0)_26%,rgba(255,255,255,0.18)_58%,rgba(255,255,255,0.46)_100%)]" />
 
               <motion.div
-                className="absolute inset-[-6%]"
+                className="absolute inset-[-8%]"
                 style={prefersReducedMotion ? undefined : { x: homeGlowX, y: homeGlowY }}
               >
                 {NEURAL_GLOW_FIELDS.map((field, index) => (
@@ -955,15 +1087,15 @@ export default function DashboardPage() {
                       background: field.color,
                       filter: `blur(${field.blur}px)`,
                     }}
-                    initial={{ opacity: 0.16, scale: 0.92 }}
+                    initial={{ opacity: 0.18, scale: 0.96 }}
                     animate={
                       prefersReducedMotion
-                        ? { opacity: 0.2, scale: 1 }
+                        ? { opacity: 0.24, scale: 1 }
                         : {
-                            opacity: [0.12, 0.28, 0.16],
-                            scale: [0.92, 1.08, 0.96],
-                            x: [0, field.dx, field.dx * 0.4],
-                            y: [0, field.dy, field.dy * 0.45],
+                            opacity: [0.16, 0.34, 0.2],
+                            scale: [0.96, 1.05, 0.98],
+                            x: [0, field.dx, field.dx * 0.45],
+                            y: [0, field.dy, field.dy * 0.4],
                           }
                     }
                     transition={
@@ -972,7 +1104,7 @@ export default function DashboardPage() {
                         : {
                             duration: field.duration,
                             repeat: Infinity,
-                            repeatType: "loop",
+                            repeatType: "mirror",
                             ease: "easeInOut",
                             delay: field.delay,
                           }
@@ -981,14 +1113,60 @@ export default function DashboardPage() {
                 ))}
               </motion.div>
 
+              <div className="absolute inset-0 overflow-hidden opacity-[0.72]">
+                {HOME_WAVES.map((wave, index) => (
+                  <motion.svg
+                    key={`home-wave-${index}`}
+                    viewBox="0 0 1720 420"
+                    fill="none"
+                    aria-hidden="true"
+                    className="absolute left-1/2 h-[330px] w-[170%] -translate-x-1/2"
+                    style={{ top: wave.top }}
+                    animate={
+                      prefersReducedMotion
+                        ? undefined
+                        : {
+                            x: [-14, 18, -10],
+                            opacity: [wave.opacity * 0.94, wave.opacity, wave.opacity * 0.9],
+                          }
+                    }
+                    transition={
+                      prefersReducedMotion
+                        ? undefined
+                        : {
+                            duration: wave.duration,
+                            repeat: Infinity,
+                            repeatType: "mirror",
+                            ease: "easeInOut",
+                            delay: wave.delay,
+                          }
+                    }
+                  >
+                    <path
+                      d={wave.path}
+                      stroke={wave.stroke}
+                      strokeWidth={wave.strokeWidth}
+                      strokeLinecap="round"
+                    />
+                  </motion.svg>
+                ))}
+              </div>
+
+              <div className="absolute inset-0 opacity-75">
+                <HomeParticleField reducedMotion={Boolean(prefersReducedMotion)} />
+              </div>
+
+              <div className="absolute inset-0 bg-[radial-gradient(rgba(255,255,255,0.78)_0.95px,transparent_0.95px)] bg-[size:30px_30px] opacity-[0.18] [mask-image:radial-gradient(circle_at_center,black_28%,transparent_84%)]" />
+              <div className="absolute inset-x-0 bottom-0 h-[30%] bg-[linear-gradient(180deg,rgba(243,245,250,0),rgba(243,245,250,0.62)_76%,rgba(243,245,250,0.96)_100%)]" />
+
               <motion.div
-                className="absolute inset-[-8%]"
+                className="absolute inset-[-4%]"
                 style={prefersReducedMotion ? undefined : { x: homeNetworkX, y: homeNetworkY }}
               >
                 {ANALYTICAL_PANELS.map((panel, index) => (
                   <motion.div
                     key={`analytical-panel-${index}`}
-                    className="absolute hidden overflow-hidden rounded-[28px] border border-white/80 bg-white/68 p-4 shadow-[0_18px_55px_rgba(148,163,184,0.18)] backdrop-blur-md lg:block"
+                    className="absolute hidden overflow-hidden rounded-[36px] border border-white/82 bg-white/34 p-4 shadow-[0_28px_80px_rgba(141,165,205,0.18)] backdrop-blur-[18px] xl:block"
                     style={{
                       left: panel.left,
                       top: panel.top,
@@ -999,9 +1177,9 @@ export default function DashboardPage() {
                     initial={{ opacity: 0.22, y: 0 }}
                     animate={
                       prefersReducedMotion
-                        ? { opacity: 0.28 }
+                        ? { opacity: 0.32 }
                         : {
-                            opacity: [0.2, 0.4, 0.24],
+                            opacity: [0.22, 0.42, 0.28],
                             y: [0, -8, 0],
                           }
                     }
@@ -1009,24 +1187,24 @@ export default function DashboardPage() {
                       prefersReducedMotion
                         ? { duration: 0 }
                         : {
-                            duration: 8.4,
+                            duration: 8.8,
                             repeat: Infinity,
-                            repeatType: "loop",
+                            repeatType: "mirror",
                             ease: "easeInOut",
                             delay: panel.delay,
                           }
                     }
                   >
                     <div className="mb-3 flex items-center justify-between">
-                      <span className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-500">
+                      <span className="text-[10px] font-black uppercase tracking-[0.28em] text-[#9aa7bc]">
                         {panel.label}
                       </span>
-                      <span className="rounded-full bg-slate-900/5 px-2 py-1 text-[9px] font-bold uppercase tracking-[0.14em] text-slate-500">
+                      <span className="rounded-full border border-white/75 bg-white/52 px-2 py-1 text-[9px] font-bold uppercase tracking-[0.18em] text-[#a4afc1]">
                         Live
                       </span>
                     </div>
-                    <div className="absolute inset-x-4 top-11 h-px bg-slate-200/80" />
-                    <div className="mt-5 flex h-[52px] items-end gap-2">
+                    <div className="absolute inset-x-4 top-11 h-px bg-white/55" />
+                    <div className="mt-6 flex h-[56px] items-end gap-2.5">
                       {panel.bars.map((bar, barIndex) => (
                         <motion.span
                           key={`${panel.label}-bar-${barIndex}`}
@@ -1039,7 +1217,7 @@ export default function DashboardPage() {
                             prefersReducedMotion
                               ? undefined
                               : {
-                                  opacity: [0.75, 1, 0.78],
+                                  opacity: [0.78, 1, 0.82],
                                   y: [0, -2, 0],
                                 }
                           }
@@ -1058,199 +1236,119 @@ export default function DashboardPage() {
                       ))}
                     </div>
                     <svg
-                      className="absolute inset-x-4 bottom-4 h-[42px] w-[calc(100%-2rem)]"
+                      className="absolute inset-x-4 bottom-4 h-[40px] w-[calc(100%-2rem)]"
                       viewBox="0 0 210 92"
                       fill="none"
                       aria-hidden="true"
                     >
                       <path d={panel.trendPath} stroke={panel.accent} strokeWidth="4" strokeLinecap="round" />
-                      <path d={panel.trendPath} stroke="rgba(255,255,255,0.55)" strokeWidth="1.6" strokeLinecap="round" />
+                      <path d={panel.trendPath} stroke="rgba(255,255,255,0.72)" strokeWidth="1.5" strokeLinecap="round" />
                     </svg>
                   </motion.div>
-                ))}
-
-                {NEURAL_CONNECTIONS.map((connection, index) => (
-                  <motion.span
-                    key={`neural-link-${index}`}
-                    className="absolute h-[1.5px] origin-left rounded-full"
-                    style={{
-                      left: connection.left,
-                      top: connection.top,
-                      width: connection.width,
-                      background: `linear-gradient(90deg, transparent, ${connection.color}, transparent)`,
-                      rotate: connection.rotate,
-                      boxShadow: `0 0 18px ${connection.color}`,
-                    }}
-                    initial={{ opacity: 0.2, scaleX: 0.38 }}
-                    animate={
-                      prefersReducedMotion
-                        ? { opacity: 0.26, scaleX: 1 }
-                        : {
-                            opacity: [0.16, 0.54, 0.22],
-                            scaleX: [0.38, 1, 0.52],
-                          }
-                    }
-                    transition={
-                      prefersReducedMotion
-                        ? { duration: 0 }
-                        : {
-                            duration: connection.duration,
-                            repeat: Infinity,
-                            repeatType: "loop",
-                            ease: "easeInOut",
-                            delay: connection.delay,
-                          }
-                    }
-                  />
-                ))}
-
-                {NEURAL_NODES.map((node, index) => (
-                  <motion.div
-                    key={`neural-node-${index}`}
-                    className="absolute rounded-full border border-white/80"
-                    style={{
-                      left: node.left,
-                      top: node.top,
-                      width: node.size,
-                      height: node.size,
-                      background: node.color,
-                      boxShadow: `0 0 0 7px rgba(255,255,255,0.42), 0 0 20px ${node.color}`,
-                    }}
-                    initial={{ opacity: 0.4, scale: 0.82 }}
-                    animate={
-                      prefersReducedMotion
-                        ? { opacity: 0.6, scale: 1 }
-                        : {
-                            opacity: [0.28, 0.95, 0.36],
-                            scale: [0.82, 1.24, 0.92],
-                          }
-                    }
-                    transition={
-                      prefersReducedMotion
-                        ? { duration: 0 }
-                        : {
-                            duration: node.duration,
-                            repeat: Infinity,
-                            repeatType: "loop",
-                            ease: "easeInOut",
-                            delay: node.delay,
-                          }
-                    }
-                  />
                 ))}
               </motion.div>
             </div>
 
-            <div className={`relative z-20 mx-auto w-full max-w-7xl px-3 pb-10 pt-8 sm:px-6 sm:pb-14 ${isMobileViewport ? "" : "min-h-[150vh]"}`}>
-              <div className={`${isMobileViewport ? "relative py-8" : "sticky top-0 flex min-h-[calc(100dvh-4rem)] items-center py-8 sm:min-h-[calc(100dvh-5rem)] sm:py-10"}`}>
-                <div className="mx-auto w-full max-w-6xl">
-                  <div className="grid gap-10 lg:gap-14">
+            <div className="relative z-20 mx-auto flex w-full max-w-[1340px] justify-center px-4 pb-10 pt-5 sm:px-6 sm:pb-12 sm:pt-6 lg:px-8">
+              <div className={isMobileViewport ? "mx-auto w-full max-w-[1240px]" : "relative mx-auto"} style={homeScaledWrapperStyle}>
+                <div
+                  ref={homeFitContentRef}
+                  className={`flex flex-col gap-5 ${isMobileViewport ? "mx-auto w-full max-w-[1240px]" : ""}`}
+                  style={homeScaledContentStyle}
+                >
+                  <motion.div
+                    className="relative px-2 pt-2 text-center sm:px-4"
+                    style={prefersReducedMotion ? undefined : { y: homeHeroY, opacity: homeHeroOpacity }}
+                  >
                     <motion.div
-                      className="text-center"
-                      style={prefersReducedMotion ? undefined : { y: homeHeroY, opacity: homeHeroOpacity }}
-                    >
-                      <motion.div variants={staggerContainer} initial="initial" animate="animate">
-                        <motion.div variants={fadeIn} className="mb-8 inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-gradient-to-r from-white/96 via-emerald-50/92 to-amber-50/92 px-4 py-1.5 shadow-[0_20px_60px_rgba(16,185,129,0.14)] backdrop-blur-xl">
-                          <span className="relative flex h-2.5 w-2.5">
-                            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75"></span>
-                            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500"></span>
-                          </span>
-                          <span className="text-[10px] font-black uppercase tracking-[0.25em] text-slate-800">Live Neural Feed</span>
-                        </motion.div>
+                      className="pointer-events-none absolute left-1/2 top-1 h-[340px] w-[78%] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(255,255,255,0.98),rgba(231,242,255,0.78),rgba(228,232,255,0.46),transparent_72%)] blur-[72px]"
+                      animate={prefersReducedMotion ? undefined : { opacity: [0.74, 1, 0.8], scale: [0.985, 1.025, 1] }}
+                      transition={prefersReducedMotion ? undefined : { duration: 10, repeat: Infinity, ease: "easeInOut" }}
+                    />
 
-                        <motion.h2 variants={fadeIn} className="mb-8 text-center font-black tracking-tight">
-                          <span className="block text-2xl leading-tight text-slate-950 md:text-3xl">Welcome to</span>
-                          <span className="relative mx-auto mt-2 block w-fit">
-                            <motion.span
-                              aria-hidden="true"
-                              className="pointer-events-none absolute inset-0 bg-[linear-gradient(96deg,#1e3a8a_0%,#2563eb_18%,#d946ef_50%,#ef4444_82%,#1e3a8a_100%)] bg-[length:240%_100%] bg-clip-text font-serif text-[2.8rem] font-black italic leading-[0.9] tracking-[0.03em] text-transparent opacity-40 blur-[16px] sm:text-[4.15rem] md:text-7xl md:[transform:scaleX(1.02)]"
-                              style={{ backgroundPosition: "0% 50%" }}
-                              animate={prefersReducedMotion ? undefined : { backgroundPosition: ["0% 50%", "100% 50%", "0% 50%"], opacity: [0.3, 0.5, 0.34] }}
-                              transition={prefersReducedMotion ? undefined : { duration: 10, repeat: Infinity, ease: "linear" }}
-                            >
-                              Business Control Centre
-                            </motion.span>
-                            <motion.span
-                              className="relative block bg-[linear-gradient(96deg,#1e3a8a_0%,#2563eb_18%,#d946ef_50%,#ef4444_82%,#1e3a8a_100%)] bg-[length:240%_100%] bg-clip-text font-serif text-[2.8rem] font-black italic leading-[0.9] tracking-[0.03em] text-transparent drop-shadow-[0_14px_34px_rgba(217,70,239,0.18)] sm:text-[4.15rem] md:text-7xl md:[transform:scaleX(1.02)]"
-                              style={{ backgroundPosition: "0% 50%" }}
-                              animate={prefersReducedMotion ? undefined : { backgroundPosition: ["0% 50%", "100% 50%", "0% 50%"] }}
-                              transition={prefersReducedMotion ? undefined : { duration: 10, repeat: Infinity, ease: "linear" }}
-                            >
-                              Business Control Centre
-                            </motion.span>
-                          </span>
-                        </motion.h2>
-                        
-                        <motion.p variants={fadeIn} className="mx-auto max-w-2xl text-center text-base font-medium leading-relaxed text-slate-600 sm:text-lg md:text-xl">
-                          Navigate through partner ecosystems with precision. <br />Real-time performance metrics at your fingertips.
-                        </motion.p>
-                      </motion.div>
+                    <motion.div variants={staggerContainer} initial="initial" animate="animate" className="relative">
+                      <motion.h2 variants={fadeIn} className="space-y-4 text-center">
+                        <span className="block text-[clamp(2.25rem,4vw,3.85rem)] font-black tracking-[-0.06em] text-[#4a5975] drop-shadow-[0_1px_0_rgba(255,255,255,0.7)]">
+                          Welcome to
+                        </span>
+                        <motion.span
+                          className="block bg-[linear-gradient(92deg,#1894f3_10%,#2a7eea_34%,#5a7de5_64%,#9b63cf_92%)] bg-[length:180%_100%] bg-clip-text font-serif text-[clamp(3.7rem,6vw,6.45rem)] font-black italic leading-[0.92] tracking-[-0.05em] text-transparent md:whitespace-nowrap"
+                          style={{
+                            backgroundPosition: "0% 50%",
+                            WebkitTextStroke: "0.35px rgba(255,255,255,0.28)",
+                            filter: "drop-shadow(0 10px 22px rgba(97,136,235,0.12))",
+                          }}
+                          animate={prefersReducedMotion ? undefined : { backgroundPosition: ["0% 50%", "100% 50%", "0% 50%"] }}
+                          transition={prefersReducedMotion ? undefined : { duration: 14, repeat: Infinity, ease: "linear" }}
+                        >
+                          Business Control Centre
+                        </motion.span>
+                      </motion.h2>
+
+                      <motion.p variants={fadeIn} className="mx-auto mt-6 max-w-[760px] text-center text-[1.02rem] font-medium leading-[1.72] text-[#53627d] sm:text-[1.14rem]">
+                        Navigate through partner ecosystems with precision.
+                        <br />
+                        Real-time performance metrics at your fingertips.
+                      </motion.p>
                     </motion.div>
+                  </motion.div>
 
+                  <motion.div
+                    variants={staggerContainer}
+                    initial="initial"
+                    animate="animate"
+                    className="w-full space-y-5 [perspective:1800px]"
+                    style={prefersReducedMotion ? undefined : { y: homeCardsY, rotateX: homeCardsRotateX }}
+                  >
                     <motion.div
-                      variants={staggerContainer}
-                      initial="initial"
-                      animate="animate"
-                      className="w-full space-y-4 [perspective:1800px] sm:space-y-8"
-                      style={prefersReducedMotion ? undefined : { y: homeCardsY, rotateX: homeCardsRotateX }}
+                      variants={cardHover}
+                      whileHover="hover"
+                      onClick={() => handleViewChange("master")}
+                      className="group relative mx-auto w-full max-w-[1010px] cursor-pointer overflow-hidden rounded-[46px] border border-white/78 bg-[linear-gradient(180deg,rgba(255,255,255,0.72),rgba(240,246,255,0.66),rgba(231,238,249,0.58))] px-8 py-9 text-center shadow-[0_28px_84px_rgba(118,139,176,0.14)] backdrop-blur-[18px] sm:px-10"
                     >
-                      <motion.div
-                        variants={cardHover}
-                        whileHover="hover"
-                        onClick={() => handleViewChange("master")}
-                        className="group relative mx-auto w-full max-w-[1160px] cursor-pointer overflow-hidden rounded-[30px] border border-slate-200/90 bg-[linear-gradient(135deg,rgba(255,255,255,0.99),rgba(248,250,252,0.98),rgba(241,248,255,0.96))] p-6 text-center shadow-[0_20px_56px_rgba(15,23,42,0.1),0_0_0_1px_rgba(255,255,255,0.92)_inset] backdrop-blur-sm sm:rounded-[40px] sm:p-8"
-                      >
-                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.06),transparent_44%),radial-gradient(circle_at_bottom_right,rgba(20,184,166,0.05),transparent_36%)]" />
-                        <div className="relative space-y-3 text-center">
-                          <div className="flex items-center justify-center gap-3">
-                            <h3 className="text-2xl font-black tracking-[-0.04em] text-slate-900 sm:text-3xl">Master Dashboard</h3>
-                            <div className="flex h-9 w-9 scale-0 items-center justify-center rounded-full bg-gradient-to-br from-sky-600 to-teal-600 text-white transition-transform duration-300 group-hover:scale-100 sm:h-10 sm:w-10">
-                              <ChevronRight size={20} />
-                            </div>
-                          </div>
-                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-sky-800/90">
-                            Unified view across Samsung, Croma, Vijay Sales, Reliance ResQ and Godrej
-                          </p>
-                        </div>
-                      </motion.div>
-
-                      <div className="grid grid-cols-1 justify-items-center gap-4 sm:gap-8 md:grid-cols-3">
-                        {brandConfigs.map((cfg) => (
-                          <motion.div
-                            key={cfg.value}
-                            variants={cardHover}
-                            whileHover="hover"
-                            onClick={() => {
-                              applyBrandChange(cfg.value)
-                            }}
-                            className="group relative w-full max-w-[360px] cursor-pointer overflow-hidden rounded-[30px] border border-white/85 bg-[linear-gradient(155deg,rgba(255,255,255,0.97),rgba(247,250,252,0.95),rgba(239,246,255,0.92))] p-6 text-center shadow-[0_24px_70px_rgba(148,163,184,0.2)] transition-all duration-500 backdrop-blur-xl sm:max-w-[380px] sm:rounded-[48px] sm:p-10"
-                          >
-                            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.07),transparent_42%),radial-gradient(circle_at_bottom_right,rgba(20,184,166,0.07),transparent_36%)] opacity-90" />
-                            <div className="relative mb-6 flex h-20 items-center justify-center overflow-hidden rounded-[24px] border border-slate-100 bg-white/95 shadow-[0_16px_40px_rgba(148,163,184,0.2)] sm:mb-10 sm:h-24">
-                              <motion.div whileHover={{ scale: 1.08, rotate: 1.5 }}>
-                                <Image
-                                  src={cfg.logo}
-                                  alt={cfg.label}
-                                  width={180}
-                                  height={80}
-                                  className={`max-h-full max-w-full object-contain filter drop-shadow-md ${cfg.value === "reliance" ? "scale-125" : ""}`}
-                                />
-                              </motion.div>
-                            </div>
-                            <div className="relative space-y-4 text-center">
-                              <div className="flex items-center justify-center gap-3">
-                                <h3 className="text-xl font-bold tracking-tight text-slate-800 sm:text-2xl">{cfg.label}</h3>
-                                <div className="flex h-9 w-9 scale-0 items-center justify-center rounded-full bg-gradient-to-br from-sky-600 to-cyan-600 text-white transition-transform duration-300 group-hover:scale-100 sm:h-10 sm:w-10">
-                                  <ChevronRight size={20} />
-                                </div>
-                              </div>
-                              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">{cfg.caption}</p>
-                            </div>
-                          </motion.div>
-                        ))}
+                      <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_4%,rgba(255,255,255,0.94),transparent_48%),radial-gradient(circle_at_50%_100%,rgba(144,195,255,0.16),transparent_56%)]" />
+                      <div className="absolute inset-[1px] rounded-[46px] border border-white/52" />
+                      <div className="relative space-y-4 text-center">
+                        <h3 className="text-[clamp(2.1rem,4vw,3.8rem)] font-black tracking-[-0.06em] text-[#1c2944]">
+                          Master Dashboard
+                        </h3>
+                        <p className="mx-auto max-w-5xl text-[10px] font-black uppercase tracking-[0.26em] text-[#30486a] sm:text-[11px]">
+                          Unified view across Samsung, Croma, Vijay Sales, Reliance ResQ and Godrej
+                        </p>
                       </div>
                     </motion.div>
-                  </div>
+
+                    <div className="grid gap-5 md:grid-cols-3">
+                      {brandConfigs.map((cfg) => (
+                        <motion.div
+                          key={cfg.value}
+                          variants={cardHover}
+                          whileHover="hover"
+                          onClick={() => {
+                            applyBrandChange(cfg.value)
+                          }}
+                          className={`group relative min-h-[308px] cursor-pointer overflow-hidden rounded-[38px] border border-white/80 px-7 pb-8 pt-7 text-center shadow-[0_24px_74px_rgba(118,139,176,0.12)] backdrop-blur-[18px] ${cfg.surfaceClass}`}
+                        >
+                          <div className="absolute inset-[1px] rounded-[38px] border border-white/46" />
+                          <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(255,255,255,0.9),transparent_42%),radial-gradient(circle_at_50%_100%,rgba(163,200,243,0.12),transparent_64%)]" />
+                          <div className={`relative mb-8 flex h-[132px] items-center justify-center overflow-hidden rounded-[28px] border border-white/86 shadow-[0_18px_48px_rgba(147,168,203,0.14)] ${cfg.logoSurfaceClass}`}>
+                            <motion.div whileHover={{ scale: 1.02, y: -1 }} className="flex h-full w-full items-center justify-center">
+                              <Image
+                                src={cfg.logo}
+                                alt={cfg.label}
+                                width={240}
+                                height={110}
+                                className={cfg.logoClass}
+                              />
+                            </motion.div>
+                          </div>
+                          <p className="relative text-[1.05rem] font-medium tracking-[-0.02em] text-[#243755] sm:text-[1.18rem]">
+                            {cfg.label}
+                          </p>
+                        </motion.div>
+                      ))}
+                    </div>
+                  </motion.div>
                 </div>
               </div>
             </div>

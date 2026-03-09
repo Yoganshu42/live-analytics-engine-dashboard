@@ -24,6 +24,7 @@ import {
 
 import DateRangePicker from "@/components/DateRangePicker"
 import { fetchMasterDashboard, type MasterDashboardResponse } from "@/app/lib/api"
+import { SAMSUNG_PARTNERS, type SamsungPartnerKey } from "@/lib/samsungPartners"
 
 type Props = {
   jobId?: string | null
@@ -265,7 +266,7 @@ const mergeSeries = (seriesByKey: Record<string, Map<string, MonthPoint>>) => {
     series.forEach((_value, key) => monthKeys.add(key))
   })
 
-  return Array.from(monthKeys)
+  const merged = Array.from(monthKeys)
     .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())
     .map((monthKey) => {
       const base: Record<string, number | string> = {
@@ -276,6 +277,27 @@ const mergeSeries = (seriesByKey: Record<string, Map<string, MonthPoint>>) => {
       })
       return base
     })
+
+  if (merged.length !== 1) return merged
+
+  const center = parseMonthDate(merged[0].month)
+  if (!center) return merged
+
+  const buildZeroRow = (date: Date) => {
+    const row: Record<string, number | string> = { month: monthToLabel(date) }
+    Object.keys(merged[0]).forEach((key) => {
+      if (key === "month") return
+      row[key] = 0
+    })
+    return row
+  }
+
+  const prev = new Date(center)
+  prev.setMonth(center.getMonth() - 1)
+  const next = new Date(center)
+  next.setMonth(center.getMonth() + 1)
+
+  return [buildZeroRow(prev), merged[0], buildZeroRow(next)]
 }
 
 const sumSeriesValues = (series: Map<string, MonthPoint>) =>
@@ -295,27 +317,30 @@ const addKpis = (a: KpiValues, b: KpiValues): KpiValues => ({
   claims: a.claims + b.claims,
 })
 
+const EMPTY_KPIS: KpiValues = {
+  gross: 0,
+  earned: 0,
+  zopper: 0,
+  claims: 0,
+}
+
+const SAMSUNG_MASTER_PREFIX: Record<SamsungPartnerKey, string> = {
+  samsung_vs: "vs",
+  samsung_croma: "croma",
+  samsung_reliance_digital: "reliance_digital",
+}
+
 const toMasterData = (payload: MasterDashboardResponse): MasterData => {
   const summaries = payload?.summaries || {}
   const rows = payload?.rows || {}
 
-  const samsungVsSalesSummary = summaries.samsung_vs_sales || {}
-  const samsungCromaSalesSummary = summaries.samsung_croma_sales || {}
   const samsungSalesSummary = summaries.samsung_sales || {}
   const relianceSalesSummary = summaries.reliance_sales || {}
   const godrejSalesSummary = summaries.godrej_sales || {}
 
-  const samsungVsClaimsSummary = summaries.samsung_vs_claims || {}
-  const samsungCromaClaimsSummary = summaries.samsung_croma_claims || {}
   const relianceClaimsSummary = summaries.reliance_claims || {}
   const godrejClaimsSummary = summaries.godrej_claims || {}
 
-  const samsungVsGrossRows = Array.isArray(rows.samsung_vs_gross) ? rows.samsung_vs_gross : []
-  const samsungVsEarnedRows = Array.isArray(rows.samsung_vs_earned) ? rows.samsung_vs_earned : []
-  const samsungVsZopperRows = Array.isArray(rows.samsung_vs_zopper) ? rows.samsung_vs_zopper : []
-  const samsungCromaGrossRows = Array.isArray(rows.samsung_croma_gross) ? rows.samsung_croma_gross : []
-  const samsungCromaEarnedRows = Array.isArray(rows.samsung_croma_earned) ? rows.samsung_croma_earned : []
-  const samsungCromaZopperRows = Array.isArray(rows.samsung_croma_zopper) ? rows.samsung_croma_zopper : []
   const relianceGrossRows = Array.isArray(rows.reliance_gross) ? rows.reliance_gross : []
   const relianceEarnedRows = Array.isArray(rows.reliance_earned) ? rows.reliance_earned : []
   const relianceZopperRows = Array.isArray(rows.reliance_zopper) ? rows.reliance_zopper : []
@@ -323,31 +348,34 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
   const godrejEarnedRows = Array.isArray(rows.godrej_earned) ? rows.godrej_earned : []
   const godrejZopperRows = Array.isArray(rows.godrej_zopper) ? rows.godrej_zopper : []
 
-  const samsungVsClaimsRows = Array.isArray(rows.samsung_vs_claims) ? rows.samsung_vs_claims : []
-  const samsungCromaClaimsRows = Array.isArray(rows.samsung_croma_claims) ? rows.samsung_croma_claims : []
   const relianceClaimsRows = Array.isArray(rows.reliance_claims) ? rows.reliance_claims : []
   const godrejClaimsRows = Array.isArray(rows.godrej_claims) ? rows.godrej_claims : []
 
-  const samsungVsGrossSeries = toMonthlySeries(samsungVsGrossRows, "gross_premium")
-  const samsungCromaGrossSeries = toMonthlySeries(samsungCromaGrossRows, "gross_premium")
-  const samsungVsEarnedSeries = toMonthlySeries(samsungVsEarnedRows, "earned_premium")
-  const samsungCromaEarnedSeries = toMonthlySeries(samsungCromaEarnedRows, "earned_premium")
-  const samsungVsZopperSeries = toMonthlySeries(samsungVsZopperRows, "zopper_earned_premium")
-  const samsungCromaZopperSeries = toMonthlySeries(samsungCromaZopperRows, "zopper_earned_premium")
-
-  const samsungSalesRows = mergeSeries({
-    vs_gross: samsungVsGrossSeries,
-    croma_gross: samsungCromaGrossSeries,
-    vs_earned: samsungVsEarnedSeries,
-    croma_earned: samsungCromaEarnedSeries,
-    vs_zopper: samsungVsZopperSeries,
-    croma_zopper: samsungCromaZopperSeries,
+  const samsungPartnerSnapshots = SAMSUNG_PARTNERS.map((partner) => {
+    const prefix = SAMSUNG_MASTER_PREFIX[partner.key]
+    return {
+      partner,
+      prefix,
+      salesSummary: summaries[`${partner.key}_sales`] || {},
+      claimsSummary: summaries[`${partner.key}_claims`] || {},
+      grossRows: Array.isArray(rows[`${partner.key}_gross`]) ? rows[`${partner.key}_gross`] : [],
+      earnedRows: Array.isArray(rows[`${partner.key}_earned`]) ? rows[`${partner.key}_earned`] : [],
+      zopperRows: Array.isArray(rows[`${partner.key}_zopper`]) ? rows[`${partner.key}_zopper`] : [],
+      claimsRows: Array.isArray(rows[`${partner.key}_claims`]) ? rows[`${partner.key}_claims`] : [],
+    }
   })
 
-  const samsungClaimsChartRows = mergeSeries({
-    vs_claims: toMonthlySeries(samsungVsClaimsRows, "claims"),
-    croma_claims: toMonthlySeries(samsungCromaClaimsRows, "claims"),
+  const samsungSalesSeries: Record<string, Map<string, MonthPoint>> = {}
+  const samsungClaimsSeries: Record<string, Map<string, MonthPoint>> = {}
+  samsungPartnerSnapshots.forEach((snapshot) => {
+    samsungSalesSeries[`${snapshot.prefix}_gross`] = toMonthlySeries(snapshot.grossRows, "gross_premium")
+    samsungSalesSeries[`${snapshot.prefix}_earned`] = toMonthlySeries(snapshot.earnedRows, "earned_premium")
+    samsungSalesSeries[`${snapshot.prefix}_zopper`] = toMonthlySeries(snapshot.zopperRows, "zopper_earned_premium")
+    samsungClaimsSeries[`${snapshot.prefix}_claims`] = toMonthlySeries(snapshot.claimsRows, "claims")
   })
+
+  const samsungSalesRows = mergeSeries(samsungSalesSeries)
+  const samsungClaimsChartRows = mergeSeries(samsungClaimsSeries)
 
   const relianceSalesRows = mergeSeries({
     gross: toMonthlySeries(relianceGrossRows, "gross_premium"),
@@ -369,16 +397,27 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
     claims: toMonthlySeries(godrejClaimsRows, "claims"),
   })
 
-  const samsungVsKpis = toKpis(samsungVsSalesSummary as Summary, samsungVsClaimsSummary as Summary)
-  const samsungCromaKpis = toKpis(samsungCromaSalesSummary as Summary, samsungCromaClaimsSummary as Summary)
-  const samsungKpisBase = addKpis(samsungVsKpis, samsungCromaKpis)
+  const samsungKpisBase = samsungPartnerSnapshots.reduce(
+    (acc, snapshot) => addKpis(acc, toKpis(snapshot.salesSummary as Summary, snapshot.claimsSummary as Summary)),
+    EMPTY_KPIS
+  )
 
   const samsungSummaryEarned = asNumber((samsungSalesSummary as Summary)?.earned_premium)
   const samsungSummaryZopper = asNumber((samsungSalesSummary as Summary)?.zopper_earned_premium)
-  const samsungEarnedFromRows = sumSeriesValues(samsungVsEarnedSeries) + sumSeriesValues(samsungCromaEarnedSeries)
-  const samsungZopperFromRows = sumSeriesValues(samsungVsZopperSeries) + sumSeriesValues(samsungCromaZopperSeries)
-  const hasSamsungEarnedRows = samsungVsEarnedSeries.size > 0 || samsungCromaEarnedSeries.size > 0
-  const hasSamsungZopperRows = samsungVsZopperSeries.size > 0 || samsungCromaZopperSeries.size > 0
+  const samsungEarnedFromRows = samsungPartnerSnapshots.reduce(
+    (sum, snapshot) => sum + sumSeriesValues(samsungSalesSeries[`${snapshot.prefix}_earned`]),
+    0
+  )
+  const samsungZopperFromRows = samsungPartnerSnapshots.reduce(
+    (sum, snapshot) => sum + sumSeriesValues(samsungSalesSeries[`${snapshot.prefix}_zopper`]),
+    0
+  )
+  const hasSamsungEarnedRows = samsungPartnerSnapshots.some(
+    (snapshot) => samsungSalesSeries[`${snapshot.prefix}_earned`].size > 0
+  )
+  const hasSamsungZopperRows = samsungPartnerSnapshots.some(
+    (snapshot) => samsungSalesSeries[`${snapshot.prefix}_zopper`].size > 0
+  )
 
   const samsungKpis: KpiValues = {
     ...samsungKpisBase,
@@ -638,6 +677,11 @@ export default function MasterDashboardView({
     await loadMasterData(defaultFromDate || undefined, defaultToDate || undefined)
   }
 
+  const samsungSeriesMeta = SAMSUNG_PARTNERS.map((partner) => ({
+    ...partner,
+    prefix: SAMSUNG_MASTER_PREFIX[partner.key],
+  }))
+
   const renderChart = useCallback(
     (chartId: ExpandableChartId, expanded = false) => {
       if (!data) return null
@@ -660,42 +704,32 @@ export default function MasterDashboardView({
                       <div className="rounded-lg border border-slate-200 bg-white p-3 text-xs shadow-lg">
                         <div className="mb-2 font-bold text-slate-700">{label}</div>
                         <div className="space-y-2">
-                          <div>
-                            <div className="font-semibold text-slate-700">Vijay Sales</div>
-                            <div className="text-slate-600">{`Gross: ${money(asNumber(row.vs_gross))}`}</div>
-                            <div className="text-slate-600">{`Earned: ${money(asNumber(row.vs_earned))}`}</div>
-                            <div className="text-slate-600">{`Zopper: ${money(asNumber(row.vs_zopper))}`}</div>
-                          </div>
-                          <div>
-                            <div className="font-semibold text-slate-700">Croma</div>
-                            <div className="text-slate-600">{`Gross: ${money(asNumber(row.croma_gross))}`}</div>
-                            <div className="text-slate-600">{`Earned: ${money(asNumber(row.croma_earned))}`}</div>
-                            <div className="text-slate-600">{`Zopper: ${money(asNumber(row.croma_zopper))}`}</div>
-                          </div>
+                          {samsungSeriesMeta.map((series) => (
+                            <div key={`tooltip-${series.key}`}>
+                              <div className="font-semibold text-slate-700">{series.shortLabel}</div>
+                              <div className="text-slate-600">{`Gross: ${money(asNumber(row[`${series.prefix}_gross`]))}`}</div>
+                              <div className="text-slate-600">{`Earned: ${money(asNumber(row[`${series.prefix}_earned`]))}`}</div>
+                              <div className="text-slate-600">{`Zopper: ${money(asNumber(row[`${series.prefix}_zopper`]))}`}</div>
+                            </div>
+                          ))}
                         </div>
                       </div>
                     )
                   }}
                 />
                 <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="vs_gross"
-                  name="Vijay Sales Gross Premium"
-                  stroke="#2563eb"
-                  strokeWidth={2.4}
-                  dot={<ArrowPointDot />}
-                  activeDot={{ r: 5 }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="croma_gross"
-                  name="Croma Gross Premium"
-                  stroke="#0ea5a4"
-                  strokeWidth={2.4}
-                  dot={<ArrowPointDot />}
-                  activeDot={{ r: 5 }}
-                />
+                {samsungSeriesMeta.map((series) => (
+                  <Line
+                    key={`gross-${series.key}`}
+                    type="monotone"
+                    dataKey={`${series.prefix}_gross`}
+                    name={`${series.shortLabel} Gross Premium`}
+                    stroke={series.color}
+                    strokeWidth={2.4}
+                    dot={<ArrowPointDot />}
+                    activeDot={{ r: 5 }}
+                  />
+                ))}
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -712,24 +746,18 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="vs_claims"
-                  name="Vijay Sales Claims Cost"
-                  stroke="#ef4444"
-                  strokeWidth={2.4}
-                  dot={<ArrowPointDot />}
-                  activeDot={{ r: 5 }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="croma_claims"
-                  name="Croma Claims Cost"
-                  stroke="#f59e0b"
-                  strokeWidth={2.4}
-                  dot={<ArrowPointDot />}
-                  activeDot={{ r: 5 }}
-                />
+                {samsungSeriesMeta.map((series) => (
+                  <Line
+                    key={`claims-${series.key}`}
+                    type="monotone"
+                    dataKey={`${series.prefix}_claims`}
+                    name={`${series.shortLabel} Claims Cost`}
+                    stroke={series.color}
+                    strokeWidth={2.4}
+                    dot={<ArrowPointDot />}
+                    activeDot={{ r: 5 }}
+                  />
+                ))}
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -806,7 +834,7 @@ export default function MasterDashboardView({
         </div>
       )
     },
-    [data]
+    [data, samsungSeriesMeta]
   )
 
   return (
@@ -862,7 +890,7 @@ export default function MasterDashboardView({
         {!loading && !error && data && (
           <div className="space-y-6">
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-              <KpiStrip title="Samsung KPI (Vijay Sales + Croma)" values={data.samsung.kpis} showTotalLossRatio />
+              <KpiStrip title="Samsung KPI (Vijay Sales + Croma + Reliance Digital)" values={data.samsung.kpis} showTotalLossRatio />
               <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
                 <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                   <div className="mb-2 flex items-center justify-between gap-3">

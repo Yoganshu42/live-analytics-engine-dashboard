@@ -18,6 +18,10 @@ from services.precomputed_repository import (
     upsert_precomputed_insights,
     upsert_precomputed_summary,
 )
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_LABELS,
+    SAMSUNG_PARTNER_SOURCES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,23 +138,29 @@ def _derive_rule_based_insights(
     metric_key = str(metric or "").strip().lower().replace(" ", "_")
 
     if compare_mode:
-        points: list[tuple[str, float, float]] = []
+        points: list[tuple[str, dict[str, float]]] = []
         for row in rows:
             label = str(row.get(dim_key, row.get(dimension, "Unknown")))
-            vs = _to_number(row.get("samsung_vs"))
-            cr = _to_number(row.get("samsung_croma"))
-            if vs is None and cr is None:
+            partner_values = {
+                partner_key: (_to_number(row.get(partner_key)) or 0.0)
+                for partner_key in SAMSUNG_PARTNER_SOURCES
+                if row.get(partner_key) is not None
+            }
+            if not partner_values:
                 continue
-            points.append((label, vs or 0.0, cr or 0.0))
+            points.append((label, partner_values))
         if not points:
             return []
-        latest = points[-1]
-        label, vs_val, cr_val = latest
-        leader = "Vijay Sales" if vs_val >= cr_val else "Croma"
-        gap = abs(vs_val - cr_val)
+        label, latest_values = points[-1]
+        leader_key = max(latest_values, key=latest_values.get)
+        leader = SAMSUNG_PARTNER_LABELS.get(leader_key, leader_key).replace("Samsung ", "")
+        snapshot = ", ".join(
+            f"{SAMSUNG_PARTNER_LABELS.get(partner_key, partner_key).replace('Samsung ', '')} is {value:,.2f}"
+            for partner_key, value in latest_values.items()
+        )
         return [
-            f"In {label}, Vijay Sales is {vs_val:,.2f} and Croma is {cr_val:,.2f}.",
-            f"{leader} leads by {gap:,.2f} in the latest period.",
+            f"In {label}, {snapshot}.",
+            f"{leader} leads at {latest_values[leader_key]:,.2f} in the latest period.",
         ]
 
     values: list[tuple[str, float]] = []
@@ -282,7 +292,7 @@ def rebuild_precomputed_analytics(
                         rows=rows,
                     )
 
-                    compare_mode = src.startswith("samsung")
+                    compare_mode = src == "samsung"
                     insights = _derive_rule_based_insights(
                         rows=rows,
                         dimension=dimension,
@@ -327,7 +337,7 @@ def rebuild_precomputed_for_all_tags(
         resolved_source, _ = _normalize_source(source)
         if resolved_source == "samsung":
             query = query.filter(
-                DataRow.source.in_(["samsung", "samsung_vs", "samsung_croma", "samsung_vijay_sales"])
+                DataRow.source.in_(["samsung", *SAMSUNG_PARTNER_SOURCES, "samsung_vijay_sales"])
             )
         elif resolved_source:
             query = query.filter(DataRow.source == resolved_source)
@@ -346,7 +356,7 @@ def rebuild_precomputed_for_all_tags(
         agg_query = db.query(DataRow.source, DataRow.dataset_type).distinct()
         if resolved_source == "samsung":
             agg_query = agg_query.filter(
-                DataRow.source.in_(["samsung", "samsung_vs", "samsung_croma", "samsung_vijay_sales"])
+                DataRow.source.in_(["samsung", *SAMSUNG_PARTNER_SOURCES, "samsung_vijay_sales"])
             )
         elif resolved_source:
             agg_query = agg_query.filter(DataRow.source == resolved_source)

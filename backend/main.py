@@ -60,6 +60,11 @@ from services.partner_filter_service import (
     normalize_partner_rows,
 )
 from services.data_quality_service import prepare_rows_for_storage
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_LABELS,
+    SAMSUNG_PARTNER_SOURCES,
+    normalize_samsung_source,
+)
 
 # --------------------------------------------------
 # LOGGING
@@ -2174,7 +2179,7 @@ DEFAULT_CHATBOT_SYSTEM_PROMPT = (
     "If key data is insufficient, explicitly state what is missing and provide the closest defensible estimate with assumptions. "
     "For greetings, acknowledgements, or short conversational messages, respond naturally and invite a data question. "
     "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, "
-    "samsung/overview/overall/ -> Samsung Overview, samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma. "
+    "samsung/overview/overall/ -> Samsung Overview, samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma, reliance digital/reliance_digital -> Samsung Reliance Digital. "
     "Apply source-specific taxonomy and mappings; use Samsung-specific model mapping or Samsung plan abbreviations only when the selected source is Samsung. "
     "Write in a clear executive tone with concise, evidence-backed reasoning. "
     "Lead with the direct answer, then support it with key metrics, trend direction, and business impact. "
@@ -2293,10 +2298,9 @@ def _to_safe_key(key: str) -> str:
 
 def _normalize_source_key(source: str) -> str:
     source_key = (source or "").strip().lower()
-    if source_key in {"samsung_vs", "samsung_vijay_sales", "samsung vs", "samsung vijay sales", "vijay sales"}:
-        return "samsung_vs"
-    if source_key in {"samsung_croma", "samsung croma", "croma"}:
-        return "samsung_croma"
+    samsung_source = normalize_samsung_source(source_key)
+    if samsung_source:
+        return samsung_source
     if source_key in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         return "reliance"
     if source_key in {"godrej", "goodrej", "goddrej"}:
@@ -2305,6 +2309,16 @@ def _normalize_source_key(source: str) -> str:
 
 
 _CHATBOT_SOURCE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    (
+        "samsung_reliance_digital",
+        (
+            "samsung reliance digital",
+            "samsung_reliance_digital",
+            "reliance digital",
+            "reliance-digital",
+            "reliance_digital",
+        ),
+    ),
     ("reliance", ("reliance resq", "reliance-resq", "reliance_resq", "resq", "reliance")),
     ("godrej", ("godrej", "goodrej", "goddrej")),
     ("samsung_vs", ("samsung vijay sales", "samsung_vs", "samsung vs", "vijay sales", "vijay")),
@@ -2318,6 +2332,7 @@ _CHATBOT_SOURCE_LABELS: dict[str, str] = {
     "samsung": "Samsung",
     "samsung_vs": "Samsung Vijay Sales",
     "samsung_croma": "Samsung Croma",
+    "samsung_reliance_digital": "Samsung Reliance Digital",
 }
 
 
@@ -2654,8 +2669,9 @@ def _prepend_partner_scope_prompt(
         if str(label).strip() and str(label).strip().lower() != "all sources"
     ]
     if not partner_labels:
-        partner_labels = ["Samsung Croma", "Samsung Vijay Sales", "Reliance ResQ", "Godrej"]
-    partner_preview = ", ".join(partner_labels[:4])
+        partner_labels = [SAMSUNG_PARTNER_LABELS[source_key] for source_key in SAMSUNG_PARTNER_SOURCES]
+        partner_labels.extend(["Reliance ResQ", "Godrej"])
+    partner_preview = ", ".join(partner_labels)
     prefix = (
         "Partner is not specified. I am sharing combined insights across all available partners. "
         f"For a partner-specific answer, mention one partner ({partner_preview})."
@@ -3138,10 +3154,7 @@ def _build_chatbot_global_context(
             for scope in scopes[:12]
         )
     )
-    if any(
-        _normalize_source_key(str(scope.get("source", ""))) in {"samsung", "samsung_vs", "samsung_croma"}
-        for scope in scopes
-    ):
+    if any(_is_samsung_source(str(scope.get("source", ""))) for scope in scopes):
         context_lines.append(_samsung_model_mapping_context_line())
         context_lines.extend(_samsung_plan_reference_context_lines())
 
@@ -3546,7 +3559,7 @@ def _build_chatbot_dashboard_context(
     ui_context_line = _summarize_ui_context(payload.ui_context)
     if ui_context_line:
         context_lines.append(ui_context_line)
-    if _normalize_source_key(source) in {"samsung", "samsung_vs", "samsung_croma"}:
+    if _is_samsung_source(source):
         context_lines.append(_samsung_model_mapping_context_line())
         context_lines.extend(_samsung_plan_reference_context_lines())
     if job_id:
@@ -3765,8 +3778,8 @@ _SAMSUNG_PLAN_REFERENCE_LINES: tuple[str, ...] = (
     "Samsung plan glossary: ADLD = Accidental Damage and Liquid Damage; SP/SPP = Screen Protection Plan; EW = Extended Warranty; CPP = Comprehensive Protection Plan; Combo = ADLD + EW.",
     "Samsung products/devices covered: smartphones, tablets, laptops, and smartwatches (subject to Samsung terms and channel eligibility in India).",
     "Coverage summary: ADLD covers accidental/liquid damage; SPP covers screen/display damage; EW covers mechanical and electrical breakdown; CPP covers accidental damage plus mechanical/electrical breakdown.",
-    "Samsung fixed Device Plan Category x Plan Category matrix is treated as Zopper Share reference (used for earned premium and zopper earned premium derivation when share columns are missing).",
-    "Samsung gross premium basis uses plan sold price fields (Plan Selling Price/Plan MRP/Amount mapped to gross premium columns).",
+    "Samsung fixed Device Plan Category x Plan Category matrix is treated as Zopper Share reference (used for zopper earned premium derivation when share columns are missing).",
+    "Samsung gross premium and earned premium basis uses plan sold price fields (Plan Selling Price/Plan MRP/Amount mapped to gross premium columns).",
     "Claims process summary: login via registered mobile OTP on Samsung unified portal, open Raise Claim for active policy, submit issue/carry-in details, choose service center and visit slot, pay processing fee where applicable, then receive claim ID.",
 )
 
@@ -4294,7 +4307,7 @@ def _detect_samsung_plan_category_from_text(text: str) -> str | None:
 
 def _is_samsung_source(source: str) -> bool:
     source_key = _normalize_source_key(source)
-    return source_key in {"samsung", "samsung_vs", "samsung_croma"}
+    return source_key == "samsung" or source_key in SAMSUNG_PARTNER_SOURCES
 
 
 def _is_samsung_price_lookup_query(message: str) -> bool:
@@ -4438,10 +4451,12 @@ def _aggregate_metric_by_dimension(
             value = _to_number(row.get(metric_key))
 
         if value is None:
-            partner_vs = _to_number(row.get("samsung_vs"))
-            partner_croma = _to_number(row.get("samsung_croma"))
-            if partner_vs is not None or partner_croma is not None:
-                value = float(partner_vs or 0) + float(partner_croma or 0)
+            partner_values = [
+                _to_number(row.get(partner_key))
+                for partner_key in SAMSUNG_PARTNER_SOURCES
+            ]
+            if any(partner_value is not None for partner_value in partner_values):
+                value = float(sum(float(partner_value or 0) for partner_value in partner_values))
 
         if value is None:
             fallback_total = 0.0

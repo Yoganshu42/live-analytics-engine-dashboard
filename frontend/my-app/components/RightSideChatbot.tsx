@@ -18,6 +18,7 @@ import {
   transformChatbotFile,
   type ChatbotTurn,
 } from "@/app/lib/api"
+import { normalizeSamsungSource } from "@/lib/samsungPartners"
 
 type ChatMessage = {
   role: "user" | "assistant"
@@ -63,6 +64,8 @@ const normalizeJobId = (value: string) => {
 const normalizeSource = (value: string) => {
   const key = (value || "").trim().toLowerCase()
   if (!key) return ""
+  const samsungSource = normalizeSamsungSource(key)
+  if (samsungSource !== key || key === "samsung") return samsungSource
   if (key === "goodrej" || key === "goddrej") return "godrej"
   if (key === "reliance resq" || key === "reliance_resq" || key === "reliance-resq" || key === "resq") {
     return "reliance"

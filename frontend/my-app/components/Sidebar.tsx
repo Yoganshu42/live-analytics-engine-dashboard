@@ -15,6 +15,7 @@ import {
 
 import AdminFileAccess from "@/components/AdminFileAccess"
 import DeckStudioAccess from "@/components/DeckStudioAccess"
+import { SAMSUNG_PARTNERS, isSamsungSource } from "@/lib/samsungPartners"
 
 type Props = {
   brand: string
@@ -41,8 +42,7 @@ export default function Sidebar({
   const [openSamsung, setOpenSamsung] = useState(true)
   const [openSourcesMobile, setOpenSourcesMobile] = useState(false)
 
-  const isSamsungActive =
-    brand === "samsung" || brand === "samsung_croma" || brand === "samsung_vs"
+  const isSamsungActive = isSamsungSource(brand)
 
   const sourceItemClass = (active: boolean) =>
     `${railLinkBase} ${active ? "bg-[#e8efff] text-[#1f5cc8]" : "text-slate-600 hover:bg-slate-100"}`
@@ -132,10 +132,8 @@ export default function Sidebar({
 
           {openSamsung && !collapsed && (
             <ul className="mt-1 space-y-1 pl-2">
-              {[
-                { label: "Croma", value: "samsung_croma", logo: "/croma_logo.jpg" },
-                { label: "Vijay Sales", value: "samsung_vs", logo: "/vs_logo.jpg" },
-              ].map((item) => {
+              {SAMSUNG_PARTNERS.map((partner) => {
+                const item = { label: partner.shortLabel, value: partner.key, logo: partner.logo }
                 const active = brand === item.value
                 return (
                   <li key={item.value}>

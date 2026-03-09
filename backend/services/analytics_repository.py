@@ -7,6 +7,11 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_SOURCES,
+    SAMSUNG_SOURCE_VARIANTS,
+    normalize_samsung_source,
+)
 
 _CACHE_TTL_SECONDS = 300
 _df_cache_lock = threading.Lock()
@@ -29,9 +34,14 @@ def _source_variants(source: str | None) -> list[str]:
     if source_key in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         # Keep legacy Reliance ResQ aliases readable without forcing a migration first.
         return ["reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"]
-    if source_key in {"samsung_vs", "samsung_vijay_sales"}:
+    samsung_source = normalize_samsung_source(source_key)
+    if samsung_source == "samsung":
+        return list(SAMSUNG_SOURCE_VARIANTS)
+    if samsung_source == "samsung_vs":
         # Keep both aliases readable without requiring a data migration first.
         return ["samsung_vs", "samsung_vijay_sales"]
+    if samsung_source in SAMSUNG_PARTNER_SOURCES:
+        return [samsung_source]
     return [source_key]
 
 
@@ -48,8 +58,13 @@ def invalidate_dataframe_cache(
         src_values: set[str] | None = None
         if source is not None:
             src = (source or "").strip().lower()
-            if src in {"samsung_vs", "samsung_vijay_sales"}:
+            samsung_source = normalize_samsung_source(src)
+            if samsung_source == "samsung":
+                src_values = set(SAMSUNG_SOURCE_VARIANTS)
+            elif samsung_source == "samsung_vs":
                 src_values = {"samsung_vs", "samsung_vijay_sales"}
+            elif samsung_source in SAMSUNG_PARTNER_SOURCES:
+                src_values = {samsung_source}
             elif src in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
                 src_values = {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}
             elif src in {"godrej", "goodrej", "goddrej"}:

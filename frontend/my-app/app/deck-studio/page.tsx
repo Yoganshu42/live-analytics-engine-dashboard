@@ -23,6 +23,7 @@ type PartnerOption = {
 const PARTNERS: PartnerOption[] = [
   { key: "samsung_vs", label: "Samsung Vijay Sales", logo: "/vs_logo.jpg" },
   { key: "samsung_croma", label: "Samsung Croma", logo: "/croma_logo.jpg" },
+  { key: "samsung_reliance_digital", label: "Samsung Reliance Digital", logo: "/reliance_digital_logo.png" },
   { key: "reliance", label: "Reliance ResQ", logo: "/resq.png" },
   { key: "godrej", label: "Godrej", logo: "/Group 1244833444.png" },
 ]

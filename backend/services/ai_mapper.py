@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from services.date_parsing import parse_flexible_datetime
+
 
 def normalize(col: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(col or "").lower())
@@ -34,12 +36,15 @@ def _clean_numeric(series: pd.Series) -> pd.Series:
 
 
 def _datetime_ratio(series: pd.Series) -> float:
+    if len(series) == 0:
+        return 0.0
     try:
         parsed = pd.to_datetime(series, format="mixed", errors="coerce")
     except TypeError:
         parsed = pd.to_datetime(series, errors="coerce")
-    if len(series) == 0:
-        return 0.0
+    if parsed.isna().any():
+        fallback = series.where(parsed.isna()).map(parse_flexible_datetime)
+        parsed = parsed.where(parsed.notna(), fallback)
     return float(parsed.notna().sum()) / float(len(series))
 
 
@@ -52,6 +57,67 @@ def _text_ratio(series: pd.Series) -> float:
         .replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "None": pd.NA})
     )
     return float(cleaned.notna().sum()) / float(len(series))
+
+
+def _samsung_device_category_ratio(series: pd.Series) -> float:
+    if len(series) == 0:
+        return 0.0
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "null": pd.NA})
+        .dropna()
+    )
+    if cleaned.empty:
+        return 0.0
+
+    normalized = (
+        cleaned
+        .str.replace("_", " ", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    matches = (
+        normalized.eq("mass")
+        | normalized.eq("mid")
+        | normalized.eq("high")
+        | normalized.eq("premium")
+        | normalized.eq("super premium")
+        | normalized.eq("luxury flip")
+        | normalized.eq("luxury fold")
+    )
+    return float(matches.mean()) if len(normalized) else 0.0
+
+
+def _samsung_plan_like_ratio(series: pd.Series) -> float:
+    if len(series) == 0:
+        return 0.0
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "null": pd.NA})
+        .dropna()
+    )
+    if cleaned.empty:
+        return 0.0
+
+    normalized = (
+        cleaned
+        .str.replace("_", " ", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    matches = (
+        normalized.str.contains(r"\bcombo\b", na=False)
+        | normalized.str.contains(r"\badld\b", na=False)
+        | normalized.str.contains(r"\bew\b", na=False)
+        | normalized.str.contains(r"\bextended warranty\b", na=False)
+        | normalized.str.contains(r"\bscreen protection\b", na=False)
+        | normalized.str.contains(r"\bprotect max\b", na=False)
+    )
+    return float(matches.mean()) if len(normalized) else 0.0
 
 
 def _sample_values(series: pd.Series, limit: int = 3) -> list[str]:
@@ -92,6 +158,8 @@ SOURCE_ALIASES = {
     "samsungvs": "samsung",
     "samsungvijaysales": "samsung",
     "samsungcroma": "samsung",
+    "samsungreliancedigital": "samsung",
+    "reliancedigital": "samsung",
 }
 
 
@@ -187,8 +255,8 @@ PROFILE_RULES: dict[tuple[str, str], list[FieldRule]] = {
         ),
         FieldRule(
             field="plan_category",
-            aliases=("plan category", "plan_category"),
-            keywords=("plan", "category"),
+            aliases=("plan category", "plan_category", "plan type", "warranty type", "pack type"),
+            keywords=("plan", "category", "type", "warranty", "pack"),
             expected_type="text",
             required=True,
         ),
@@ -201,15 +269,15 @@ PROFILE_RULES: dict[tuple[str, str], list[FieldRule]] = {
         ),
         FieldRule(
             field="start_date",
-            aliases=("start_date", "start date", "plan start date", "date"),
-            keywords=("start", "purchase", "invoice", "date"),
+            aliases=("start_date", "start date", "plan start date", "warranty start date", "transaction date", "date"),
+            keywords=("start", "purchase", "invoice", "transaction", "date", "warranty"),
             expected_type="date",
             required=True,
         ),
         FieldRule(
             field="end_date",
-            aliases=("end_date", "end date", "plan end date"),
-            keywords=("end", "expiry", "date"),
+            aliases=("end_date", "end date", "plan end date", "warranty end date"),
+            keywords=("end", "expiry", "date", "warranty"),
             expected_type="date",
             required=False,
         ),
@@ -430,6 +498,19 @@ def _score_candidate(rule: FieldRule, col_name: str, series: pd.Series) -> dict[
         elif ratio >= 0.35:
             score += 0.5
             reasons.append("moderate text signal")
+
+    if rule.field == "device_plan_category":
+        device_ratio = _samsung_device_category_ratio(series)
+        plan_like_ratio = _samsung_plan_like_ratio(series)
+        if device_ratio >= 0.6:
+            score += 3.0
+            reasons.append("values match samsung device segments")
+        elif device_ratio >= 0.25:
+            score += 1.5
+            reasons.append("some values match samsung device segments")
+        if plan_like_ratio >= 0.5 and device_ratio < 0.35:
+            score -= 10.0
+            reasons.append("values look like plan labels, not device segments")
 
     fill_ratio = _text_ratio(series)
     score += fill_ratio

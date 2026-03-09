@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 108" role="img" aria-labelledby="title desc">
+  <title id="title">Reliance Digital</title>
+  <desc id="desc">Reliance Digital logo on a red background.</desc>
+  <rect width="360" height="108" rx="20" fill="#e51f2c"/>
+  <circle cx="63" cy="36" r="22" fill="#1f3b7a" stroke="#f8efe7" stroke-width="2.5"/>
+  <path d="M53 47c0-9.8 4.6-19.4 8.1-24.4 2.2 5.1 6.2 11.4 11.5 15.2-5.5 2.8-7.6 7.6-7.6 13.2 0 7.1 4 12.1 8.8 15.5-5.7-.5-12.6-2.8-17.2-7.5-2.6-2.6-3.6-6.2-3.6-12z" fill="#f8efe7"/>
+  <text x="22" y="84" fill="#f8efe7" font-family="Arial Black, Arial, sans-serif" font-size="34" font-weight="900">Reliance</text>
+  <text
+    x="171"
+    y="84"
+    fill="#1fb4e5"
+    stroke="#f8efe7"
+    stroke-width="2.1"
+    paint-order="stroke"
+    font-family="Arial Black, Arial, sans-serif"
+    font-size="34"
+    font-weight="900"
+  >digital</text>
+</svg>

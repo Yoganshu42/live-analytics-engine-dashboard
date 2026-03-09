@@ -41,6 +41,15 @@ type MetricCard = {
   icon: LucideIcon
 }
 
+type KpiCacheValue = {
+  summary: Summary | null
+  claimsSummary: Summary | null
+  lastUpdated: string | null
+}
+
+const KPI_CACHE_TTL_MS = 120000
+const kpiCache = new Map<string, { expiresAt: number; value: KpiCacheValue }>()
+
 const money = (value: number) => {
   const abs = Math.abs(value)
   if (abs >= 1e7) return `Rs ${(value / 1e7).toFixed(2)} Cr`
@@ -162,6 +171,14 @@ export default function KpiCardsRow({
 
   useEffect(() => {
     let mounted = true
+    const cacheKey = JSON.stringify({
+      source,
+      datasetType,
+      jobId: jobId || "",
+      fromDate: fromDate || "",
+      toDate: toDate || "",
+      refreshTick: refreshTick || 0,
+    })
 
     const summaryParams: Parameters<typeof fetchSummary>[0] = {
       job_id: jobId,
@@ -195,35 +212,67 @@ export default function KpiCardsRow({
     }
 
     const load = async () => {
+      const cached = kpiCache.get(cacheKey)
+      if (cached && cached.expiresAt > Date.now()) {
+        if (!mounted) return
+        setSummary(cached.value.summary)
+        setClaimsSummary(cached.value.claimsSummary)
+        setLastUpdated(cached.value.lastUpdated)
+        setLoading(false)
+        setError(null)
+        return
+      }
+
       if (mounted) {
         setLoading(true)
         setError(null)
       }
 
       try {
-        const [summaryRes, freshnessRes, claimsRes, monthRows, dateRows] = await Promise.all([
+        const [summaryRes, freshnessRes, claimsRes] = await Promise.all([
           fetchSummary(summaryParams),
           fetchLastUpdated(freshnessParams),
           datasetType === "sales"
             ? fetchSummary(claimsSummaryParams).catch(() => null)
             : Promise.resolve(null),
-          fetchByDimensionRows({
-            ...trendBaseParams,
-            dimension: "month",
-          }).catch(() => []),
-          fetchByDimensionRows({
-            ...trendBaseParams,
-            dimension: "date",
-          }).catch(() => []),
         ])
         if (!mounted) return
-        setSummary(summaryRes || null)
-        const trendLatest =
-          pickLatestTrendDate(monthRows, "month")
-          || pickLatestTrendDate(dateRows, "date")
+
         const freshnessDate = (freshnessRes as LastUpdated | null)?.data_upto ?? null
-        setLastUpdated(trendLatest || freshnessDate)
-        setClaimsSummary((claimsRes as Summary | null) || null)
+        let resolvedLastUpdated = freshnessDate
+
+        if (!resolvedLastUpdated) {
+          const [monthRows, dateRows] = await Promise.all([
+            fetchByDimensionRows({
+              ...trendBaseParams,
+              dimension: "month",
+            }).catch(() => []),
+            fetchByDimensionRows({
+              ...trendBaseParams,
+              dimension: "date",
+            }).catch(() => []),
+          ])
+          if (!mounted) return
+          resolvedLastUpdated =
+            pickLatestTrendDate(monthRows, "month")
+            || pickLatestTrendDate(dateRows, "date")
+            || freshnessDate
+        }
+
+        const nextValue: KpiCacheValue = {
+          summary: (summaryRes as Summary | null) || null,
+          claimsSummary: (claimsRes as Summary | null) || null,
+          lastUpdated: resolvedLastUpdated,
+        }
+
+        kpiCache.set(cacheKey, {
+          expiresAt: Date.now() + KPI_CACHE_TTL_MS,
+          value: nextValue,
+        })
+
+        setSummary(nextValue.summary)
+        setLastUpdated(nextValue.lastUpdated)
+        setClaimsSummary(nextValue.claimsSummary)
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase()
         const isAuthError = msg.includes("not authenticated") || msg.includes("invalid token")

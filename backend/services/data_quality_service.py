@@ -14,7 +14,7 @@ def _clean_key(value: Any) -> str:
 
 def _normalize_source(source: str) -> str:
     key = _clean_key(source)
-    if key in {"samsungvs", "samsungvijaysales", "samsungcroma", "samsung"}:
+    if key in {"samsungvs", "samsungvijaysales", "samsungcroma", "samsungreliancedigital", "reliancedigital", "samsung"}:
         return "samsung"
     if key in {"relianceresq", "reliance", "resq"}:
         return "reliance"

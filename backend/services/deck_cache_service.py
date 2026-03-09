@@ -13,6 +13,11 @@ from sqlalchemy.orm import Session
 
 from models.data_rows import DataRow
 from models.deck_pptx_cache import DeckPptxCache
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_SOURCES,
+    SAMSUNG_SOURCE_VARIANTS,
+    normalize_samsung_source,
+)
 from services.deck_pptx_service import (
     VALID_WEEK_WINDOWS,
     build_partner_deck_preview,
@@ -53,10 +58,13 @@ def _normalize_optional(value: str | None) -> str:
 
 def _source_variants(source: str) -> list[str]:
     key = (source or "").strip().lower()
-    if key in {"samsung", "samsung_vs", "samsung_vijay_sales"}:
+    samsung_source = normalize_samsung_source(key)
+    if samsung_source == "samsung":
+        return list(SAMSUNG_SOURCE_VARIANTS)
+    if samsung_source == "samsung_vs":
         return ["samsung_vs", "samsung_vijay_sales"]
-    if key == "samsung_croma":
-        return ["samsung_croma"]
+    if samsung_source in SAMSUNG_PARTNER_SOURCES:
+        return [samsung_source]
     if key in {"reliance", "reliance_resq", "reliance-resq", "reliance resq", "resq"}:
         return ["reliance"]
     if key in {"godrej", "goodrej", "goddrej"}:
@@ -66,12 +74,13 @@ def _source_variants(source: str) -> list[str]:
 
 def _partners_for_source(source: str) -> set[str]:
     key = (source or "").strip().lower()
-    if key == "samsung":
-        return {"samsung_vs", "samsung_croma"}
-    if key in {"samsung_vs", "samsung_vijay_sales"}:
+    samsung_source = normalize_samsung_source(key)
+    if samsung_source == "samsung":
+        return set(SAMSUNG_PARTNER_SOURCES)
+    if samsung_source == "samsung_vs":
         return {"samsung_vs"}
-    if key == "samsung_croma":
-        return {"samsung_croma"}
+    if samsung_source in SAMSUNG_PARTNER_SOURCES:
+        return {samsung_source}
     if key in {"reliance", "reliance_resq", "reliance-resq", "reliance resq", "resq"}:
         return {"reliance"}
     if key in {"godrej", "goodrej", "goddrej"}:

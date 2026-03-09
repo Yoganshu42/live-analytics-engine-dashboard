@@ -27,6 +27,11 @@ import {
   fetchGraphInsights,
   type CategoryPercentageRow,
 } from "@/app/lib/api"
+import {
+  SAMSUNG_PARTNERS,
+  isSamsungPartnerSource,
+  sumSamsungPartnerValues,
+} from "@/lib/samsungPartners"
 import { GRAPH_PRESETS } from "@/utils/graphPresets"
 
 const normalizedInsightsFlag = (
@@ -447,11 +452,15 @@ const buildInsightsRows = (snapshot: GraphDataSnapshot) => {
   const dimKey = snapshot.dimensionKey
 
   if (snapshot.compareMode) {
-    return rows.map((row) => ({
-      [dimKey]: row[dimKey],
-      samsung_vs: row.samsung_vs ?? 0,
-      samsung_croma: row.samsung_croma ?? 0,
-    }))
+    return rows.map((row) => {
+      const next: Record<string, unknown> = {
+        [dimKey]: row[dimKey],
+      }
+      SAMSUNG_PARTNERS.forEach((partner) => {
+        next[partner.key] = row[partner.key] ?? 0
+      })
+      return next
+    })
   }
 
   const measureKey = snapshot.measure
@@ -550,6 +559,7 @@ const METRIC_LINE_COLORS: Record<string, string> = {
 const SOURCE_FALLBACK_METRIC_KEYS: Record<string, string[]> = {
   samsung_vs: ["samsung_vs"],
   samsung_croma: ["samsung_croma"],
+  samsung_reliance_digital: ["samsung_reliance_digital"],
   reliance: ["reliance", "reliance_resq"],
   godrej: ["godrej"],
 }
@@ -676,13 +686,13 @@ const getSectionMainChartMode = (
   if (
     (sourceKey === "godrej" && (dimKey === "channel" || dimKey === "plan_category"))
     || (sourceKey === "reliance" && dimKey === "plan_category")
-    || ((sourceKey === "samsung_vs" || sourceKey === "samsung_croma") && dimKey === "plan_category")
+    || (isSamsungPartnerSource(sourceKey) && dimKey === "plan_category")
   ) {
     return "dense_heatmap"
   }
 
   if (
-    ((sourceKey === "samsung_vs" || sourceKey === "samsung_croma") && dimKey === "device_plan_category")
+    (isSamsungPartnerSource(sourceKey) && dimKey === "device_plan_category")
     || (sourceKey === "reliance" && (dimKey === "article_brand" || dimKey === "brand"))
     || (sourceKey === "godrej" && dimKey === "product_category")
   ) {
@@ -715,7 +725,7 @@ export default function MultiGraphView({
           {
             id: "samsung-month-claims-cost",
             title: "Claims Cost Trend by Month",
-            subtitle: "Month-on-month claims cost line range comparison between Vijay Sales and Croma.",
+            subtitle: "Month-on-month claims cost line range comparison across Vijay Sales, Croma, and Reliance Digital.",
             dimension: "month",
             metric: "claims",
             bucket: "month",
@@ -748,7 +758,7 @@ export default function MultiGraphView({
         {
           id: "samsung-month-gross-premium",
           title: "Gross Premium Trend by Month",
-          subtitle: "Month-on-month gross premium line range comparison between Vijay Sales and Croma.",
+          subtitle: "Month-on-month gross premium line range comparison across Vijay Sales, Croma, and Reliance Digital.",
           dimension: "month",
           metric: "gross_premium",
           bucket: "month",
@@ -952,7 +962,7 @@ export default function MultiGraphView({
       if (!label) continue
 
       const value = openedGraphData.compareMode
-        ? asNumber(row.samsung_vs) + asNumber(row.samsung_croma)
+        ? sumSamsungPartnerValues(row as Record<string, unknown>)
         : asNumber(row[measureKey])
       map.set(label, (map.get(label) ?? 0) + Math.max(0, value))
     }
@@ -1818,7 +1828,8 @@ export default function MultiGraphView({
 
   const renderSamsungCard = (
     card: SamsungOverviewCard,
-    layout: "main" | "small"
+    layout: "main" | "small",
+    index: number
   ) => {
     return (
       <motion.div
@@ -1871,6 +1882,7 @@ export default function MultiGraphView({
               chartType={card.chartType}
               tooltipMetricOverride={card.tooltipMetricOverride}
               deferUntilVisible
+              fetchDelayMs={layout === "main" ? index * 80 : 140 + index * 120}
               heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
             />
           </div>
@@ -1881,7 +1893,8 @@ export default function MultiGraphView({
 
   const renderPartnerSideCard = (
     card: PartnerSideCard,
-    keyPrefix: string
+    keyPrefix: string,
+    index: number
   ) => {
     return (
       <motion.div
@@ -1931,6 +1944,7 @@ export default function MultiGraphView({
               chartType={card.chartType}
               tooltipMetricOverride={card.tooltipMetricOverride}
               deferUntilVisible
+              fetchDelayMs={160 + index * 120}
               heightClassName={
                 card.chartType === "pie"
                   ? "h-[230px] sm:h-[260px]"
@@ -1949,11 +1963,11 @@ export default function MultiGraphView({
         <div className="space-y-4">
           {samsungOverviewCards
             .filter((card) => card.size === "main")
-            .map((card) => renderSamsungCard(card, "main"))}
+            .map((card, index) => renderSamsungCard(card, "main", index))}
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {samsungOverviewCards
             .filter((card) => card.size === "small")
-            .map((card) => renderSamsungCard(card, "small"))}
+            .map((card, index) => renderSamsungCard(card, "small", index))}
           </div>
         </div>
       ) : (
@@ -2333,7 +2347,7 @@ export default function MultiGraphView({
           {!!partnerSideCards.length && (
             <div className="xl:sticky xl:top-4">
               <div className="grid grid-cols-1 gap-3">
-                {partnerSideCards.map((card) => renderPartnerSideCard(card, "frozen-side-rail"))}
+                {partnerSideCards.map((card, index) => renderPartnerSideCard(card, "frozen-side-rail", index))}
               </div>
             </div>
           )}

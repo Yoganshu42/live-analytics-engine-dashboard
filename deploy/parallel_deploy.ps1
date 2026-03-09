@@ -95,7 +95,7 @@ Invoke-Scp `
     -Destination "${remoteUser}@${serverIP}:${remotePath}/frontend/my-app/" `
     -FailureMessage "Failed to upload frontend root files."
 Invoke-Scp -Recursive `
-    -SourcePaths @("frontend/my-app/app", "frontend/my-app/components", "frontend/my-app/utils", "frontend/my-app/public") `
+    -SourcePaths @("frontend/my-app/app", "frontend/my-app/components", "frontend/my-app/lib", "frontend/my-app/utils", "frontend/my-app/public") `
     -Destination "${remoteUser}@${serverIP}:${remotePath}/frontend/my-app/" `
     -FailureMessage "Failed to upload frontend app directories."
 

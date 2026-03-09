@@ -48,6 +48,19 @@ const FILTER_AI_INSTRUCTION_EXAMPLES = [
   "remove duplicates from column Policy Number",
 ]
 
+const ADMIN_SOURCE_LABELS: Record<string, string> = {
+  samsung: "Samsung Overview",
+  samsung_vs: "Samsung Vijay Sales",
+  samsung_croma: "Samsung Croma",
+  samsung_reliance_digital: "Samsung Reliance Digital",
+  reliance: "Reliance ResQ",
+  godrej: "Godrej",
+}
+
+const formatAdminSourceLabel = (source: string) => (
+  ADMIN_SOURCE_LABELS[source] || source.replace(/_/g, " ")
+)
+
 function inferTransformOutputFormat(file: File): "csv" | "xlsx" | undefined {
   const name = String(file.name || "").trim().toLowerCase()
   if (name.endsWith(".csv")) return "csv"
@@ -144,7 +157,7 @@ function DataUpdationPanel() {
   const [file, setFile] = useState<File | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
-  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "reliance", "godrej"], [])
+  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "samsung_reliance_digital", "reliance", "godrej"], [])
 
   const refreshDashboard = useCallback(() => {
     if (typeof window === "undefined") return
@@ -273,7 +286,7 @@ function DataUpdationPanel() {
           >
             {knownSources.map((src) => (
               <option key={src} value={src}>
-                {src}
+                {formatAdminSourceLabel(src)}
               </option>
             ))}
           </select>
@@ -583,7 +596,7 @@ function FilterFilePanel() {
   const [aiInstruction, setAiInstruction] = useState("")
   const [instructionSummary, setInstructionSummary] = useState("")
 
-  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "reliance", "godrej"], [])
+  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "samsung_reliance_digital", "reliance", "godrej"], [])
 
   const refreshDashboard = useCallback(() => {
     if (!applyToDb || typeof window === "undefined") return
@@ -788,7 +801,7 @@ function FilterFilePanel() {
           >
             {knownSources.map((src) => (
               <option key={src} value={src}>
-                {src}
+                {formatAdminSourceLabel(src)}
               </option>
             ))}
           </select>

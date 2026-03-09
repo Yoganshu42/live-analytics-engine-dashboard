@@ -28,6 +28,7 @@ type WeekWindow = 2 | 3 | 4 | 6
 const PARTNERS: PartnerOption[] = [
   { key: "samsung_vs", label: "Samsung Vijay Sales", logo: "/vs_logo.jpg", cardLabel: "Samsung VS" },
   { key: "samsung_croma", label: "Samsung Croma", logo: "/croma_logo.jpg", cardLabel: "Samsung Croma" },
+  { key: "samsung_reliance_digital", label: "Samsung Reliance Digital", logo: "/reliance_digital_logo.png", cardLabel: "Reliance Digital" },
   { key: "reliance", label: "Reliance ResQ", logo: "/resq.png", cardLabel: "Reliance ResQ" },
   { key: "godrej", label: "Godrej", logo: "/Group 1244833444.png", cardLabel: "Godrej" },
 ]

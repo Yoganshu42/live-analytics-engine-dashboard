@@ -10,18 +10,27 @@ from sqlalchemy.orm import Session
 
 from services.analytics.base_engine import BaseAnalyticsEngine
 from services.analytics_repository import get_dataframe
+from services.date_parsing import (
+    canonicalize_samsung_plan_category,
+    parse_flexible_datetime,
+    resolve_samsung_plan_window,
+)
+from services.partner_filter_service import (
+    _canonical_samsung_device_category,
+    _infer_samsung_device_category_from_plan_selling_price,
+    _infer_samsung_device_category_from_reference_price,
+)
+from services.samsung_partner_config import (
+    SAMSUNG_PARTNER_SOURCES,
+    SAMSUNG_SOURCE_VARIANTS,
+)
 
 REPORT_START = pd.Timestamp("2000-01-01")
 REPORT_END = pd.Timestamp("2100-12-31")
-ZOPPER_GST_MULTIPLIER = 1.18
+# Samsung Zopper Share values are already GST-inclusive in the uploaded files.
+ZOPPER_GST_MULTIPLIER = 1.0
 LOSS_RATIO_CAP_PERCENT = 300.0
 logger = logging.getLogger(__name__)
-SAMSUNG_SOURCE_VARIANTS = (
-    "samsung_vs",
-    "samsung_croma",
-    "samsung_vijay_sales",
-    "samsung",
-)
 SAMSUNG_LOAD_CACHE_TTL_SECONDS = 300
 _samsung_load_cache_lock = threading.Lock()
 _samsung_load_cache: dict[
@@ -309,7 +318,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         src = (self.source or "").strip().lower()
         # Partner-specific queries already scope rows at source level; do not
         # rely on marketplace text because vendor files are often inconsistent.
-        if src in {"samsung_vs", "samsung_vijay_sales", "samsung_croma"}:
+        if src in {"samsung_vs", "samsung_vijay_sales", "samsung_croma", "samsung_reliance_digital"}:
             return df
         is_vs = ("vijay" in src) or src in {"samsung_vs", "samsung_vijay_sales"}
         is_croma = "croma" in src
@@ -521,8 +530,89 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                 sales_df = self._coalesce_columns(sales_df, "End_Date", ["End_Date", "End Date", "Plan End Date"])
                 sales_df = self._coalesce_columns(sales_df, "Month", ["Month", "Month ", "Month Name", "Month_Name"])
                 sales_df = self._coalesce_columns(sales_df, "State", ["State", "State / City", "State/City"])
+                sales_df = self._coalesce_columns(
+                    sales_df,
+                    "Plan Category",
+                    ["Plan Category", "Plan_Category", "Plan Type", "Plan type", "Warranty Type", "Pack Type", "Pack type"],
+                )
+                sales_df = self._coalesce_columns(
+                    sales_df,
+                    "Device Plan Category",
+                    ["Device Plan Category", "Device_Plan_Category", "Device Category", "Device_Category", "Category"],
+                )
 
             if not sales_df.empty:
+                if "Plan Category" in sales_df.columns:
+                    raw_plan = self._clean_text_series(sales_df["Plan Category"]).fillna("")
+                    canonical_plan = raw_plan.map(canonicalize_samsung_plan_category)
+                    sales_df["Plan Category"] = canonical_plan.where(canonical_plan.ne(""), raw_plan)
+                    sales_df["Plan_Category"] = sales_df["Plan Category"]
+                model_ref: pd.Series | None = None
+                for model_col in ["Model Code", "Model Code-1", "Model"]:
+                    if model_col in sales_df.columns:
+                        model_ref = sales_df[model_col] if model_ref is None else model_ref.fillna(sales_df[model_col])
+                zopper_share_col = self._find_column_by_alias(
+                    sales_df,
+                    "Zopper Share",
+                    "Zopper Shared ( Transfer Price )",
+                    "transfer_price",
+                )
+                plan_price_col = self._find_column_by_alias(
+                    sales_df,
+                    "Plan Selling Price",
+                    "Plan Selling Price ",
+                    "Amount",
+                    "Gross Premium",
+                    "Customer Premium",
+                )
+                if "Device Plan Category" in sales_df.columns or model_ref is not None or plan_price_col is not None or zopper_share_col is not None:
+                    raw_device = (
+                        self._clean_text_series(sales_df["Device Plan Category"]).fillna("")
+                        if "Device Plan Category" in sales_df.columns
+                        else pd.Series("", index=sales_df.index, dtype="object")
+                    )
+                    plan_price_series = (
+                        self._numeric_series(sales_df[plan_price_col])
+                        if plan_price_col is not None
+                        else pd.Series(0.0, index=sales_df.index, dtype="float64")
+                    )
+                    transfer_series = (
+                        self._numeric_series(sales_df[zopper_share_col])
+                        if zopper_share_col is not None
+                        else pd.Series(0.0, index=sales_df.index, dtype="float64")
+                    )
+                    plan_ref = sales_df.get("Plan Category", pd.Series("", index=sales_df.index, dtype="object"))
+                    model_series = model_ref if model_ref is not None else pd.Series("", index=sales_df.index, dtype="object")
+                    resolved_device = pd.Series(
+                        [
+                            _canonical_samsung_device_category(device_value, model_value)
+                            or _infer_samsung_device_category_from_plan_selling_price(plan_value, plan_price_value)
+                            or _infer_samsung_device_category_from_reference_price(plan_value, transfer_value)
+                            for device_value, model_value, plan_value, plan_price_value, transfer_value in zip(
+                                raw_device.tolist(),
+                                model_series.tolist(),
+                                plan_ref.tolist(),
+                                plan_price_series.tolist(),
+                                transfer_series.tolist(),
+                            )
+                        ],
+                        index=sales_df.index,
+                        dtype="object",
+                    )
+                    if resolved_device.astype(str).str.strip().ne("").any():
+                        invalid_plan_like_mask = raw_device.astype(str).str.contains(
+                            r"\b(?:combo|adld|ew|extended warranty|screen protection|protect max)\b",
+                            case=False,
+                            na=False,
+                        )
+                        sales_df["Device Plan Category"] = resolved_device.where(
+                            resolved_device.astype(str).str.strip().ne(""),
+                            raw_device.where(~invalid_plan_like_mask, pd.NA),
+                        )
+                        sales_df["Device_Plan_Category"] = sales_df["Device Plan Category"]
+                raw_start = sales_df["Start_Date"] if "Start_Date" in sales_df.columns else pd.Series("", index=sales_df.index, dtype="object")
+                raw_end = sales_df["End_Date"] if "End_Date" in sales_df.columns else pd.Series("", index=sales_df.index, dtype="object")
+                raw_tx = sales_df["Date"] if "Date" in sales_df.columns else pd.Series("", index=sales_df.index, dtype="object")
                 if "Start_Date" in sales_df.columns:
                     try:
                         sales_df["Start_Date"] = pd.to_datetime(sales_df["Start_Date"], format="mixed", errors="coerce")
@@ -538,6 +628,30 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                         sales_df["Date"] = pd.to_datetime(sales_df["Date"], format="mixed", errors="coerce")
                     except TypeError:
                         sales_df["Date"] = pd.to_datetime(sales_df["Date"], errors="coerce")
+                resolved_windows = [
+                    resolve_samsung_plan_window(
+                        plan_type=plan_value,
+                        start_value=start_value,
+                        end_value=end_value,
+                        transaction_value=transaction_value,
+                    )
+                    for plan_value, start_value, end_value, transaction_value in zip(
+                        sales_df.get("Plan Category", pd.Series("", index=sales_df.index)).tolist(),
+                        raw_start.tolist(),
+                        raw_end.tolist(),
+                        raw_tx.tolist(),
+                    )
+                ]
+                resolved_start = pd.Series([start for start, _end in resolved_windows], index=sales_df.index, dtype="datetime64[ns]")
+                resolved_end = pd.Series([end for _start, end in resolved_windows], index=sales_df.index, dtype="datetime64[ns]")
+                if "Start_Date" not in sales_df.columns:
+                    sales_df["Start_Date"] = resolved_start
+                elif sales_df["Start_Date"].isna().any():
+                    sales_df["Start_Date"] = sales_df["Start_Date"].where(sales_df["Start_Date"].notna(), resolved_start)
+                if "End_Date" not in sales_df.columns:
+                    sales_df["End_Date"] = resolved_end
+                elif sales_df["End_Date"].isna().any():
+                    sales_df["End_Date"] = sales_df["End_Date"].where(sales_df["End_Date"].notna(), resolved_end)
                 # Keep raw Month values; parsing is handled centrally in _parse_month_series
 
 
@@ -856,7 +970,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                     .str.replace(r"[^a-z0-9]+", " ", regex=True)
                     .str.replace(r"\s+", " ", regex=True)
                 )
-                return raw.isin({"ew", "extended warranty", "extendedwarranty"})
+                return raw.eq("ew") | raw.str.contains(r"\bextended warranty\b", na=False)
         return pd.Series(False, index=df.index)
 
     def _sales_date_series(
@@ -1004,6 +1118,77 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         ratio = (earned_days / policy_days).replace([float("inf"), float("-inf")], pd.NA).fillna(0.0)
         return ratio.clip(lower=0.0, upper=1.0)
 
+    def _sales_earned_period_columns(self, df: pd.DataFrame) -> tuple[pd.Series | None, pd.Series | None]:
+        start_col = "_adj_start_date" if "_adj_start_date" in df.columns else ("Start_Date" if "Start_Date" in df.columns else None)
+        end_col = "_adj_end_date" if "_adj_end_date" in df.columns else ("End_Date" if "End_Date" in df.columns else None)
+        if start_col is None or end_col is None:
+            return None, None
+        start_series = pd.to_datetime(df[start_col], errors="coerce")
+        end_series = pd.to_datetime(df[end_col], errors="coerce")
+        return start_series, end_series
+
+    def _resolve_sales_metric_series(self, df: pd.DataFrame, metric: str) -> pd.Series | None:
+        amount_col = self._find_column_by_alias(
+            df,
+            "Plan Selling Price",
+            "Plan Selling Price ",
+            "gross_premium",
+            "Gross Premium",
+            "Amount",
+            "Customer Premium",
+        )
+        earned_col = self._find_column_by_alias(df, "Earned Premium", "Earned_Premium", "earned_premium")
+        zopper_earned_col = self._find_column_by_alias(
+            df,
+            "Zopper Earned Premium",
+            "zopper_earned_premium",
+            "earned_zopper",
+        )
+        zopper_share_col = self._find_column_by_alias(
+            df,
+            "Zopper Share",
+            "Zopper Shared ( Transfer Price )",
+            "transfer_price",
+        )
+        earned_ratio = self._earned_ratio_from_days(df)
+        start_series, end_series = self._sales_earned_period_columns(df)
+        can_accrue = start_series is not None and end_series is not None
+
+        if metric == "gross_premium":
+            if amount_col is None:
+                return None
+            return self._numeric_series(df[amount_col])
+
+        if metric == "earned_premium":
+            if amount_col is not None and earned_ratio is not None:
+                return self._numeric_series(df[amount_col]) * earned_ratio
+            if amount_col is not None and can_accrue:
+                return self._earned_with_dates(df, amount_col, start_series, end_series)
+            if amount_col is not None:
+                return self._numeric_series(df[amount_col])
+            if earned_col is not None:
+                return self._numeric_series(df[earned_col])
+            if zopper_share_col is not None and earned_ratio is not None:
+                return self._numeric_series(df[zopper_share_col]) * earned_ratio
+            if zopper_share_col is not None and can_accrue:
+                return self._earned_with_dates(df, zopper_share_col, start_series, end_series)
+            if zopper_share_col is not None:
+                return self._numeric_series(df[zopper_share_col])
+            return None
+
+        if metric == "zopper_earned_premium":
+            if zopper_share_col is not None and earned_ratio is not None:
+                return self._numeric_series(df[zopper_share_col]) * earned_ratio
+            if zopper_share_col is not None and can_accrue:
+                return self._earned_with_dates(df, zopper_share_col, start_series, end_series)
+            if zopper_share_col is not None:
+                return self._numeric_series(df[zopper_share_col])
+            if zopper_earned_col is not None:
+                return self._numeric_series(df[zopper_earned_col])
+            return None
+
+        return None
+
     # --------------------------------------------------
     # MAIN AGGREGATION
     # --------------------------------------------------
@@ -1066,60 +1251,23 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             # Adjusted dates are only for earned-style metrics.
             premium_metric = metric in {"earned_premium", "zopper_earned_premium"}
             df = self._apply_sales_date_filter(df, use_adjusted=premium_metric)
-            amount_col = self._find_column_by_alias(
-                df,
-                "Amount",
-                "Gross Premium",
-                "gross_premium",
-                "Plan Selling Price",
-                "Customer Premium",
-            )
-            earned_col = self._find_column_by_alias(df, "Earned Premium", "Earned_Premium", "earned_premium")
-            zopper_earned_col = self._find_column_by_alias(
-                df,
-                "Zopper Earned Premium",
-                "zopper_earned_premium",
-                "earned_zopper",
-            )
-            zopper_share_col = self._find_column_by_alias(
-                df,
-                "Zopper Share",
-                "Zopper Shared ( Transfer Price )",
-                "transfer_price",
-            )
-            earned_ratio = self._earned_ratio_from_days(df)
             if metric == "gross_premium":
-                if amount_col is None:
+                resolved_series = self._resolve_sales_metric_series(df, metric)
+                if resolved_series is None:
                     return []
-                df["_value"] = self._numeric_series(df[amount_col])
+                df["_value"] = resolved_series
 
             elif metric == "earned_premium":
-                if earned_col is not None:
-                    df["_value"] = self._numeric_series(df[earned_col])
-                elif amount_col is not None and earned_ratio is not None:
-                    df["_value"] = self._numeric_series(df[amount_col]) * earned_ratio
-                elif amount_col is not None and "_adj_start_date" in df.columns and "_adj_end_date" in df.columns:
-                    df["_value"] = self._earned_with_dates(
-                        df, amount_col, df["_adj_start_date"], df["_adj_end_date"]
-                    )
-                elif amount_col is not None:
-                    df["_value"] = self._numeric_series(df[amount_col])
-                else:
+                resolved_series = self._resolve_sales_metric_series(df, metric)
+                if resolved_series is None:
                     return []
+                df["_value"] = resolved_series
 
             elif metric == "zopper_earned_premium":
-                if zopper_earned_col is not None:
-                    df["_value"] = self._numeric_series(df[zopper_earned_col])
-                elif zopper_share_col is not None and earned_ratio is not None:
-                    df["_value"] = self._numeric_series(df[zopper_share_col]) * earned_ratio * ZOPPER_GST_MULTIPLIER
-                elif zopper_share_col is not None and "_adj_start_date" in df.columns and "_adj_end_date" in df.columns:
-                    df["_value"] = self._earned_with_dates(
-                        df, zopper_share_col, df["_adj_start_date"], df["_adj_end_date"]
-                    ) * ZOPPER_GST_MULTIPLIER
-                elif zopper_share_col is not None:
-                    df["_value"] = self._numeric_series(df[zopper_share_col]) * ZOPPER_GST_MULTIPLIER
-                else:
+                resolved_series = self._resolve_sales_metric_series(df, metric)
+                if resolved_series is None:
                     return []
+                df["_value"] = resolved_series
 
             elif metric == "quantity":
                 df["_value"] = 1
@@ -1696,104 +1844,19 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
 
         gross = _sum_col(
             df_prem,
-            "Amount",
-            "Gross Premium",
-            "gross_premium",
             "Plan Selling Price",
             "Plan Selling Price ",
+            "gross_premium",
+            "Gross Premium",
+            "Amount",
             "Customer Premium",
         )
 
-        amount_col = self._find_column_by_alias(df_earned_scope, "Amount", "Gross Premium", "Plan Selling Price", "Customer Premium")
-        earned_col = self._find_column_by_alias(df_earned_scope, "Earned Premium", "Earned_Premium", "earned_premium")
-        zopper_earned_col = self._find_column_by_alias(
-            df_earned_scope,
-            "Zopper Earned Premium",
-            "zopper_earned_premium",
-            "earned_zopper",
-        )
-        zopper_share_col = self._find_column_by_alias(
-            df_earned_scope,
-            "Zopper Share",
-            "Zopper Shared ( Transfer Price )",
-            "transfer_price",
-        )
-        earned_ratio = self._earned_ratio_from_days(df_earned_scope)
+        earned_series = self._resolve_sales_metric_series(df_earned_scope, "earned_premium")
+        earned = float(earned_series.sum()) if earned_series is not None else 0.0
 
-        start_col = "_adj_start_date" if "_adj_start_date" in df_earned_scope.columns else ("Start_Date" if "Start_Date" in df_earned_scope.columns else None)
-        end_col = "_adj_end_date" if "_adj_end_date" in df_earned_scope.columns else ("End_Date" if "End_Date" in df_earned_scope.columns else None)
-        can_accrue_by_overlap = (
-            self.apply_date_filter
-            and amount_col is not None
-            and start_col is not None
-            and end_col is not None
-        )
-
-        if can_accrue_by_overlap:
-            earned = float(
-                self._earned_with_dates(
-                    df_earned_scope,
-                    amount_col,
-                    pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
-                    pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
-                ).sum()
-            )
-        elif earned_col is not None:
-            earned = float(self._numeric_series(df_earned_scope[earned_col]).sum())
-        elif amount_col is not None and earned_ratio is not None:
-            earned = float((self._numeric_series(df_earned_scope[amount_col]) * earned_ratio).sum())
-        elif amount_col is not None and start_col is not None and end_col is not None:
-            earned = float(
-                self._earned_with_dates(
-                    df_earned_scope,
-                    amount_col,
-                    pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
-                    pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
-                ).sum()
-            )
-        elif amount_col is not None:
-            earned = float(self._numeric_series(df_earned_scope[amount_col]).sum())
-        else:
-            earned = 0.0
-
-        can_accrue_zopper_by_overlap = (
-            self.apply_date_filter
-            and zopper_share_col is not None
-            and start_col is not None
-            and end_col is not None
-        )
-        if can_accrue_zopper_by_overlap:
-            zopper_earned = float(
-                (
-                    self._earned_with_dates(
-                        df_earned_scope,
-                        zopper_share_col,
-                        pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
-                        pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
-                    )
-                    * ZOPPER_GST_MULTIPLIER
-                ).sum()
-            )
-        elif zopper_earned_col is not None:
-            zopper_earned = float(self._numeric_series(df_earned_scope[zopper_earned_col]).sum())
-        elif zopper_share_col is not None and earned_ratio is not None:
-            zopper_earned = float((self._numeric_series(df_earned_scope[zopper_share_col]) * earned_ratio * ZOPPER_GST_MULTIPLIER).sum())
-        elif zopper_share_col is not None and start_col is not None and end_col is not None:
-            zopper_earned = float(
-                (
-                    self._earned_with_dates(
-                        df_earned_scope,
-                        zopper_share_col,
-                        pd.to_datetime(df_earned_scope[start_col], errors="coerce"),
-                        pd.to_datetime(df_earned_scope[end_col], errors="coerce"),
-                    )
-                    * ZOPPER_GST_MULTIPLIER
-                ).sum()
-            )
-        elif zopper_share_col is not None:
-            zopper_earned = float(self._numeric_series(df_earned_scope[zopper_share_col]).sum() * ZOPPER_GST_MULTIPLIER)
-        else:
-            zopper_earned = 0.0
+        zopper_earned_series = self._resolve_sales_metric_series(df_earned_scope, "zopper_earned_premium")
+        zopper_earned = float(zopper_earned_series.sum()) if zopper_earned_series is not None else 0.0
 
         result = {
             "gross_premium": float(gross),

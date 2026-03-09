@@ -9,6 +9,11 @@ from typing import Any
 import pandas as pd
 
 from services.ai_mapper import suggest_reverse_mapping
+from services.date_parsing import (
+    canonicalize_samsung_plan_category,
+    parse_flexible_datetime,
+    resolve_samsung_plan_window,
+)
 
 SAMSUNG_REFERENCE_PLAN_PRICES: dict[tuple[str, str], int] = {
     ("Luxury Fold", "ADLD"): 5299,
@@ -39,6 +44,45 @@ SAMSUNG_REFERENCE_PLAN_PRICES: dict[tuple[str, str], int] = {
     ("Mass", "Screen Protection"): 53,
     ("Mass", "Combo"): 267,
     ("Mass", "Extended Warranty"): 46,
+}
+
+SAMSUNG_PLAN_SELLING_PRICE_DEVICE_ANCHORS: dict[str, dict[str, tuple[int, ...]]] = {
+    "ADLD": {
+        "Mass": (1099, 1299),
+        "Mid": (1899, 2143, 2145, 2150, 2152, 2161, 2163, 2249),
+        "High": (2599, 2980, 2996, 3099),
+        "Premium": (4799, 5799, 6999),
+        "Super Premium": (8399,),
+        "Luxury Flip": (9999, 11999),
+        "Luxury Fold": (14999, 17999),
+    },
+    "Screen Protection": {
+        "Mass": (699, 849),
+        "Mid": (999, 1199, 1499),
+        "High": (1099, 1699, 1999, 2299),
+        "Premium": (2999, 3599, 3999, 4999),
+        "Super Premium": (5999,),
+        "Luxury Flip": (9499,),
+        "Luxury Fold": (10999, 12999),
+    },
+    "Combo": {
+        "Mass": (2499, 2799),
+        "Mid": (3499, 4199),
+        "High": (5999, 6999),
+        "Premium": (9999, 11599, 15999),
+        "Super Premium": (13999, 17999, 18999),
+        "Luxury Flip": (16490, 17490),
+        "Luxury Fold": (23265, 24490),
+    },
+    "Extended Warranty": {
+        "Mass": (999, 1099),
+        "Mid": (1699, 1869),
+        "High": (2699, 2969),
+        "Premium": (4999, 5399, 6999),
+        "Super Premium": (7399,),
+        "Luxury Flip": (9999,),
+        "Luxury Fold": (12999, 14999),
+    },
 }
 
 SAMSUNG_MODEL_TO_DEVICE_PLAN_CATEGORY: dict[str, str] = {
@@ -80,6 +124,8 @@ SOURCE_ALIASES: dict[str, str] = {
     "samsungvs": "samsung",
     "samsungvijaysales": "samsung",
     "samsungcroma": "samsung",
+    "samsungreliancedigital": "samsung",
+    "reliancedigital": "samsung",
     "reliance": "reliance",
     "relianceresq": "reliance",
     "resq": "reliance",
@@ -109,6 +155,24 @@ FIELD_TO_CANONICAL: dict[str, str] = {
     "claim_month": "Month",
     "month": "Month",
 }
+
+TRACKED_CANONICAL_FIELDS: tuple[str, ...] = (
+    "gross_premium",
+    "zopper_transfer_price",
+    "zopper_share",
+    "plan_category",
+    "device_plan_category",
+    "brand",
+    "start_date",
+    "plan_start_date",
+    "warranty_start_date",
+    "end_date",
+    "plan_end_date",
+    "warranty_end_date",
+    "claims_cost",
+    "claim_date",
+    "claim_month",
+)
 
 COMMON_ALIAS_TARGETS: dict[str, tuple[str, ...]] = {
     "Plan Selling Price": (
@@ -484,20 +548,7 @@ def _apply_common_alias_coalescing(df: pd.DataFrame) -> int:
 
 
 def _canonical_samsung_plan_category(value: Any) -> str:
-    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
-    if not text or text in {"nan", "none", "null"}:
-        return ""
-    if "combo" in text:
-        return "Combo"
-    if "adld" in text or "accidental" in text or "liquid" in text:
-        return "ADLD"
-    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text:
-        return "Screen Protection"
-    if re.search(r"\bew\b", text) or "extended warranty" in text or text.startswith("ew"):
-        return "Extended Warranty"
-    if "warranty" in text:
-        return "Extended Warranty"
-    return ""
+    return canonicalize_samsung_plan_category(value)
 
 
 def _extract_samsung_model_code(text: str) -> str | None:
@@ -535,6 +586,91 @@ def _canonical_samsung_device_category(value: Any, model_text: str = "") -> str:
     if text.startswith("mass") or text == "mass":
         return "Mass"
     return ""
+
+
+def _looks_like_samsung_plan_label(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not text or text in {"nan", "none", "null"}:
+        return False
+    if _canonical_samsung_plan_category(text):
+        return True
+    return (
+        "protect max" in text
+        or ("samsung" in text and any(token in text for token in ("combo", "adld", "warranty", "screen")))
+    )
+
+
+def _infer_samsung_device_category_from_reference_price(plan_category: Any, transfer_price: Any) -> str:
+    canonical_plan = _canonical_samsung_plan_category(plan_category)
+    if not canonical_plan:
+        return ""
+
+    try:
+        price_value = float(transfer_price or 0)
+    except Exception:
+        return ""
+    if not math.isfinite(price_value) or price_value <= 0:
+        return ""
+
+    candidates = [
+        (device_category, float(reference_price))
+        for (device_category, plan_name), reference_price in SAMSUNG_REFERENCE_PLAN_PRICES.items()
+        if plan_name == canonical_plan
+    ]
+    if not candidates:
+        return ""
+
+    best_device = ""
+    best_price = 0.0
+    best_gap = float("inf")
+    for device_category, reference_price in candidates:
+        gap = abs(price_value - reference_price)
+        if gap < best_gap:
+            best_gap = gap
+            best_device = device_category
+            best_price = reference_price
+
+    if not best_device:
+        return ""
+
+    tolerance = max(20.0, best_price * 0.06)
+    return best_device if best_gap <= tolerance else ""
+
+
+def _infer_samsung_device_category_from_plan_selling_price(plan_category: Any, plan_selling_price: Any) -> str:
+    canonical_plan = _canonical_samsung_plan_category(plan_category)
+    if not canonical_plan:
+        return ""
+
+    anchors = SAMSUNG_PLAN_SELLING_PRICE_DEVICE_ANCHORS.get(canonical_plan) or {}
+    if not anchors:
+        return ""
+
+    try:
+        price_value = float(plan_selling_price or 0)
+    except Exception:
+        return ""
+    if not math.isfinite(price_value) or price_value <= 0:
+        return ""
+
+    best_device = ""
+    best_gap = float("inf")
+    best_anchor = 0.0
+    for device_category, device_anchors in anchors.items():
+        for anchor in device_anchors:
+            anchor_value = float(anchor)
+            gap = abs(price_value - anchor_value)
+            if gap < best_gap:
+                best_gap = gap
+                best_anchor = anchor_value
+                best_device = device_category
+
+    if not best_device:
+        return ""
+
+    # Samsung plan-price sheets are discrete price points, but partner files can
+    # drift by a few rupees; always snap to the nearest configured anchor.
+    return best_device
 
 
 def _build_reliance_transfer_bands() -> list[tuple[int, int, float]]:
@@ -674,28 +810,7 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
     plan_raw = _coalesce_text(df, COMMON_ALIAS_TARGETS["Plan Category"], default="")
     model_raw = _coalesce_text(df, COMMON_ALIAS_TARGETS["Model Code"], default="")
     device_raw = _coalesce_text(df, COMMON_ALIAS_TARGETS["Device Plan Category"], default="")
-
-    plan_category = plan_raw.map(_canonical_samsung_plan_category)
-    device_category = pd.Series(
-        [
-            _canonical_samsung_device_category(device_value, model_value)
-            for device_value, model_value in zip(device_raw.tolist(), model_raw.tolist())
-        ],
-        index=df.index,
-        dtype="object",
-    )
-
-    plan_mask = plan_category.ne("")
-    if plan_mask.any():
-        df.loc[plan_mask, "Plan Category"] = plan_category[plan_mask]
-        touched += 1
-
-    device_mask = device_category.ne("")
-    if device_mask.any():
-        df.loc[device_mask, "Device Plan Category"] = device_category[device_mask]
-        touched += 1
-
-    plan_price = _coalesce_numeric(
+    raw_plan_selling_price = _coalesce_numeric(
         df,
         (
             "Plan Selling Price",
@@ -711,6 +826,167 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
         ),
         default=0.0,
     )
+    raw_zopper_share = _coalesce_numeric(
+        df,
+        (
+            "Zopper Share",
+            "Zopper Shared ( Transfer Price )",
+            "Transfer Price",
+            "Transfer_Price",
+            "Total Billing Amount",
+            "Billing Amount",
+        ),
+        default=0.0,
+    )
+
+    plan_category = plan_raw.map(_canonical_samsung_plan_category)
+    device_category = pd.Series(
+        "",
+        index=df.index,
+        dtype="object",
+    )
+    for idx in df.index:
+        raw_device_value = device_raw.loc[idx]
+        resolved_device = _canonical_samsung_device_category(raw_device_value, model_raw.loc[idx])
+        if not resolved_device:
+            resolved_device = _infer_samsung_device_category_from_plan_selling_price(
+                plan_category.loc[idx],
+                raw_plan_selling_price.loc[idx],
+            )
+        if not resolved_device and _looks_like_samsung_plan_label(raw_device_value):
+            resolved_device = _infer_samsung_device_category_from_reference_price(
+                plan_category.loc[idx],
+                raw_zopper_share.loc[idx],
+            )
+        elif not resolved_device:
+            resolved_device = _infer_samsung_device_category_from_reference_price(
+                plan_category.loc[idx],
+                raw_zopper_share.loc[idx],
+            )
+        device_category.loc[idx] = resolved_device
+
+    plan_mask = plan_category.ne("")
+    if plan_mask.any():
+        df.loc[plan_mask, "Plan Category"] = plan_category[plan_mask]
+        for plan_type_col in ("Plan Type", "Plan type", "Warranty Type", "Pack Type", "Pack type"):
+            if plan_type_col in df.columns:
+                df.loc[plan_mask, plan_type_col] = plan_category[plan_mask]
+        touched += 1
+
+    device_mask = device_category.ne("")
+    desired_device_series = device_category.where(device_mask, pd.NA)
+    if "Device Plan Category" not in df.columns:
+        df["Device Plan Category"] = desired_device_series
+        touched += 1
+    else:
+        existing_device_series = df["Device Plan Category"]
+        canonical_existing_device = existing_device_series.map(_canonical_samsung_device_category)
+        existing_device_text = existing_device_series.astype(str).str.strip()
+        device_replace_mask = device_mask & (
+            _missing_mask(existing_device_series)
+            | existing_device_series.map(_looks_like_samsung_plan_label)
+            | canonical_existing_device.eq("")
+            | (
+                canonical_existing_device.ne("")
+                & existing_device_text.ne(canonical_existing_device)
+            )
+        )
+        if device_replace_mask.any():
+            df.loc[device_replace_mask, "Device Plan Category"] = device_category[device_replace_mask]
+            touched += 1
+    invalid_device_mask = device_raw.map(_looks_like_samsung_plan_label) & device_category.eq("")
+    if invalid_device_mask.any():
+        df.loc[invalid_device_mask, "Device Plan Category"] = pd.NA
+        touched += 1
+
+    start_raw = _coalesce_text(
+        df,
+        (
+            "Start_Date",
+            "Plan Start Date",
+            "Warranty Start Date",
+            "Warranty_Start_Date",
+            "Start Date",
+        ),
+        default="",
+    )
+    end_raw = _coalesce_text(
+        df,
+        (
+            "End_Date",
+            "Plan End Date",
+            "Warranty End Date",
+            "Warranty_End_Date",
+            "End Date",
+        ),
+        default="",
+    )
+    transaction_raw = _coalesce_text(
+        df,
+        (
+            "Transaction Date",
+            "Date",
+            "Invoice Date",
+            "Invoice_Date_",
+            "Purchase Date",
+            "Warranty Purchase Date",
+        ),
+        default="",
+    )
+    resolved_windows = [
+        resolve_samsung_plan_window(
+            plan_type=plan_value,
+            start_value=start_value,
+            end_value=end_value,
+            transaction_value=transaction_value,
+        )
+        for plan_value, start_value, end_value, transaction_value in zip(
+            plan_category.tolist(),
+            start_raw.tolist(),
+            end_raw.tolist(),
+            transaction_raw.tolist(),
+        )
+    ]
+    resolved_start = pd.Series([start for start, _end in resolved_windows], index=df.index, dtype="datetime64[ns]")
+    resolved_end = pd.Series([end for _start, end in resolved_windows], index=df.index, dtype="datetime64[ns]")
+
+    if resolved_start.notna().any():
+        for start_col in ("Start_Date", "Plan Start Date", "Warranty Start Date", "Warranty_Start_Date", "Start Date"):
+            raw_text = (
+                df[start_col].astype(str).fillna("")
+                if start_col in df.columns
+                else pd.Series("", index=df.index, dtype="object")
+            )
+            composite_mask = raw_text.str.contains(r"\b(?:ew|adld|sp|screen|extended warranty)\b", case=False, na=False)
+            existing = (
+                df[start_col].map(parse_flexible_datetime)
+                if start_col in df.columns
+                else pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+            )
+            merged = existing.where(existing.notna() & ~composite_mask, resolved_start)
+            if start_col not in df.columns or composite_mask.any() or not merged.equals(existing):
+                df[start_col] = merged
+                touched += 1
+
+    if resolved_end.notna().any():
+        for end_col in ("End_Date", "Plan End Date", "Warranty End Date", "Warranty_End_Date", "End Date"):
+            raw_text = (
+                df[end_col].astype(str).fillna("")
+                if end_col in df.columns
+                else pd.Series("", index=df.index, dtype="object")
+            )
+            composite_mask = raw_text.str.contains(r"\b(?:ew|adld|sp|screen|extended warranty)\b", case=False, na=False)
+            existing = (
+                df[end_col].map(parse_flexible_datetime)
+                if end_col in df.columns
+                else pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+            )
+            merged = existing.where(existing.notna() & ~composite_mask, resolved_end)
+            if end_col not in df.columns or composite_mask.any() or not merged.equals(existing):
+                df[end_col] = merged
+                touched += 1
+
+    plan_price = raw_plan_selling_price
     existing_plan = _as_numeric(df["Plan Selling Price"]) if "Plan Selling Price" in df.columns else pd.Series(0.0, index=df.index)
     plan_price = existing_plan.where(existing_plan.ne(0.0), plan_price)
     if plan_price.ne(0.0).any():
@@ -724,19 +1000,6 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
     gross = _as_numeric(df["Gross Premium"]) if "Gross Premium" in df.columns else pd.Series(0.0, index=df.index)
     gross = gross.where(gross.ne(0.0), plan_price)
     df["Gross Premium"] = gross
-
-    raw_zopper_share = _coalesce_numeric(
-        df,
-        (
-            "Zopper Share",
-            "Zopper Shared ( Transfer Price )",
-            "Transfer Price",
-            "Transfer_Price",
-            "Total Billing Amount",
-            "Billing Amount",
-        ),
-        default=0.0,
-    )
 
     mapped_share = pd.Series(
         [
@@ -963,6 +1226,9 @@ def _ensure_deck_compat_columns(df: pd.DataFrame, *, source: str, dataset_type: 
 
         generic = generic.where(generic.dt.year >= 2000)
         parsed = parsed.where(parsed.notna(), generic)
+        if parsed.isna().any():
+            fallback = cleaned.where(parsed.isna()).map(parse_flexible_datetime)
+            parsed = parsed.where(parsed.notna(), fallback)
         return parsed
 
     def _coalesce_datetime(candidates: tuple[str, ...]) -> pd.Series:
@@ -1197,6 +1463,7 @@ def normalize_partner_dataframe(
             "columns": 0,
             "smart_mapping": {"applied": 0, "required_found": 0, "required_total": 0, "coverage": 0.0},
             "columns_touched": 0,
+            "canonical_fields": {},
         }
 
     work = df.copy()
@@ -1223,6 +1490,7 @@ def normalize_partner_dataframe(
         "columns": int(len(work.columns)),
         "smart_mapping": smart_meta,
         "columns_touched": int(touched),
+        "canonical_fields": _collect_canonical_field_status(work),
     }
     return work, metadata
 
@@ -1254,6 +1522,32 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _collect_canonical_field_status(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    status: dict[str, dict[str, Any]] = {}
+    total_rows = max(int(len(df.index)), 1)
+    for field in TRACKED_CANONICAL_FIELDS:
+        canonical = FIELD_TO_CANONICAL.get(field)
+        if not canonical:
+            continue
+        if canonical not in df.columns:
+            status[field] = {
+                "column": canonical,
+                "available": False,
+                "non_null_rows": 0,
+                "fill_ratio": 0.0,
+            }
+            continue
+        filled_mask = ~_missing_mask(df[canonical])
+        non_null_rows = int(filled_mask.sum())
+        status[field] = {
+            "column": canonical,
+            "available": bool(non_null_rows > 0),
+            "non_null_rows": non_null_rows,
+            "fill_ratio": round(float(non_null_rows) / float(total_rows), 4),
+        }
+    return status
+
+
 def dataframe_to_payload_rows(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
@@ -1282,6 +1576,7 @@ def normalize_partner_rows(
             "columns": 0,
             "smart_mapping": {"applied": 0, "required_found": 0, "required_total": 0, "coverage": 0.0},
             "columns_touched": 0,
+            "canonical_fields": {},
         }
 
     df = pd.DataFrame(rows)

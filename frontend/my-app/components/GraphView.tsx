@@ -1,6 +1,6 @@
 "use client"
 
-import { type MouseEvent, type TouchEvent, useEffect, useId, useMemo, useRef, useState } from "react"
+import { Fragment, type MouseEvent, type TouchEvent, useEffect, useId, useMemo, useRef, useState } from "react"
 import { useReducedMotion } from "framer-motion"
 import indiaSvgMap from "@svg-maps/india"
 import {
@@ -24,6 +24,13 @@ import {
   ResponsiveContainer,
   CartesianGrid,
 } from "recharts"
+import {
+  SAMSUNG_PARTNERS,
+  isSamsungPartnerSource,
+  normalizeSamsungSource,
+  sumSamsungPartnerValues,
+  type SamsungPartnerKey,
+} from "@/lib/samsungPartners"
 
 /* ---------- TYPES ---------- */
 export type GraphChartType = "bar" | "line" | "pie" | "radar" | "india_map"
@@ -307,6 +314,43 @@ const sortTemporalRows = (rows: Row[], dimKey: string) =>
     if (bValid) return 1
     return String(a[dimKey] ?? "").localeCompare(String(b[dimKey] ?? ""))
   })
+
+const monthBucketValue = (date: Date) => {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  return `${year}-${month}-01`
+}
+
+const buildZeroTemporalRow = (template: Row, dimKey: string, date: Date): Row => {
+  const bucket = monthBucketValue(date)
+  const next: Row = {}
+  Object.entries(template).forEach(([key, value]) => {
+    if (key === dimKey || key === "period_start" || key === "period_end") {
+      next[key] = bucket
+      return
+    }
+    const numeric = Number(value)
+    next[key] = Number.isFinite(numeric) ? 0 : ""
+  })
+  return next
+}
+
+const padSingleTemporalRows = (rows: Row[], dimKey: string) => {
+  if (rows.length !== 1) return rows
+  const centerTs = toTimeValue(rows[0][dimKey])
+  if (!Number.isFinite(centerTs)) return rows
+  const center = new Date(centerTs)
+  center.setDate(1)
+  const prev = new Date(center)
+  prev.setMonth(center.getMonth() - 1)
+  const next = new Date(center)
+  next.setMonth(center.getMonth() + 1)
+  return [
+    buildZeroTemporalRow(rows[0], dimKey, prev),
+    rows[0],
+    buildZeroTemporalRow(rows[0], dimKey, next),
+  ]
+}
 
 /* ---------- DATA FETCH ---------- */
 export type GraphFetchParams = {
@@ -796,6 +840,10 @@ const CustomTooltip = ({
   if (!active || !payload?.length) return null
   const formattedLabel = formatMonth(label || "")
   const tooltipRow = payload[0]?.payload
+  const tooltipObject = (tooltipRow || {}) as Record<string, unknown>
+  const compareTooltipPartners = SAMSUNG_PARTNERS.filter((partner) => (
+    `tooltip_${partner.key}` in tooltipObject
+  ))
   const metricIsLossRatio = measure.toLowerCase().includes("loss_ratio")
   const rowPeriodStart = formatMonth(String(tooltipRow?.period_start ?? ""))
   const rowPeriodEnd = formatMonth(String((tooltipRow?.period_end ?? label) || ""))
@@ -807,16 +855,9 @@ const CustomTooltip = ({
     effectivePeriodStart &&
     effectivePeriodEnd
   )
-  const showQuantityOnly =
-    compareTooltipQuantity &&
-    Boolean(tooltipRow) &&
-    ("tooltip_samsung_vs" in (tooltipRow || {}) || "tooltip_samsung_croma" in (tooltipRow || {}))
+  const showQuantityOnly = compareTooltipQuantity && compareTooltipPartners.length > 0
 
   if (showQuantityOnly) {
-    const vsQuantity = asNumber(tooltipRow?.tooltip_samsung_vs)
-    const cromaQuantity = asNumber(tooltipRow?.tooltip_samsung_croma)
-    const vsMetric = asNumber(tooltipRow?.samsung_vs)
-    const cromaMetric = asNumber(tooltipRow?.samsung_croma)
     return (
       <div className="max-w-[min(84vw,280px)] rounded-lg border bg-white p-2.5 shadow sm:p-3">
         <p className="text-[11px] font-bold text-gray-400 sm:text-xs">{formattedLabel}</p>
@@ -832,18 +873,20 @@ const CustomTooltip = ({
             <span>{prettyLabel(measure)}</span>
           </div>
           <div className="mt-1 grid grid-cols-[minmax(92px,1fr)_auto_auto] items-center gap-x-2 gap-y-1.5 text-[11px] font-semibold sm:grid-cols-[minmax(120px,1fr)_auto_auto] sm:gap-x-4 sm:gap-y-2 sm:text-sm">
-            <span className="flex items-center gap-2 text-slate-700">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[#f97316]" />
-              Vijay Sales
-            </span>
-            <span className="text-slate-900">{vsQuantity.toLocaleString()}</span>
-            <span className="text-slate-900">{formatValue(vsMetric, measure)}</span>
-            <span className="flex items-center gap-2 text-slate-700">
-              <span className="inline-block h-2.5 w-2.5 rounded-full bg-[#8b5cf6]" />
-              Croma
-            </span>
-            <span className="text-slate-900">{cromaQuantity.toLocaleString()}</span>
-            <span className="text-slate-900">{formatValue(cromaMetric, measure)}</span>
+            {compareTooltipPartners.map((partner) => {
+              const quantity = asNumber(tooltipObject[`tooltip_${partner.key}`])
+              const metricValue = asNumber(tooltipObject[partner.key])
+              return (
+                <Fragment key={`tooltip-${partner.key}`}>
+                  <span className="flex items-center gap-2 text-slate-700">
+                    <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: partner.color }} />
+                    {partner.shortLabel}
+                  </span>
+                  <span className="text-slate-900">{quantity.toLocaleString()}</span>
+                  <span className="text-slate-900">{formatValue(metricValue, measure)}</span>
+                </Fragment>
+              )
+            })}
           </div>
         </div>
       </div>
@@ -923,6 +966,7 @@ export default function GraphView({
   const [hoverDetailByStateId, setHoverDetailByStateId] = useState<
     Record<string, Partial<Record<HoverDetailMetricKey, number>>>
   >({})
+  const [hoverDetailLoadingKey, setHoverDetailLoadingKey] = useState<string | null>(null)
   const [hoverCard, setHoverCard] = useState<{
     key: string
     label: string
@@ -935,6 +979,7 @@ export default function GraphView({
   const requestIdRef = useRef(0)
   const gradientId = useId()
   const gradientIdAlt = useId()
+  const gradientIdThird = useId()
   const normalizedCategoryFilters = useMemo<GraphCategoryFilter[]>(() => (
     (categoryFilters || [])
       .map((filter) => ({
@@ -956,6 +1001,8 @@ export default function GraphView({
   useEffect(() => {
     setActiveMapKey(null)
     setHoverCard(null)
+    setHoverDetailByStateId({})
+    setHoverDetailLoadingKey(null)
   }, [source, dimension, metric, datasetType, bucket, chartType, fromDate, toDate, jobId, categoryFiltersKey])
 
   useEffect(() => {
@@ -1007,7 +1054,7 @@ export default function GraphView({
 
         if (source === "samsung") {
           setCompareMode(true)
-          // Backend returns both partners in one response to avoid 2 requests per graph.
+          // Backend returns all Samsung partners in one response to avoid extra compare requests.
           const combined = await fetchRowsWithRangeFallback({
             source: "samsung",
             dimension,
@@ -1020,11 +1067,13 @@ export default function GraphView({
             categoryFilters: normalizedCategoryFilters,
           })
 
-          let merged: Row[] = (combined.data || []).map(row => ({
-            ...row,
-            samsung_vs: asNumber(row["samsung_vs"]),
-            samsung_croma: asNumber(row["samsung_croma"]),
-          }))
+          let merged: Row[] = (combined.data || []).map((row) => {
+            const next: Row = { ...row }
+            SAMSUNG_PARTNERS.forEach((partner) => {
+              next[partner.key] = asNumber(row[partner.key])
+            })
+            return next
+          })
 
           if (tooltipMetricOverride && tooltipMetricKey && tooltipMetricKey !== metricKey) {
             const tooltipRows = await fetchRowsWithRangeFallback({
@@ -1039,28 +1088,29 @@ export default function GraphView({
               categoryFilters: normalizedCategoryFilters,
             })
 
-            const tooltipMap = new Map<string, { samsung_vs: number; samsung_croma: number }>()
+            const tooltipMap = new Map<string, Record<SamsungPartnerKey, number>>()
             for (const row of tooltipRows.data || []) {
               const dimValue = String(row[dimKey] ?? "")
-              tooltipMap.set(dimValue, {
-                samsung_vs: asNumber(row.samsung_vs),
-                samsung_croma: asNumber(row.samsung_croma),
+              const partnerValues = {} as Record<SamsungPartnerKey, number>
+              SAMSUNG_PARTNERS.forEach((partner) => {
+                partnerValues[partner.key] = asNumber(row[partner.key])
               })
+              tooltipMap.set(dimValue, partnerValues)
             }
 
             merged = merged.map((row) => {
               const dimValue = String(row[dimKey] ?? "")
               const tooltip = tooltipMap.get(dimValue)
-              return {
-                ...row,
-                tooltip_samsung_vs: tooltip?.samsung_vs ?? 0,
-                tooltip_samsung_croma: tooltip?.samsung_croma ?? 0,
-              }
+              const next: Row = { ...row }
+              SAMSUNG_PARTNERS.forEach((partner) => {
+                next[`tooltip_${partner.key}`] = tooltip?.[partner.key] ?? 0
+              })
+              return next
             })
           }
 
           if (dimKey.includes("month") || dimKey.includes("date")) {
-            merged = sortTemporalRows(merged, dimKey)
+            merged = padSingleTemporalRows(sortTemporalRows(merged, dimKey), dimKey)
           }
 
           if (requestId !== requestIdRef.current) return
@@ -1101,12 +1151,11 @@ export default function GraphView({
 
         let normalizedSingle = single.data
         if (!(metricKey in normalizedSingle[0])) {
+          const normalizedSource = normalizeSamsungSource(source)
           const partnerMetricKey =
-            source === "samsung_vs" || source === "samsung_vijay_sales"
-              ? "samsung_vs"
-              : source === "samsung_croma"
-                ? "samsung_croma"
-                : ""
+            isSamsungPartnerSource(source)
+              ? normalizedSource as SamsungPartnerKey
+              : ""
 
           if (partnerMetricKey && partnerMetricKey in normalizedSingle[0]) {
             normalizedSingle = normalizedSingle.map((row) => ({
@@ -1128,7 +1177,7 @@ export default function GraphView({
 
         let next = normalizedSingle
         if (dimKey.includes("month") || dimKey.includes("date")) {
-          next = sortTemporalRows(next, dimKey)
+          next = padSingleTemporalRows(sortTemporalRows(next, dimKey), dimKey)
         }
 
         if (requestId !== requestIdRef.current) return
@@ -1186,19 +1235,38 @@ export default function GraphView({
     normalizedCategoryFilters,
   ])
 
-  useEffect(() => {
-    let active = true
-    if (chartType !== "india_map" || !source || (deferUntilVisible && !isVisible)) {
-      setHoverDetailByStateId({})
-      return () => {
-        active = false
-      }
+  const hoverDetailQueryLabel = useMemo(() => {
+    if (chartType !== "india_map" || !hoverCard?.key) return ""
+    const stateDimensionKey = toSafeKey(dimension || "state")
+    for (const row of data) {
+      const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
+      if (!stateName) continue
+      const stateId = mapStateToIndiaStateId(stateName)
+      if (stateId === hoverCard.key) return stateName
     }
+    return hoverCard.label || ""
+  }, [chartType, data, dimension, hoverCard])
 
-    const loadHoverDetails = async () => {
-      const aggregate: Record<string, Partial<Record<HoverDetailMetricKey, number>>> = {}
+  useEffect(() => {
+    if (chartType !== "india_map" || !source || !hoverCard?.key || !hoverDetailQueryLabel) return
+
+    const cachedMetrics = hoverDetailByStateId[hoverCard.key] || {}
+    const pendingMetrics = HOVER_DETAIL_METRICS.filter((detailMetric) => cachedMetrics[detailMetric] == null)
+    if (!pendingMetrics.length) return
+
+    let active = true
+    const hoverFilters: GraphCategoryFilter[] = [
+      ...normalizedCategoryFilters.filter((filter) => filter.dimension !== "state").slice(0, 1),
+      { dimension: "state", values: [hoverDetailQueryLabel] },
+    ]
+
+    const timer = setTimeout(async () => {
+      if (!active) return
+      setHoverDetailLoadingKey(hoverCard.key)
+
+      const nextMetrics: Partial<Record<HoverDetailMetricKey, number>> = { ...cachedMetrics }
       await Promise.all(
-        HOVER_DETAIL_METRICS.map(async (detailMetric) => {
+        pendingMetrics.map(async (detailMetric) => {
           try {
             const result = await fetchGraphRows({
               source,
@@ -1209,32 +1277,42 @@ export default function GraphView({
               jobId,
               from_date: fromDate,
               to_date: toDate,
-              categoryFilters: normalizedCategoryFilters,
+              categoryFilters: hoverFilters,
             })
             const measureKey = toSafeKey(result.measure || detailMetric)
-            ;(result.data || []).forEach((row) => {
-              const rawStateValue = String(row.state ?? row[toSafeKey("state")] ?? "").trim()
-              const stateId = mapStateToIndiaStateId(rawStateValue)
-              if (!stateId) return
-              const value = asNumber(row[measureKey] ?? row[detailMetric])
-              if (!aggregate[stateId]) aggregate[stateId] = {}
-              aggregate[stateId][detailMetric] = (aggregate[stateId][detailMetric] || 0) + value
-            })
+            nextMetrics[detailMetric] = (result.data || []).reduce((sum, row) => (
+              sum + asNumber(row[measureKey] ?? row[detailMetric])
+            ), 0)
           } catch {
             // ignore hover detail misses per metric and keep map interactive
           }
         })
       )
-      if (!active) return
-      setHoverDetailByStateId(aggregate)
-    }
 
-    const timer = setTimeout(loadHoverDetails, 220)
+      if (!active) return
+      setHoverDetailByStateId((prev) => ({
+        ...prev,
+        [hoverCard.key]: nextMetrics,
+      }))
+      setHoverDetailLoadingKey((prev) => (prev === hoverCard.key ? null : prev))
+    }, 120)
+
     return () => {
       active = false
       clearTimeout(timer)
     }
-  }, [chartType, source, bucket, jobId, fromDate, toDate, datasetType, categoryFiltersKey, normalizedCategoryFilters, deferUntilVisible, isVisible])
+  }, [
+    chartType,
+    source,
+    bucket,
+    jobId,
+    fromDate,
+    toDate,
+    hoverCard?.key,
+    hoverDetailByStateId,
+    hoverDetailQueryLabel,
+    normalizedCategoryFilters,
+  ])
 
   if (deferUntilVisible && !isVisible) {
     return (
@@ -1282,20 +1360,25 @@ export default function GraphView({
   const useLogScale = false
   const primaryPlotKey = useLogScale ? toLogPlotKey(measure) : measure
   const ewCountPlotKey = useLogScale ? toLogPlotKey("ew_count") : "ew_count"
-  const samsungVsPlotKey = useLogScale ? toLogPlotKey("samsung_vs") : "samsung_vs"
-  const samsungCromaPlotKey = useLogScale ? toLogPlotKey("samsung_croma") : "samsung_croma"
+  const samsungCompareSeries = SAMSUNG_PARTNERS.map((partner, index) => ({
+    ...partner,
+    plotKey: useLogScale ? toLogPlotKey(partner.key) : partner.key,
+    gradientId: index === 0 ? gradientId : index === 1 ? gradientIdAlt : gradientIdThird,
+  }))
   const isSamsungSource = source === "samsung"
   const isRelianceSource = source === "reliance"
   const chartData: Row[] = data.map((row) => {
     const next: Row = { ...row }
     if (compareMode) {
       if (clampToZero) {
-        next.samsung_vs = Math.max(0, asNumber(row.samsung_vs))
-        next.samsung_croma = Math.max(0, asNumber(row.samsung_croma))
+        SAMSUNG_PARTNERS.forEach((partner) => {
+          next[partner.key] = Math.max(0, asNumber(row[partner.key]))
+        })
       }
       if (useLogScale) {
-        next[samsungVsPlotKey] = toLogSafeValue(next.samsung_vs)
-        next[samsungCromaPlotKey] = toLogSafeValue(next.samsung_croma)
+        samsungCompareSeries.forEach((series) => {
+          next[series.plotKey] = toLogSafeValue(next[series.key])
+        })
       }
       return next
     }
@@ -1326,7 +1409,7 @@ export default function GraphView({
   const pieData = chartData
     .map((row) => {
       const baseValue = compareMode
-        ? Math.max(0, asNumber(row.samsung_vs) + asNumber(row.samsung_croma))
+        ? Math.max(0, sumSamsungPartnerValues(row as Record<string, unknown>))
         : Math.max(0, asNumber(row[measure]))
       const ewValue = !compareMode && isRelianceSource && measure.includes("quantity")
         ? Math.max(0, asNumber(row.ew_count))
@@ -1368,12 +1451,16 @@ export default function GraphView({
         : formatValue(value, measure),
     }
   })
-  const radarData = chartData.map((row) => ({
-    name: String(row[dimKey] ?? "Unknown"),
-    samsung_vs: Math.max(0, asNumber(row.samsung_vs)),
-    samsung_croma: Math.max(0, asNumber(row.samsung_croma)),
-    [measure]: Math.max(0, asNumber(row[measure])),
-  }))
+  const radarData = chartData.map((row) => {
+    const next: Row = {
+      name: String(row[dimKey] ?? "Unknown"),
+      [measure]: Math.max(0, asNumber(row[measure])),
+    }
+    SAMSUNG_PARTNERS.forEach((partner) => {
+      next[partner.key] = Math.max(0, asNumber(row[partner.key]))
+    })
+    return next
+  })
   const indiaMapValuesByStateId = new Map<string, number>()
   INDIA_MAP_LOCATIONS.forEach((location) => {
     indiaMapValuesByStateId.set(location.id, 0)
@@ -1383,7 +1470,7 @@ export default function GraphView({
     const stateId = mapStateToIndiaStateId(stateName)
     if (!stateId) return
     const value = compareMode
-      ? Math.max(0, asNumber(row.samsung_vs) + asNumber(row.samsung_croma))
+      ? Math.max(0, sumSamsungPartnerValues(row as Record<string, unknown>))
       : Math.max(0, asNumber(row[measure]))
     indiaMapValuesByStateId.set(stateId, (indiaMapValuesByStateId.get(stateId) || 0) + value)
   })
@@ -1456,20 +1543,15 @@ export default function GraphView({
     <div ref={containerRef} className={`smooth-surface ${heightClassName}`}>
       {compareMode && chartType !== "pie" && chartType !== "india_map" && (
         <div className="mb-2 flex items-center gap-3 text-[11px] font-semibold text-slate-500">
-          <span className="flex items-center gap-1.5">
-            <span
-              className="inline-block h-2.5 w-2.5 rounded-full"
-              style={{ backgroundColor: primaryColor }}
-            />
-            Vijay Sales
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span
-              className="inline-block h-2.5 w-2.5 rounded-full"
-              style={{ backgroundColor: secondaryColor }}
-            />
-            Croma
-          </span>
+          {samsungCompareSeries.map((series) => (
+            <span key={`legend-${series.key}`} className="flex items-center gap-1.5">
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-full"
+                style={{ backgroundColor: series.color }}
+              />
+              {series.shortLabel}
+            </span>
+          ))}
         </div>
       )}
       {chartType === "india_map" ? (
@@ -1543,7 +1625,9 @@ export default function GraphView({
                     const hasValue = value != null
                     const formatted = hasValue
                       ? formatValue(asNumber(value), detailMetric)
-                      : "N/A"
+                      : hoverDetailLoadingKey === hoverCard.key
+                        ? "Loading..."
+                        : "N/A"
                     return (
                       <div
                         key={`${hoverCard.key}-${detailMetric}`}
@@ -1709,6 +1793,12 @@ export default function GraphView({
                 <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.15)} stopOpacity={0.55} />
                 <stop offset="100%" stopColor={secondaryColor} stopOpacity={0.04} />
               </linearGradient>
+              {samsungCompareSeries[2] && (
+                <linearGradient id={gradientIdThird} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={mixWithWhite(samsungCompareSeries[2].color, 0.15)} stopOpacity={0.55} />
+                  <stop offset="100%" stopColor={samsungCompareSeries[2].color} stopOpacity={0.04} />
+                </linearGradient>
+              )}
             </defs>
             <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
             <XAxis
@@ -1743,28 +1833,20 @@ export default function GraphView({
             />
             {compareMode ? (
               <>
-                <Area
-                  type="monotone"
-                  dataKey={samsungVsPlotKey}
-                  name="Vijay Sales"
-                  stroke={primaryColor}
-                  fill={`url(#${gradientId})`}
-                  strokeWidth={2.4}
-                  fillOpacity={1}
-                  isAnimationActive={shouldAnimateBars}
-                  dot={false}
-                />
-                <Area
-                  type="monotone"
-                  dataKey={samsungCromaPlotKey}
-                  name="Croma"
-                  stroke={secondaryColor}
-                  fill={`url(#${gradientIdAlt})`}
-                  strokeWidth={2.4}
-                  fillOpacity={1}
-                  isAnimationActive={shouldAnimateBars}
-                  dot={false}
-                />
+                {samsungCompareSeries.map((series) => (
+                  <Area
+                    key={`area-${series.key}`}
+                    type="monotone"
+                    dataKey={series.plotKey}
+                    name={series.shortLabel}
+                    stroke={series.color}
+                    fill={`url(#${series.gradientId})`}
+                    strokeWidth={2.4}
+                    fillOpacity={1}
+                    isAnimationActive={shouldAnimateBars}
+                    dot={false}
+                  />
+                ))}
               </>
             ) : (
               <>
@@ -1869,22 +1951,17 @@ export default function GraphView({
             />
             {compareMode ? (
               <>
-                <Radar
-                  name="Vijay Sales"
-                  dataKey="samsung_vs"
-                  stroke={primaryColor}
-                  fill={primaryColor}
-                  fillOpacity={0.3}
-                  isAnimationActive={shouldAnimateBars}
-                />
-                <Radar
-                  name="Croma"
-                  dataKey="samsung_croma"
-                  stroke={secondaryColor}
-                  fill={secondaryColor}
-                  fillOpacity={0.25}
-                  isAnimationActive={shouldAnimateBars}
-                />
+                {SAMSUNG_PARTNERS.map((partner) => (
+                  <Radar
+                    key={`radar-${partner.key}`}
+                    name={partner.shortLabel}
+                    dataKey={partner.key}
+                    stroke={partner.color}
+                    fill={partner.color}
+                    fillOpacity={0.22}
+                    isAnimationActive={shouldAnimateBars}
+                  />
+                ))}
               </>
             ) : (
               <Radar
@@ -1908,6 +1985,12 @@ export default function GraphView({
                 <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.35)} />
                 <stop offset="100%" stopColor={secondaryColor} />
               </linearGradient>
+              {samsungCompareSeries[2] && (
+                <linearGradient id={gradientIdThird} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={mixWithWhite(samsungCompareSeries[2].color, 0.35)} />
+                  <stop offset="100%" stopColor={samsungCompareSeries[2].color} />
+                </linearGradient>
+              )}
             </defs>
             <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
             <XAxis
@@ -1936,26 +2019,19 @@ export default function GraphView({
             />
             {compareMode ? (
               <>
-                <Bar
-                  dataKey="samsung_vs"
-                  name="Vijay Sales"
-                  barSize={18}
-                  radius={[8, 8, 2, 2]}
-                  fill={`url(#${gradientId})`}
-                  isAnimationActive={shouldAnimateBars}
-                  animationDuration={barAnimationDuration}
-                  animationBegin={150}
-                />
-                <Bar
-                  dataKey="samsung_croma"
-                  name="Croma"
-                  barSize={18}
-                  radius={[8, 8, 2, 2]}
-                  fill={`url(#${gradientIdAlt})`}
-                  isAnimationActive={shouldAnimateBars}
-                  animationDuration={barAnimationDuration}
-                  animationBegin={250}
-                />
+                {samsungCompareSeries.map((series, index) => (
+                  <Bar
+                    key={`bar-${series.key}`}
+                    dataKey={series.key}
+                    name={series.shortLabel}
+                    barSize={18}
+                    radius={[8, 8, 2, 2]}
+                    fill={`url(#${series.gradientId})`}
+                    isAnimationActive={shouldAnimateBars}
+                    animationDuration={barAnimationDuration}
+                    animationBegin={150 + (index * 100)}
+                  />
+                ))}
               </>
             ) : showEwCounts ? (
               <>
