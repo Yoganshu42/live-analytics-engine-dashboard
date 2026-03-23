@@ -15,7 +15,7 @@ import {
 
 import AdminFileAccess from "@/components/AdminFileAccess"
 import DeckStudioAccess from "@/components/DeckStudioAccess"
-import { SAMSUNG_PARTNERS, isSamsungSource } from "@/lib/samsungPartners"
+import { VISIBLE_SAMSUNG_PARTNERS, isSamsungSource } from "@/lib/samsungPartners"
 
 type Props = {
   brand: string
@@ -101,7 +101,7 @@ export default function Sidebar({
           <span className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-400">
             Data Sources
           </span>
-          {openSourcesMobile ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <ChevronDown size={14} className={`transition-transform ${openSourcesMobile ? "" : "-rotate-90"}`} />
         </button>
 
         <div className={`hidden px-2 pb-2 text-[10px] font-black uppercase tracking-[0.18em] text-slate-400 md:block ${collapsed ? "md:hidden" : ""}`}>
@@ -132,24 +132,23 @@ export default function Sidebar({
 
           {openSamsung && !collapsed && (
             <ul className="mt-1 space-y-1 pl-2">
-              {SAMSUNG_PARTNERS.map((partner) => {
-                const item = { label: partner.shortLabel, value: partner.key, logo: partner.logo }
-                const active = brand === item.value
+              {VISIBLE_SAMSUNG_PARTNERS.map((partner) => {
+                const active = brand === partner.key
                 return (
-                  <li key={item.value}>
+                  <li key={partner.key}>
                     <button
-                      title={item.label}
-                      onClick={() => handleSourceChange(item.value)}
+                      title={partner.label}
+                      onClick={() => handleSourceChange(partner.key)}
                       className={`${railLinkBase} ${active ? "bg-[#e8efff] text-[#1f5cc8]" : "text-slate-600 hover:bg-slate-100"}`}
                     >
                       <Image
-                        src={item.logo}
-                        alt={`${item.label} logo`}
+                        src={partner.logo}
+                        alt={`${partner.label} logo`}
                         width={40}
                         height={16}
                         className="h-4 w-10 rounded object-contain"
                       />
-                      <span>{item.label}</span>
+                      <span>{partner.shortLabel}</span>
                     </button>
                   </li>
                 )
@@ -173,6 +172,15 @@ export default function Sidebar({
           >
             <Shield size={16} />
             <span className={collapsed ? "md:hidden" : ""}>Godrej</span>
+          </button>
+
+          <button
+            title="Hitachi"
+            onClick={() => handleSourceChange("hitachi")}
+            className={`${sourceItemClass(brand === "hitachi")} mt-1 ${collapsed ? "md:justify-center md:px-2" : ""}`}
+          >
+            <Store size={16} />
+            <span className={collapsed ? "md:hidden" : ""}>Hitachi</span>
           </button>
         </div>
       </div>

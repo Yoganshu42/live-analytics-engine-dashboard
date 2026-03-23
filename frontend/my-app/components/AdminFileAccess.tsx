@@ -7,10 +7,12 @@ import {
   AdminFilterAnalyzeResponse,
   AdminFileItem,
   AdminUser,
+  LiveUsersResponse,
   analyzeAdminFilterFile,
   createAdminUser,
   deleteAdminFile,
   deleteAdminUser,
+  fetchLiveUsers,
   filterAndDownloadAdminFile,
   downloadAdminFile,
   fetchAdminFiles,
@@ -52,14 +54,36 @@ const ADMIN_SOURCE_LABELS: Record<string, string> = {
   samsung: "Samsung Overview",
   samsung_vs: "Samsung Vijay Sales",
   samsung_croma: "Samsung Croma",
+  samsung_croma_dsdsg: "Croma DS/DSG",
   samsung_reliance_digital: "Samsung Reliance Digital",
   reliance: "Reliance ResQ",
   godrej: "Godrej",
+  hitachi: "Hitachi",
 }
 
 const formatAdminSourceLabel = (source: string) => (
   ADMIN_SOURCE_LABELS[source] || source.replace(/_/g, " ")
 )
+
+function formatAdminTimestamp(value?: string | null): string {
+  if (!value) return "Legacy / not tracked"
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+}
+
+function formatUploader(value?: string | null): string {
+  const cleaned = String(value || "").trim()
+  if (!cleaned) return "Legacy / not tracked"
+  if (cleaned === "legacy-unknown") return "Legacy / unknown"
+  return cleaned
+}
 
 function inferTransformOutputFormat(file: File): "csv" | "xlsx" | undefined {
   const name = String(file.name || "").trim().toLowerCase()
@@ -157,7 +181,17 @@ function DataUpdationPanel() {
   const [file, setFile] = useState<File | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
-  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "samsung_reliance_digital", "reliance", "godrej"], [])
+  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "samsung_reliance_digital", "reliance", "godrej", "hitachi"], [])
+  const scopedItems = useMemo(
+    () => items
+      .filter((item) => item.source === source && item.dataset_type === datasetType)
+      .sort((a, b) => (b.latest_row_id || 0) - (a.latest_row_id || 0)),
+    [datasetType, items, source]
+  )
+  const scopedJobIds = useMemo(
+    () => Array.from(new Set(scopedItems.map((item) => item.job_id).filter(Boolean))) as string[],
+    [scopedItems]
+  )
 
   const refreshDashboard = useCallback(() => {
     if (typeof window === "undefined") return
@@ -201,7 +235,17 @@ function DataUpdationPanel() {
         dataset_type: datasetType,
         job_id: jobId || undefined,
       })
-      setMessage(`Updated data. Inserted ${res.rows_inserted} rows for ${source}:${datasetType}:${jobId || "untagged"}.`)
+      const resolvedJobId = res.job_id || jobId || ""
+      if (resolvedJobId) {
+        setJobId(resolvedJobId)
+      }
+      const details = [
+        res.auto_generated_job_id && resolvedJobId ? `Auto-generated job_id: ${resolvedJobId}.` : "",
+        res.uploaded_by ? `Uploaded by ${formatUploader(res.uploaded_by)} on ${formatAdminTimestamp(res.uploaded_at)}.` : "",
+      ].filter(Boolean).join(" ")
+      setMessage(
+        `Updated data. Inserted ${res.rows_inserted} rows for ${source}:${datasetType}:${resolvedJobId || "untagged"}. ${details}`.trim()
+      )
       setFile(null)
       await loadItems()
       refreshDashboard()
@@ -303,9 +347,45 @@ function DataUpdationPanel() {
           type="text"
           value={jobId}
           onChange={(e) => setJobId(e.target.value)}
-          placeholder="job_id tag (optional)"
+          list="data-job-id-suggestions"
+          placeholder="job_id tag (optional, blank creates a new auto-generated tag)"
           className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-[11px]"
         />
+        <datalist id="data-job-id-suggestions">
+          {scopedJobIds.map((tag) => (
+            <option key={tag} value={tag} />
+          ))}
+        </datalist>
+        <p className="text-[10px] text-gray-500">
+          Leave this blank to create a new auto-generated job_id. Pick an existing tag only when you want to merge into that same dataset bucket.
+        </p>
+        {scopedJobIds.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {scopedJobIds.slice(0, 8).map((tag) => (
+              <button
+                key={tag}
+                type="button"
+                onClick={() => setJobId(tag)}
+                className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                  jobId === tag
+                    ? "border-indigo-300 bg-indigo-50 text-indigo-700"
+                    : "border-gray-200 bg-white text-gray-700 hover:bg-gray-100"
+                }`}
+              >
+                {tag}
+              </button>
+            ))}
+            {jobId && (
+              <button
+                type="button"
+                onClick={() => setJobId("")}
+                className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-100"
+              >
+                Use new auto tag
+              </button>
+            )}
+          </div>
+        )}
         <input
           type="file"
           accept=".csv,.xlsx,.xls"
@@ -332,25 +412,36 @@ function DataUpdationPanel() {
               <th className="px-2 py-1 font-bold">Dataset</th>
               <th className="px-2 py-1 font-bold">Job Tag</th>
               <th className="px-2 py-1 font-bold">Rows</th>
+              <th className="px-2 py-1 font-bold">Last Upload</th>
+              <th className="px-2 py-1 font-bold">Uploaded By</th>
               <th className="px-2 py-1 font-bold">Actions</th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={5} className="px-2 py-2 text-gray-500">Loading...</td>
+                <td colSpan={7} className="px-2 py-2 text-gray-500">Loading...</td>
               </tr>
             ) : items.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-2 py-2 text-gray-500">No tagged files found.</td>
+                <td colSpan={7} className="px-2 py-2 text-gray-500">No tagged files found.</td>
               </tr>
             ) : (
               items.map((item) => (
                 <tr key={item.tag} className="border-t border-gray-100">
-                  <td className="px-2 py-1.5 text-gray-700">{item.source}</td>
+                  <td className="px-2 py-1.5 text-gray-700">{formatAdminSourceLabel(item.source)}</td>
                   <td className="px-2 py-1.5 text-gray-700">{item.dataset_type}</td>
                   <td className="px-2 py-1.5 text-gray-700">{item.job_id || "untagged"}</td>
                   <td className="px-2 py-1.5 font-semibold text-gray-800">{item.rows}</td>
+                  <td className="px-2 py-1.5 text-gray-700">
+                    <div>{formatAdminTimestamp(item.uploaded_at)}</div>
+                    <div className="text-[9px] uppercase tracking-wide text-gray-400">{item.action || "legacy"}</div>
+                    {item.file_name && <div className="max-w-[180px] truncate text-[9px] text-gray-400">{item.file_name}</div>}
+                  </td>
+                  <td className="px-2 py-1.5 text-gray-700">
+                    <div>{formatUploader(item.uploaded_by)}</div>
+                    {item.notes && <div className="max-w-[220px] text-[9px] text-gray-400">{item.notes}</div>}
+                  </td>
                   <td className="px-2 py-1.5">
                     <div className="flex flex-wrap gap-1">
                       <button type="button" onClick={() => applyTagToForm(item)} className="rounded border border-gray-300 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-gray-700 hover:bg-gray-100">Use Tag</button>
@@ -373,6 +464,9 @@ function UserManagementPanel() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
   const [message, setMessage] = useState("")
+  const [liveUsers, setLiveUsers] = useState<LiveUsersResponse | null>(null)
+  const [liveLoading, setLiveLoading] = useState(false)
+  const [liveError, setLiveError] = useState("")
 
   const [search, setSearch] = useState("")
   const [email, setEmail] = useState("")
@@ -398,6 +492,19 @@ function UserManagementPanel() {
       setError(err instanceof Error ? err.message : "Failed to load users")
     } finally {
       setLoading(false)
+    }
+  }, [])
+
+  const loadLiveUsers = useCallback(async () => {
+    setLiveLoading(true)
+    setLiveError("")
+    try {
+      const res = await fetchLiveUsers()
+      setLiveUsers(res)
+    } catch (err) {
+      setLiveError(err instanceof Error ? err.message : "Failed to load live users")
+    } finally {
+      setLiveLoading(false)
     }
   }, [])
 
@@ -574,6 +681,59 @@ function UserManagementPanel() {
           </tbody>
         </table>
       </div>
+
+      <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div>
+            <h4 className="text-[11px] font-bold uppercase tracking-wider text-slate-700">Live Users</h4>
+            <p className="text-[10px] text-slate-500">Shows sessions active within the last few minutes.</p>
+          </div>
+          <button
+            type="button"
+            onClick={loadLiveUsers}
+            className="rounded border border-slate-300 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100"
+          >
+            {liveLoading ? "Refreshing..." : "Refresh Live Users"}
+          </button>
+        </div>
+
+        {liveError && <p className="mb-2 text-[10px] font-semibold text-red-600">{liveError}</p>}
+
+        {!liveUsers && !liveLoading && (
+          <p className="text-[10px] text-slate-500">Click refresh to load live user sessions.</p>
+        )}
+
+        {liveUsers && (
+          <div className="max-h-64 overflow-auto rounded border border-slate-200">
+            <table className="w-full text-left text-[10px]">
+              <thead className="sticky top-0 bg-slate-50 text-slate-700">
+                <tr>
+                  <th className="px-2 py-1 font-bold">User ID</th>
+                  <th className="px-2 py-1 font-bold">Role</th>
+                  <th className="px-2 py-1 font-bold">Last Seen</th>
+                  <th className="px-2 py-1 font-bold">TTL (sec)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {liveUsers.count === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-2 py-2 text-slate-500">No active sessions found.</td>
+                  </tr>
+                ) : (
+                  liveUsers.users.map((user) => (
+                    <tr key={`${user.email}-${user.last_seen_at}`} className="border-t border-slate-100">
+                      <td className="px-2 py-1.5 text-slate-700">{user.email}</td>
+                      <td className="px-2 py-1.5 text-slate-700">{user.role}</td>
+                      <td className="px-2 py-1.5 text-slate-700">{user.last_seen_at}</td>
+                      <td className="px-2 py-1.5 text-slate-700">{user.ttl_seconds}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -595,8 +755,52 @@ function FilterFilePanel() {
   const [applyLoading, setApplyLoading] = useState(false)
   const [aiInstruction, setAiInstruction] = useState("")
   const [instructionSummary, setInstructionSummary] = useState("")
+  const [tagItems, setTagItems] = useState<AdminFileItem[]>([])
+  const [tagLoading, setTagLoading] = useState(false)
+  const [tagError, setTagError] = useState("")
 
-  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "samsung_reliance_digital", "reliance", "godrej"], [])
+  const knownSources = useMemo(() => ["samsung", "samsung_vs", "samsung_croma", "samsung_reliance_digital", "reliance", "godrej", "hitachi"], [])
+
+  const loadTagItems = useCallback(async () => {
+    setTagLoading(true)
+    setTagError("")
+    try {
+      const res = await fetchAdminFiles({
+        source,
+        dataset_type: datasetType,
+      })
+      setTagItems(res.items || [])
+    } catch (err) {
+      setTagItems([])
+      setTagError(
+        err instanceof Error
+          ? `Existing job tags are unavailable right now. You can still upload by entering the job_id manually. ${err.message}`
+          : "Existing job tags are unavailable right now. You can still upload by entering the job_id manually."
+      )
+    } finally {
+      setTagLoading(false)
+    }
+  }, [datasetType, source])
+
+  useEffect(() => {
+    loadTagItems()
+  }, [loadTagItems])
+
+  const matchingTags = useMemo(
+    () => tagItems.filter((item) => item.source === source && item.dataset_type === datasetType),
+    [datasetType, source, tagItems]
+  )
+
+  const jobIdOptions = useMemo(() => (
+    Array.from(new Set(matchingTags.map((item) => item.job_id).filter(Boolean))) as string[]
+  ), [matchingTags])
+
+  const suggestedJobId = useMemo(() => {
+    const candidates = matchingTags.filter((item) => item.job_id)
+    if (!candidates.length) return ""
+    const sorted = [...candidates].sort((a, b) => (b.latest_row_id || 0) - (a.latest_row_id || 0))
+    return sorted[0]?.job_id || ""
+  }, [matchingTags])
 
   const refreshDashboard = useCallback(() => {
     if (!applyToDb || typeof window === "undefined") return
@@ -605,6 +809,10 @@ function FilterFilePanel() {
       window.location.reload()
     }, 350)
   }, [applyToDb])
+  const selectedTag = useMemo(
+    () => matchingTags.find((item) => (item.job_id || "") === jobId) || null,
+    [jobId, matchingTags]
+  )
 
   const triggerAutoRefresh = useCallback((delayMs: number = 1800) => {
     if (typeof window === "undefined") return
@@ -702,8 +910,18 @@ function FilterFilePanel() {
         dataset_type: datasetType,
         job_id: jobId || undefined,
       })
+      const resolvedJobId = res.job_id || jobId || ""
+      if (resolvedJobId) {
+        setJobId(resolvedJobId)
+      }
       setLastRevisionId(res.revision_id ? Number(res.revision_id) : null)
-      setMessage(res.summary || `Applied ${res.rows_inserted} rows to database.`)
+      await loadTagItems()
+      const details = [
+        resolvedJobId ? `job_id: ${resolvedJobId}.` : "",
+        res.auto_generated_job_id && resolvedJobId ? "This tag was auto-generated." : "",
+        res.uploaded_by ? `Uploaded by ${formatUploader(res.uploaded_by)} on ${formatAdminTimestamp(res.uploaded_at)}.` : "",
+      ].filter(Boolean).join(" ")
+      setMessage([res.summary || `Applied ${res.rows_inserted} rows to database.`, details].filter(Boolean).join(" "))
       if (typeof window !== "undefined") {
         notifyDashboardDataRefresh()
       }
@@ -718,7 +936,7 @@ function FilterFilePanel() {
     } finally {
       setApplyLoading(false)
     }
-  }, [file, source, datasetType, jobId, triggerAutoRefresh, prepareFileForWorkflow])
+  }, [file, source, datasetType, jobId, triggerAutoRefresh, prepareFileForWorkflow, loadTagItems])
 
   const handleFilterDownload = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -732,7 +950,7 @@ function FilterFilePanel() {
     setMessage("")
     try {
       const preparedFile = await prepareFileForWorkflow(file)
-      const { blob, filename, summary, revision_id } = await filterAndDownloadAdminFile({
+      const { blob, filename, summary, revision_id, job_id: resolvedJobId, auto_generated_job_id, uploaded_by, uploaded_at } = await filterAndDownloadAdminFile({
         file: preparedFile,
         source,
         dataset_type: datasetType,
@@ -750,7 +968,18 @@ function FilterFilePanel() {
       link.remove()
       URL.revokeObjectURL(href)
 
-      setMessage(summary || `Downloaded ${filename}`)
+      if (applyToDb && resolvedJobId) {
+        setJobId(resolvedJobId)
+        await loadTagItems()
+      }
+      const details = applyToDb
+        ? [
+            resolvedJobId ? `job_id: ${resolvedJobId}.` : "",
+            auto_generated_job_id && resolvedJobId ? "This tag was auto-generated." : "",
+            uploaded_by ? `Uploaded by ${formatUploader(uploaded_by)} on ${formatAdminTimestamp(uploaded_at)}.` : "",
+          ].filter(Boolean).join(" ")
+        : ""
+      setMessage([summary || `Downloaded ${filename}`, details].filter(Boolean).join(" "))
       setLastRevisionId(revision_id || null)
       if (applyToDb) {
         refreshDashboard()
@@ -828,10 +1057,79 @@ function FilterFilePanel() {
             type="text"
             value={jobId}
             onChange={(e) => setJobId(e.target.value)}
-            placeholder="job_id tag (optional)"
+            list="job-id-suggestions"
+            placeholder="job_id tag (optional, blank creates a new auto-generated tag when applied)"
             className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
           />
         </div>
+
+        <datalist id="job-id-suggestions">
+          {jobIdOptions.map((tag) => (
+            <option key={tag} value={tag} />
+          ))}
+        </datalist>
+
+        {tagError && (
+          <p className="text-[10px] font-semibold text-red-600">{tagError}</p>
+        )}
+
+        {jobIdOptions.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {jobIdOptions.slice(0, 8).map((tag) => (
+              <button
+                key={tag}
+                type="button"
+                onClick={() => setJobId(tag)}
+                className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                  jobId === tag
+                    ? "border-indigo-300 bg-indigo-50 text-indigo-700"
+                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                {tag}
+              </button>
+            ))}
+            {suggestedJobId && jobId !== suggestedJobId && (
+              <button
+                type="button"
+                onClick={() => setJobId(suggestedJobId)}
+                className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-100"
+              >
+                Use latest tag
+              </button>
+            )}
+            {jobId && (
+              <button
+                type="button"
+                onClick={() => setJobId("")}
+                className="rounded-full border border-cyan-200 bg-cyan-50 px-2 py-0.5 text-[10px] font-semibold text-cyan-700 hover:bg-cyan-100"
+              >
+                Use new auto tag
+              </button>
+            )}
+          </div>
+        )}
+
+        {tagLoading && (
+          <p className="text-[10px] text-slate-500">Loading tag suggestions...</p>
+        )}
+
+        <p className="text-[10px] text-slate-500">
+          Leave job_id blank to create a fresh auto-generated tag when the file is applied to DB. Choose an existing tag only if the new file should merge into that same dataset.
+        </p>
+
+        {selectedTag && (
+          <div className="rounded border border-slate-200 bg-white p-2 text-[10px] text-slate-700">
+            <div className="font-bold uppercase tracking-wider text-slate-700">Selected Tag</div>
+            <div className="mt-1">{selectedTag.job_id}</div>
+            <div className="mt-1">Rows: {selectedTag.rows}</div>
+            <div className="mt-1">Last upload: {formatAdminTimestamp(selectedTag.uploaded_at)}</div>
+            <div className="mt-1">Uploaded by: {formatUploader(selectedTag.uploaded_by)}</div>
+            {selectedTag.notes && (
+              <div className="mt-1 text-slate-500">{selectedTag.notes}</div>
+            )}
+          </div>
+        )}
 
         <label className="flex items-center gap-2 text-[11px] text-slate-700">
           <input

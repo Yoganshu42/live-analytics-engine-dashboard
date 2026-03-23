@@ -47,7 +47,7 @@ type KpiCacheValue = {
   lastUpdated: string | null
 }
 
-const KPI_CACHE_TTL_MS = 120000
+const KPI_CACHE_TTL_MS = 15000
 const kpiCache = new Map<string, { expiresAt: number; value: KpiCacheValue }>()
 
 const money = (value: number) => {
@@ -229,7 +229,7 @@ export default function KpiCardsRow({
       }
 
       try {
-        const [summaryRes, freshnessRes, claimsRes] = await Promise.all([
+        const [summaryResult, freshnessResult, claimsResult] = await Promise.allSettled([
           fetchSummary(summaryParams),
           fetchLastUpdated(freshnessParams),
           datasetType === "sales"
@@ -238,7 +238,24 @@ export default function KpiCardsRow({
         ])
         if (!mounted) return
 
-        const freshnessDate = (freshnessRes as LastUpdated | null)?.data_upto ?? null
+        const summaryRes =
+          summaryResult.status === "fulfilled"
+            ? (summaryResult.value as Summary | null)
+            : null
+        const freshnessRes =
+          freshnessResult.status === "fulfilled"
+            ? (freshnessResult.value as LastUpdated | null)
+            : null
+        const claimsRes =
+          claimsResult.status === "fulfilled"
+            ? (claimsResult.value as Summary | null)
+            : null
+
+        if (!summaryRes && summaryResult.status === "rejected") {
+          throw summaryResult.reason
+        }
+
+        const freshnessDate = freshnessRes?.data_upto ?? null
         let resolvedLastUpdated = freshnessDate
 
         if (!resolvedLastUpdated) {
@@ -260,8 +277,8 @@ export default function KpiCardsRow({
         }
 
         const nextValue: KpiCacheValue = {
-          summary: (summaryRes as Summary | null) || null,
-          claimsSummary: (claimsRes as Summary | null) || null,
+          summary: summaryRes || null,
+          claimsSummary: claimsRes || null,
           lastUpdated: resolvedLastUpdated,
         }
 

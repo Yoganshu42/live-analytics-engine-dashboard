@@ -155,9 +155,13 @@ SOURCE_ALIASES = {
     "resq": "reliance",
     "goodrej": "godrej",
     "goddrej": "godrej",
+    "hitachi": "hitachi",
     "samsungvs": "samsung",
     "samsungvijaysales": "samsung",
     "samsungcroma": "samsung",
+    "samsungcromadsdsg": "samsung",
+    "dsdsg": "samsung",
+    "cromadsdsg": "samsung",
     "samsungreliancedigital": "samsung",
     "reliancedigital": "samsung",
 }
@@ -400,6 +404,87 @@ PROFILE_RULES: dict[tuple[str, str], list[FieldRule]] = {
             required=True,
         ),
     ),
+    ("hitachi", "sales"): _rules(
+        FieldRule(
+            field="gross_premium",
+            aliases=("customer premium", "customer_premium", "premium"),
+            keywords=("customer", "premium", "amount"),
+            expected_type="numeric",
+            required=True,
+        ),
+        FieldRule(
+            field="channel",
+            aliases=("channel", "channel name", "channel_name"),
+            keywords=("channel",),
+            expected_type="text",
+            required=True,
+        ),
+        FieldRule(
+            field="product_category",
+            aliases=("product category", "product_category", "category"),
+            keywords=("product", "category"),
+            expected_type="text",
+            required=False,
+        ),
+        FieldRule(
+            field="warranty_start_date",
+            aliases=("warranty start date", "start date", "start_date"),
+            keywords=("start", "warranty", "date"),
+            expected_type="date",
+            required=True,
+        ),
+        FieldRule(
+            field="warranty_end_date",
+            aliases=("warranty end date", "end date", "end_date"),
+            keywords=("end", "warranty", "date"),
+            expected_type="date",
+            required=False,
+        ),
+        FieldRule(
+            field="activation_code",
+            aliases=("warranty activation code", "activation code", "activation_code"),
+            keywords=("activation", "code", "warranty"),
+            expected_type="text",
+            required=False,
+        ),
+    ),
+    ("hitachi", "claims"): _rules(
+        FieldRule(
+            field="claim_amount",
+            aliases=(
+                "claim_amount",
+                "claim amount",
+                "net claim amount",
+                "payment amount",
+                "payout amount",
+                "payout_amount",
+            ),
+            keywords=("claim", "amount", "payment", "payout"),
+            expected_type="numeric",
+            required=True,
+        ),
+        FieldRule(
+            field="channel",
+            aliases=("channel", "channel name", "channel_name", "zone name", "new branch", "branch name"),
+            keywords=("channel", "zone", "branch"),
+            expected_type="text",
+            required=False,
+        ),
+        FieldRule(
+            field="product_category",
+            aliases=("product_category", "product category", "prodcut category", "category"),
+            keywords=("product", "category"),
+            expected_type="text",
+            required=True,
+        ),
+        FieldRule(
+            field="month",
+            aliases=("month", "month name", "month_name", "payment date", "claim date", "call date", "service closed date"),
+            keywords=("month", "date", "claim", "payment", "call"),
+            expected_type="date",
+            required=True,
+        ),
+    ),
 }
 
 
@@ -425,6 +510,8 @@ def _resolve_profile(source: str, dataset_type: str) -> tuple[str, str, list[Fie
     source_key = normalize(source)
     dataset_key = normalize(dataset_type)
     source_key = SOURCE_ALIASES.get(source_key, source_key)
+    if source_key.startswith("samsung"):
+        source_key = "samsung"
     dataset_key = "claims" if "claim" in dataset_key else "sales"
     profile = PROFILE_RULES.get((source_key, dataset_key), DEFAULT_PROFILE)
     return source_key, dataset_key, profile

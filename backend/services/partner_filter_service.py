@@ -132,6 +132,7 @@ SOURCE_ALIASES: dict[str, str] = {
     "godrej": "godrej",
     "goodrej": "godrej",
     "goddrej": "godrej",
+    "hitachi": "hitachi",
 }
 
 FIELD_TO_CANONICAL: dict[str, str] = {
@@ -299,6 +300,8 @@ COMMON_ALIAS_TARGETS: dict[str, tuple[str, ...]] = {
         "claim_amount",
         "net amount",
         "net_claim_amount",
+        "payout amount",
+        "payout_amount",
         "zopper's cost",
         "zoppers cost",
     ),
@@ -314,6 +317,13 @@ COMMON_ALIAS_TARGETS: dict[str, tuple[str, ...]] = {
         "channel",
         "channel name",
         "channel_name",
+    ),
+    "Retail Premium": (
+        "retail premium",
+        "retail_premium",
+        "retailer premium",
+        "retailer_premium",
+        "retail premium amount",
     ),
     "Product_Category": (
         "product category",
@@ -1148,7 +1158,7 @@ def _normalize_reliance_sales(df: pd.DataFrame) -> int:
     return touched
 
 
-def _normalize_godrej_sales(df: pd.DataFrame) -> int:
+def _normalize_godrej_sales(df: pd.DataFrame, *, source: str = "godrej") -> int:
     touched = 0
     channel = _coalesce_text(df, COMMON_ALIAS_TARGETS["Channel"], default="")
     canonical_channel = channel.map(_canonical_godrej_channel)
@@ -1157,10 +1167,71 @@ def _normalize_godrej_sales(df: pd.DataFrame) -> int:
         df["Channel"] = canonical_channel
         touched += 1
 
-    split = canonical_channel.map(REVENUE_SPLIT)
-    zopper_pct = split.map(lambda item: float(item.get("Zopper", 0.0) * 100.0) if isinstance(item, dict) else 0.0)
-    godrej_pct = split.map(lambda item: float(item.get("Godrej", 0.0) * 100.0) if isinstance(item, dict) else 0.0)
-    channel_pct = split.map(lambda item: float(item.get("Channel", 0.0) * 100.0) if isinstance(item, dict) else 0.0)
+    if source == "hitachi":
+        customer_candidates = _resolve_candidate_columns(
+            df,
+            (
+                "Customer Premium",
+                "customer premium",
+                "customer_premium",
+                "premium",
+            ),
+        )
+        retail_candidates = _resolve_candidate_columns(
+            df,
+            COMMON_ALIAS_TARGETS["Retail Premium"],
+        )
+        customer_premium = _coalesce_numeric(
+            df,
+            (
+                "Customer Premium",
+                "customer premium",
+                "customer_premium",
+                "premium",
+            ),
+            default=0.0,
+        )
+        retail_premium = _coalesce_numeric(
+            df,
+            COMMON_ALIAS_TARGETS["Retail Premium"],
+            default=0.0,
+        )
+        current_customer = _as_numeric(df["Customer Premium"]) if "Customer Premium" in df.columns else pd.Series(0.0, index=df.index, dtype="float64")
+        if (
+            customer_candidates
+            and (
+                "Customer Premium" not in df.columns
+                or not pd.api.types.is_numeric_dtype(df["Customer Premium"])
+                or not current_customer.eq(customer_premium).all()
+            )
+        ):
+            df["Customer Premium"] = customer_premium
+            touched += 1
+        current_retail = _as_numeric(df["Retail Premium"]) if "Retail Premium" in df.columns else pd.Series(0.0, index=df.index, dtype="float64")
+        if (
+            retail_candidates
+            and (
+                "Retail Premium" not in df.columns
+                or not pd.api.types.is_numeric_dtype(df["Retail Premium"])
+                or not current_retail.eq(retail_premium).all()
+            )
+        ):
+            df["Retail Premium"] = retail_premium
+            touched += 1
+        store_premium = customer_premium - retail_premium
+        hitachi_premium = customer_premium * 0.35
+        zopper_total = (customer_premium - (store_premium + hitachi_premium)).clip(lower=0.0)
+        valid_customer = customer_premium.ne(0)
+        zopper_pct = pd.Series(0.0, index=df.index, dtype="float64")
+        zopper_pct.loc[valid_customer] = (zopper_total.loc[valid_customer] / customer_premium.loc[valid_customer]) * 100.0
+        godrej_pct = pd.Series(35.0, index=df.index, dtype="float64")
+        channel_pct = pd.Series(0.0, index=df.index, dtype="float64")
+        channel_pct.loc[valid_customer] = (store_premium.loc[valid_customer] / customer_premium.loc[valid_customer]) * 100.0
+    else:
+        split = canonical_channel.map(REVENUE_SPLIT)
+        zopper_pct = split.map(lambda item: float(item.get("Zopper", 0.0) * 100.0) if isinstance(item, dict) else 0.0)
+        godrej_pct = split.map(lambda item: float(item.get("Godrej", 0.0) * 100.0) if isinstance(item, dict) else 0.0)
+        channel_pct = split.map(lambda item: float(item.get("Channel", 0.0) * 100.0) if isinstance(item, dict) else 0.0)
 
     df["Zopper Share %"] = zopper_pct
     df["Godrej Share %"] = godrej_pct
@@ -1349,7 +1420,7 @@ def _ensure_deck_compat_columns(df: pd.DataFrame, *, source: str, dataset_type: 
         _upsert_numeric_column("Amount", plan_price)
         _upsert_numeric_column("Gross Premium", plan_price)
 
-        if source == "godrej" and "Customer Premium" in df.columns:
+        if source in {"godrej", "hitachi"} and "Customer Premium" in df.columns:
             premium = _as_numeric(df["Customer Premium"])
             _upsert_numeric_column("Plan Selling Price", premium)
             _upsert_numeric_column("Amount", premium)
@@ -1479,8 +1550,8 @@ def normalize_partner_dataframe(
         touched += _normalize_samsung_claims(work)
     elif dataset_key == "sales" and source_key == "reliance":
         touched += _normalize_reliance_sales(work)
-    elif dataset_key == "sales" and source_key == "godrej":
-        touched += _normalize_godrej_sales(work)
+    elif dataset_key == "sales" and source_key in {"godrej", "hitachi"}:
+        touched += _normalize_godrej_sales(work, source=source_key)
     touched += _ensure_deck_compat_columns(work, source=source_key, dataset_type=dataset_key)
 
     metadata = {

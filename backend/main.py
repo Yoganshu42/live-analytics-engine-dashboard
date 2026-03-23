@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import asyncio
 import json
 import os
@@ -15,6 +15,7 @@ from datetime import datetime, date, timedelta
 from urllib.error import URLError
 from urllib.request import Request as UrlRequest, urlopen
 
+import pandas as pd
 from fastapi import (
     FastAPI,
     Depends,
@@ -31,7 +32,7 @@ from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
-from db.session import engine
+from db.session import SessionLocal, engine
 from db.base import Base
 from db.deps import get_db
 
@@ -53,6 +54,7 @@ from services.precomputed_repository import (
 )
 from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_engine import filter_by_date_range
+from services.admin_upload_service import backfill_missing_job_ids
 from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
 from services.partner_filter_service import (
     dataframe_to_payload_rows,
@@ -239,6 +241,24 @@ def _refresh_after_data_change(
             dataset_type=ds,
             job_id=refresh_job,
         )
+        if src in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+            invalidate_reliance_load_cache(
+                source=src,
+                dataset_type=ds,
+                job_id=refresh_job,
+            )
+        elif src in {"godrej", "goodrej", "goddrej"}:
+            invalidate_godrej_load_cache(
+                source=src,
+                dataset_type=ds,
+                job_id=refresh_job,
+            )
+        elif src == "hitachi":
+            invalidate_hitachi_load_cache(
+                source=src,
+                dataset_type=ds,
+                job_id=refresh_job,
+            )
 
     for refresh_job in refresh_jobs:
         try:
@@ -440,8 +460,63 @@ def _init_db():
                     """
                 )
             )
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.admin_upload_batches (
+                        id BIGSERIAL PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        dataset_type TEXT NOT NULL,
+                        job_key TEXT NOT NULL DEFAULT '',
+                        action TEXT NOT NULL DEFAULT 'update',
+                        file_name TEXT NOT NULL DEFAULT '',
+                        uploaded_by TEXT NOT NULL DEFAULT '',
+                        uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        rows_in INTEGER NOT NULL DEFAULT 0,
+                        rows_inserted INTEGER NOT NULL DEFAULT 0,
+                        rows_updated INTEGER NOT NULL DEFAULT 0,
+                        deleted_rows INTEGER NOT NULL DEFAULT 0,
+                        notes TEXT NOT NULL DEFAULT ''
+                    );
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_admin_upload_batches_scope
+                    ON public.admin_upload_batches (source, dataset_type, job_key, uploaded_at DESC);
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_admin_upload_batches_uploaded_by
+                    ON public.admin_upload_batches (uploaded_by);
+                    """
+                )
+            )
     except Exception:
         logger.exception("DB init failed")
+    else:
+        maintenance_db = SessionLocal()
+        try:
+            backfill_summary = backfill_missing_job_ids(maintenance_db)
+            if int(backfill_summary.get("groups_backfilled") or 0) > 0:
+                maintenance_db.commit()
+                logger.info(
+                    "Auto backfilled missing job_ids groups=%s rows=%s",
+                    int(backfill_summary.get("groups_backfilled") or 0),
+                    int(backfill_summary.get("rows_backfilled") or 0),
+                )
+            else:
+                maintenance_db.rollback()
+        except Exception:
+            maintenance_db.rollback()
+            logger.exception("Failed to auto backfill missing job_ids on startup")
+        finally:
+            maintenance_db.close()
 
     prewarm_raw = os.getenv("LLM_PREWARM", "1").strip()
     prewarm_enabled = prewarm_raw.lower() not in {"0", "false", "no", "off"}
@@ -473,6 +548,10 @@ app.add_middleware(
         "X-Filter-Apply-Db",
         "X-Filter-Rows",
         "X-Filter-Revision-Id",
+        "X-Filter-Job-Id",
+        "X-Filter-Job-Auto-Generated",
+        "X-Filter-Uploaded-By",
+        "X-Filter-Uploaded-At",
     ],
 )
 
@@ -491,6 +570,9 @@ def preflight(path: str, request: Request):
 from routers.analytics import compute_by_dimension_rows, router as analytics_router
 from routers.admin_files import router as admin_files_router
 from routers.deck_export import router as deck_export_router
+from services.analytics.goodrej_engine import invalidate_godrej_load_cache
+from services.analytics.hitachi_engine import invalidate_hitachi_load_cache
+from services.analytics.reliance_engine import invalidate_reliance_load_cache
 from services.analytics_repository import invalidate_dataframe_cache, get_dataframe
 app.include_router(auth_router)
 app.include_router(analytics_router, dependencies=[Depends(get_current_user)])
@@ -2178,13 +2260,14 @@ DEFAULT_CHATBOT_SYSTEM_PROMPT = (
     "Do not invent brands, products, numbers, dates, or events. "
     "If key data is insufficient, explicitly state what is missing and provide the closest defensible estimate with assumptions. "
     "For greetings, acknowledgements, or short conversational messages, respond naturally and invite a data question. "
-    "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, "
-    "samsung/overview/overall/ -> Samsung Overview, samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma -> Samsung Croma, reliance digital/reliance_digital -> Samsung Reliance Digital. "
+    "Treat source aliases as: reliance/resq -> Reliance ResQ, goodrej/goddrej -> Godrej, hitachi -> Hitachi, "
+    "samsung/overview/overall/ -> Samsung Overview, samsung vs/vijay sales -> Samsung Vijay Sales, samsung croma/croma/protect max/protect max croma -> Samsung Croma, reliance digital/reliance_digital -> Samsung Reliance Digital. "
     "Apply source-specific taxonomy and mappings; use Samsung-specific model mapping or Samsung plan abbreviations only when the selected source is Samsung. "
     "Write in a clear executive tone with concise, evidence-backed reasoning. "
     "Lead with the direct answer, then support it with key metrics, trend direction, and business impact. "
     "Vary phrasing and structure across turns; avoid repeating identical templates or sentence openings. "
     "For forecasting questions, derive next-month directional estimates only from historical monthly values in context. "
+    "Never expose chain-of-thought, internal reasoning, or <think> tags. "
     "Do not re-introduce yourself unless the user explicitly asks who you are."
 )
 try:
@@ -2321,17 +2404,21 @@ _CHATBOT_SOURCE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
     ),
     ("reliance", ("reliance resq", "reliance-resq", "reliance_resq", "resq", "reliance")),
     ("godrej", ("godrej", "goodrej", "goddrej")),
+    ("hitachi", ("hitachi",)),
     ("samsung_vs", ("samsung vijay sales", "samsung_vs", "samsung vs", "vijay sales", "vijay")),
-    ("samsung_croma", ("samsung croma", "samsung_croma", "croma sales", "croma")),
+    ("samsung_croma", ("samsung croma", "samsung_croma", "croma sales", "croma", "samsung protect max", "samsung protect max croma", "protect max", "protect max croma", "croma protect max")),
+    ("samsung_croma_dsdsg", ("samsung croma dsdsg", "samsung_croma_dsdsg", "croma ds dsg", "croma ds/dsg", "dsdsg", "ds dsg", "ds/dsg", "ds-dsg")),
     ("samsung", ("samsung",)),
 ]
 
 _CHATBOT_SOURCE_LABELS: dict[str, str] = {
     "reliance": "Reliance ResQ",
     "godrej": "Godrej",
+    "hitachi": "Hitachi",
     "samsung": "Samsung",
     "samsung_vs": "Samsung Vijay Sales",
     "samsung_croma": "Samsung Croma",
+    "samsung_croma_dsdsg": "Croma DS/DSG",
     "samsung_reliance_digital": "Samsung Reliance Digital",
 }
 
@@ -2526,6 +2613,58 @@ def _chatbot_requested_dimensions_from_text(text: str) -> list[str]:
                 "product-wise",
             ),
         ),
+        (
+            "product_subcategory",
+            (
+                "product subcategory",
+                "sub category",
+                "subcategory",
+                "model wise",
+                "model-wise",
+                "by model",
+            ),
+        ),
+        (
+            "reason",
+            (
+                "reason",
+                "reasons",
+                "cause",
+                "causes",
+                "root cause",
+                "nature of complaint",
+                "complaint wise",
+                "issue wise",
+            ),
+        ),
+        (
+            "operation",
+            (
+                "major call operation",
+                "operation wise",
+                "repair action",
+            ),
+        ),
+        (
+            "call_type",
+            (
+                "call type",
+                "claim type",
+                "service type",
+            ),
+        ),
+        (
+            "status",
+            (
+                "call status",
+                "claim status",
+                "approval status",
+                "status wise",
+            ),
+        ),
+        ("zone", ("zone wise", "by zone", "zone level")),
+        ("branch", ("branch wise", "by branch", "branch level")),
+        ("dealer", ("dealer wise", "by dealer", "dealer level")),
         ("brand", ("brand wise", "brand-wise", "by brand", "brand level", "brand stats")),
     ]
 
@@ -2541,6 +2680,10 @@ def _chatbot_requested_dimensions_from_text(text: str) -> list[str]:
         ("city", "city"),
         ("channel", "channel"),
         ("brand", "brand"),
+        ("reason", "complaint"),
+        ("status", "status"),
+        ("branch", "branch"),
+        ("dealer", "dealer"),
     ]
     for dimension, token in single_word_hints:
         if token in low and dimension not in requested:
@@ -2673,8 +2816,8 @@ def _prepend_partner_scope_prompt(
         partner_labels.extend(["Reliance ResQ", "Godrej"])
     partner_preview = ", ".join(partner_labels)
     prefix = (
-        "Partner is not specified. I am sharing combined insights across all available partners. "
-        f"For a partner-specific answer, mention one partner ({partner_preview})."
+        "Partner is not specified. I am sharing the overall combined view across all available partners. "
+        f"If you want a particular reference, mention a partner ({partner_preview}) or narrow it by state, city, product, branch, or date range."
     )
     return f"{prefix}\n{text}"
 
@@ -2956,6 +3099,1237 @@ def _pick_frame_column(frame: Any, candidates: list[str]) -> str | None:
     return None
 
 
+_CHATBOT_COLUMN_GROUP_ALIASES: dict[str, tuple[str, ...]] = {
+    "reason": (
+        "reason",
+        "reasons",
+        "claim reason",
+        "reason code",
+        "root cause",
+        "cause",
+        "nature of complaint",
+        "complaint nature",
+        "complaint",
+        "issue",
+        "problem",
+        "failure reason",
+        "fault",
+        "defect",
+        "fault code",
+    ),
+    "operation": (
+        "major call operation",
+        "operation",
+        "service operation",
+        "repair action",
+        "resolution",
+        "action taken",
+    ),
+    "call_type": (
+        "call type",
+        "claim type",
+        "ticket type",
+        "service type",
+        "case type",
+        "coverage type",
+    ),
+    "status": (
+        "call status",
+        "claim status",
+        "service status",
+        "approval status",
+        "status",
+        "payout type",
+    ),
+    "month": (
+        "month",
+        "month name",
+        "month_name",
+        "claim date",
+        "call date",
+        "service closed date",
+        "sms closure date",
+        "approveddate",
+        "date",
+        "payment date",
+        "plan start date",
+        "warranty start date",
+    ),
+    "state": (
+        "state",
+        "customer state",
+        "state name",
+        "region",
+        "location",
+    ),
+    "city": (
+        "city",
+        "customer city",
+        "town",
+    ),
+    "zone": (
+        "zone name",
+        "zone",
+        "region",
+    ),
+    "branch": (
+        "branch name",
+        "new branch",
+        "branch",
+    ),
+    "dealer": (
+        "dealer name",
+        "dealer type",
+        "dealer id",
+        "dealer",
+        "store name",
+    ),
+    "channel": (
+        "channel",
+        "channel name",
+        "channel_name",
+        "purchase from",
+    ),
+    "product_category": (
+        "product category",
+        "product_category",
+        "category",
+        "brand",
+        "article brand",
+        "product brand",
+    ),
+    "product_subcategory": (
+        "product subcategory",
+        "product subcatergory",
+        "subcategory",
+        "sub category",
+        "model no",
+        "model description",
+        "model code",
+        "item description",
+        "appliance model name",
+        "device plan category",
+        "plan category",
+        "item name",
+        "care+ plan name",
+    ),
+    "source": (
+        "__chatbot_source",
+        "source",
+        "partner",
+        "brand",
+    ),
+}
+
+_CHATBOT_ANALYTICS_DIMENSIONS = {
+    "month",
+    "state",
+    "city",
+    "channel",
+    "brand",
+    "plan_category",
+    "device_plan_category",
+    "product_category",
+    "product_subcategory",
+    "reason",
+}
+
+_CHATBOT_REASON_GROUP_KEYS = ("reason", "operation", "call_type", "status")
+
+_CHATBOT_COLUMN_STOPWORDS = {
+    "the",
+    "of",
+    "and",
+    "or",
+    "to",
+    "for",
+    "by",
+    "with",
+    "from",
+    "name",
+    "number",
+    "no",
+    "id",
+}
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = str(value or "").strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _frame_columns(frame: Any) -> list[str]:
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    try:
+        return [str(col) for col in list(frame.columns)]
+    except Exception:
+        return []
+
+
+def _safe_text_parts(value: str) -> list[str]:
+    return [
+        part
+        for part in _to_safe_key(value).split("_")
+        if part and part not in _CHATBOT_COLUMN_STOPWORDS
+    ]
+
+
+def _match_frame_columns(
+    frame: Any,
+    aliases: tuple[str, ...] | list[str],
+    *,
+    limit: int = 6,
+) -> list[str]:
+    columns = _frame_columns(frame)
+    if not columns:
+        return []
+
+    scored: list[tuple[int, int, str]] = []
+    for raw_col in columns:
+        safe_col = _to_safe_key(raw_col)
+        best_score = 0
+        for alias in aliases:
+            safe_alias = _to_safe_key(alias)
+            if not safe_alias:
+                continue
+            if safe_col == safe_alias:
+                best_score = max(best_score, 100)
+                continue
+            if safe_alias in safe_col:
+                best_score = max(best_score, 82)
+                continue
+            alias_parts = [part for part in safe_alias.split("_") if part]
+            if alias_parts and all(part in safe_col for part in alias_parts):
+                best_score = max(best_score, 70)
+        if best_score > 0:
+            scored.append((best_score, len(safe_col), raw_col))
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
+    return [raw_col for _, _, raw_col in scored[:limit]]
+
+
+def _semantic_field_map_for_frame(frame: Any) -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for group_key, aliases in _CHATBOT_COLUMN_GROUP_ALIASES.items():
+        mapping[group_key] = _match_frame_columns(frame, aliases, limit=5)
+    return mapping
+
+
+def _message_column_match(
+    frame: Any,
+    message: str,
+    *,
+    exclude: set[str] | None = None,
+) -> str | None:
+    columns = _frame_columns(frame)
+    if not columns:
+        return None
+
+    excluded = {str(item) for item in (exclude or set())}
+    safe_message = _to_safe_key(message)
+    if not safe_message:
+        return None
+
+    message_parts = set(_safe_text_parts(message))
+    scored: list[tuple[int, int, str]] = []
+    for raw_col in columns:
+        if raw_col in excluded:
+            continue
+        safe_col = _to_safe_key(raw_col)
+        if not safe_col:
+            continue
+
+        score = 0
+        if safe_col in safe_message:
+            score += 70
+
+        col_parts = set(_safe_text_parts(raw_col))
+        overlap = len(col_parts & message_parts)
+        if overlap:
+            score += overlap * 12
+            if col_parts and col_parts.issubset(message_parts):
+                score += 18
+
+        if score >= 24:
+            scored.append((score, len(safe_col), raw_col))
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
+    return scored[0][2] if scored else None
+
+
+def _semantic_group_for_column(frame: Any, column_name: str) -> str | None:
+    for group_key, aliases in _CHATBOT_COLUMN_GROUP_ALIASES.items():
+        matches = _match_frame_columns(frame, aliases, limit=3)
+        if column_name in matches:
+            return group_key
+    return None
+
+
+def _chatbot_scope_sources(
+    *,
+    db: Session,
+    context_payload: dict[str, Any],
+    dataset_type: str,
+) -> list[str]:
+    resolved_dataset = (dataset_type or "").strip().lower()
+    if resolved_dataset not in {"sales", "claims"}:
+        return []
+
+    if bool(context_payload.get("global_scope")):
+        scopes = _chatbot_available_scopes(
+            db=db,
+            job_id=_normalize_chatbot_job_id(context_payload.get("job_id")),
+        )
+        sources = [
+            _normalize_source_key(str(scope.get("source", "")))
+            for scope in scopes
+            if str(scope.get("dataset_type", "")).strip().lower() == resolved_dataset
+        ]
+        return _unique_preserving_order([source for source in sources if source])
+
+    source = _normalize_source_key(str(context_payload.get("source") or ""))
+    return [source] if source else []
+
+
+def _load_chatbot_scope_frame(
+    *,
+    db: Session,
+    sources: list[str],
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for source in sources:
+        try:
+            frame = get_dataframe(
+                db=db,
+                job_id=job_id,
+                source=source,
+                dataset_type=dataset_type,
+            )
+        except Exception:
+            logger.exception(
+                "Chatbot scope frame fetch failed source=%s dataset=%s job_id=%s",
+                source,
+                dataset_type,
+                job_id,
+            )
+            continue
+
+        if frame is None or getattr(frame, "empty", True):
+            continue
+
+        try:
+            scoped = frame.copy()
+        except Exception:
+            continue
+
+        if from_date or to_date:
+            try:
+                scoped = filter_by_date_range(scoped, dataset_type, from_date, to_date)
+            except Exception:
+                logger.exception(
+                    "Chatbot scope frame date filtering failed source=%s dataset=%s from=%s to=%s",
+                    source,
+                    dataset_type,
+                    from_date,
+                    to_date,
+                )
+                continue
+
+        if scoped is None or getattr(scoped, "empty", True):
+            continue
+
+        scoped = scoped.copy()
+        scoped["__chatbot_source"] = _source_display_name(source)
+        frames.append(scoped)
+
+    if not frames:
+        return pd.DataFrame()
+    if len(frames) == 1:
+        return frames[0]
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _clean_categorical_value(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value or value.lower() in {"nan", "none", "null"}:
+        return ""
+    return value
+
+
+def _top_categorical_summary(
+    frame: Any,
+    column_name: str,
+    metric_column: str | None = None,
+    *,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    if column_name not in _frame_columns(frame):
+        return []
+
+    try:
+        working = frame.copy()
+        working[column_name] = working[column_name].map(_clean_categorical_value)
+        working = working[working[column_name].astype(bool)].copy()
+        if working.empty:
+            return []
+
+        if metric_column and metric_column in working.columns:
+            working["__metric_value"] = pd.to_numeric(working[metric_column], errors="coerce").fillna(0.0)
+            grouped = working.groupby(column_name).agg(
+                count=(column_name, "size"),
+                total=("__metric_value", "sum")
+            ).sort_values("count", ascending=False).head(limit)
+            
+            return [
+                {
+                    "label": str(label),
+                    "count": int(row["count"]),
+                    "total": float(row["total"])
+                }
+                for label, row in grouped.iterrows()
+            ]
+        else:
+            counts = working[column_name].value_counts().head(limit)
+            return [
+                {
+                    "label": str(label),
+                    "count": int(count),
+                    "total": 0.0
+                }
+                for label, count in counts.items()
+            ]
+    except Exception:
+        logger.exception("Failed to compute categorical summary for %s", column_name)
+        return []
+
+
+def _top_categorical_counts(
+    frame: Any,
+    column_name: str,
+    *,
+    limit: int = 6,
+) -> list[tuple[str, int]]:
+    summary = _top_categorical_summary(frame, column_name, limit=limit)
+    return [(item["label"], item["count"]) for item in summary]
+
+
+def _is_reason_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+
+    reason_tokens = (
+        "reason",
+        "reasons",
+        "cause",
+        "causes",
+        "root cause",
+        "root causes",
+        "why are claims",
+        "why claim",
+        "common issue",
+        "common issues",
+        "nature of complaint",
+        "complaint",
+    )
+    claim_tokens = (
+        "claim",
+        "claims",
+        "breakdown",
+        "service",
+        "issue",
+    )
+    return any(token in low for token in reason_tokens) and any(token in low for token in claim_tokens)
+
+
+def _build_reason_breakdown_answer(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_reason_query(payload.message):
+        return None
+
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "claims")
+    if dataset_type != "claims":
+        return None
+
+    sources = _chatbot_scope_sources(
+        db=db,
+        context_payload=context_payload,
+        dataset_type="claims",
+    )
+    if not sources:
+        return None
+
+    frame = _load_chatbot_scope_frame(
+        db=db,
+        sources=sources,
+        dataset_type="claims",
+        job_id=_normalize_chatbot_job_id(context_payload.get("job_id")),
+        from_date=_normalize_chatbot_date(context_payload.get("from_date")),
+        to_date=_normalize_chatbot_date(context_payload.get("to_date")),
+    )
+    if frame.empty:
+        return None
+
+    semantic_map = _semantic_field_map_for_frame(frame)
+    reason_columns = _unique_preserving_order(
+        [
+            *(semantic_map.get("reason") or []),
+            *(semantic_map.get("operation") or []),
+            *(semantic_map.get("call_type") or []),
+            *(semantic_map.get("status") or []),
+        ]
+    )
+    if not reason_columns:
+        return _prepend_partner_scope_prompt(
+            "I checked the raw claims rows, but I could not find explicit reason or complaint columns in this slice.",
+            payload=payload,
+            context_payload=context_payload,
+        )
+
+    field_labels = {
+        "reason": "complaint reason",
+        "operation": "service operation",
+        "call_type": "call type",
+        "status": "call status",
+    }
+    lines: list[str] = [
+        "Yes. The claims data does include reason-like fields, so I can answer this from the dataset directly."
+    ]
+
+    payout_column = _pick_frame_column(
+        frame,
+        [
+            "Claims Costing",
+            "Claim_Amount",
+            "Payout Amount",
+            "Amount",
+            "Invoice Amount",
+            "Payment Amount",
+            "net_amount",
+            "claim_amount",
+        ],
+    )
+
+    for column_name in reason_columns[:3]:
+        group_key = _semantic_group_for_column(frame, column_name) or "reason"
+        summary = _top_categorical_summary(frame, column_name, metric_column=payout_column, limit=5)
+        if not summary:
+            continue
+        label = field_labels.get(group_key, "reason field")
+        
+        detail_bits = []
+        for item in summary:
+            bit = f"{item['label']} ({item['count']:,} claims"
+            if item.get("total") and item["total"] > 0:
+                bit += f", payout {_format_metric_value('claims', item['total'])}"
+            bit += ")"
+            detail_bits.append(bit)
+            
+        lines.append(
+            f"Top {label} in {column_name}: "
+            + "; ".join(detail_bits)
+            + "."
+        )
+
+    if len(sources) == 1:
+        scope_label = _source_display_name(sources[0])
+    else:
+        scope_label = "all available partners"
+    from_date = _normalize_chatbot_date(context_payload.get("from_date"))
+    to_date = _normalize_chatbot_date(context_payload.get("to_date"))
+    if from_date or to_date:
+        lines.append(
+            f"Scope used: {scope_label}, {from_date or 'start'} to {to_date or 'latest'}."
+        )
+    else:
+        lines.append(f"Scope used: {scope_label}, all available data.")
+
+    return _prepend_partner_scope_prompt(
+        "\n".join(lines),
+        payload=payload,
+        context_payload=context_payload,
+    )
+
+
+def _is_graph_request(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    graph_tokens = (
+        "graph",
+        "chart",
+        "plot",
+        "visualize",
+        "visualise",
+        "bar chart",
+        "line chart",
+        "pie chart",
+        "donut chart",
+        "trend chart",
+    )
+    return any(token in low for token in graph_tokens)
+
+
+def _extract_requested_limit(
+    message: str,
+    *,
+    default: int = 8,
+    minimum: int = 4,
+    maximum: int = 16,
+) -> int:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return default
+    match = re.search(r"\btop\s+(\d{1,2})\b", low) or re.search(r"\bshow\s+(\d{1,2})\b", low)
+    if not match:
+        return default
+    try:
+        value = int(match.group(1))
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _chart_metric_spec(
+    *,
+    metric: str,
+    label: str,
+    aggregation: str,
+    fmt: str,
+) -> dict[str, str]:
+    series_key = _to_safe_key(f"{metric}_{aggregation}") or f"series_{metric}"
+    return {
+        "metric": (metric or "").strip().lower(),
+        "label": label.strip() or _pretty_label(metric),
+        "aggregation": (aggregation or "sum").strip().lower(),
+        "format": fmt.strip() or (metric or "").strip().lower(),
+        "key": series_key,
+    }
+
+
+def _resolve_chart_metric_specs(message: str, dataset_type: str) -> list[dict[str, str]]:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return []
+
+    specs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(metric: str, label: str, aggregation: str = "sum", fmt: str | None = None) -> None:
+        key = (metric, aggregation)
+        if key in seen:
+            return
+        seen.add(key)
+        specs.append(
+            _chart_metric_spec(
+                metric=metric,
+                label=label,
+                aggregation=aggregation,
+                fmt=fmt or metric,
+            )
+        )
+
+    if "loss ratio" in low:
+        add("loss_ratio", "Loss Ratio", "sum", "loss_ratio")
+    if "net claim" in low or "net amount" in low:
+        add("net_claims", "Net Claims", "sum", "net_claims")
+    if any(token in low for token in ("claim amount", "claims cost", "claim cost", "payout", "claim value")):
+        add("claims", "Claims Cost", "sum", "claims")
+    if "zopper earned" in low:
+        add("zopper_earned_premium", "Zopper Earned Premium", "sum", "zopper_earned_premium")
+    if "earned premium" in low and "zopper earned" not in low:
+        add("earned_premium", "Earned Premium", "sum", "earned_premium")
+    if any(token in low for token in ("gross premium", "revenue", "sales value")):
+        add("gross_premium", "Gross Premium", "sum", "gross_premium")
+
+    count_tokens = (
+        "quantity",
+        "count",
+        "volume",
+        "units sold",
+        "units",
+        "number of claims",
+        "no of claims",
+        "no. of claims",
+        "claim count",
+        "number of sales",
+        "policy count",
+        "most common",
+    )
+    if any(token in low for token in count_tokens) or _is_reason_query(message):
+        if dataset_type == "sales" and not _is_reason_query(message):
+            add("quantity", "Quantity", "sum", "quantity")
+        else:
+            add("count", "Count", "count", "quantity")
+
+    if any(token in low for token in ("average claim", "avg claim", "mean claim")):
+        add("claims", "Average Claim Amount", "avg", "claims")
+    if any(
+        token in low
+        for token in (
+            "average premium",
+            "avg premium",
+            "average selling price",
+            "avg selling price",
+            "asp",
+            "average price",
+            "avg price",
+        )
+    ):
+        add("gross_premium", "Average Premium", "avg", "gross_premium")
+
+    if not specs:
+        if dataset_type == "claims":
+            add("count", "Claims Count", "count", "quantity")
+        else:
+            add("gross_premium", "Gross Premium", "sum", "gross_premium")
+
+    return specs[:2]
+
+
+def _time_bucket_from_message(message: str) -> str:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if "daily" in low or "day wise" in low or "by day" in low:
+        return "day"
+    if "weekly" in low or "week wise" in low or "by week" in low:
+        return "week"
+    return "month"
+
+
+def _parse_time_dimension_series(series: pd.Series, bucket: str) -> tuple[pd.Series, pd.Series]:
+    raw = series.astype(str).str.strip()
+    try:
+        parsed = pd.to_datetime(raw, format="mixed", errors="coerce")
+    except TypeError:
+        parsed = pd.to_datetime(raw, errors="coerce")
+
+    if parsed.isna().all():
+        for fmt in ("%b-%y", "%b %y", "%b-%Y", "%b %Y", "%Y-%m", "%Y-%m-%d", "%d-%m-%Y", "%d-%b-%Y"):
+            parsed_try = pd.to_datetime(raw, format=fmt, errors="coerce")
+            if parsed_try.notna().any():
+                parsed = parsed_try
+                break
+
+    if bucket == "day":
+        labels = parsed.dt.strftime("%d-%b-%y")
+        sort_values = parsed.dt.normalize()
+    elif bucket == "week":
+        week_start = parsed.dt.to_period("W").dt.start_time
+        labels = week_start.dt.strftime("%d-%b-%y")
+        sort_values = week_start
+    else:
+        month_start = parsed.dt.to_period("M").dt.to_timestamp()
+        labels = month_start.dt.strftime("%b-%y")
+        sort_values = month_start
+
+    return labels, sort_values
+
+
+def _metric_series_from_frame(
+    frame: pd.DataFrame,
+    metric: str,
+    dataset_type: str,
+) -> pd.Series | None:
+    metric_key = (metric or "").strip().lower()
+    if frame is None or frame.empty:
+        return None
+
+    if metric_key in {"count", "quantity"}:
+        return pd.Series(1.0, index=frame.index, dtype="float64")
+
+    candidate_map: dict[str, list[str]] = {
+        "claims": [
+            "Claim_Amount",
+            "Claim Amount",
+            "Payout Amount",
+            "Amount",
+            "Invoice Amount",
+            "Payment Amount",
+        ],
+        "net_claims": [
+            "Net Amount",
+            "Net Claims",
+            "Net_Claim_Amount",
+            "Claim_Amount",
+            "Claim Amount",
+        ],
+        "gross_premium": [
+            "Gross Premium",
+            "Customer Premium",
+            "Plan Selling Price",
+            "Amount",
+            "Premium",
+        ],
+        "earned_premium": [
+            "Earned_Premium",
+            "Earned Premium",
+            "Net Amount",
+        ],
+        "zopper_earned_premium": [
+            "Zopper_Share_EP",
+            "Zopper Earned Premium",
+            "Zopper Share",
+        ],
+    }
+
+    candidates = candidate_map.get(metric_key, [])
+    column_name = _pick_frame_column(frame, candidates)
+    if column_name is None:
+        if dataset_type == "claims" and metric_key == "claims":
+            column_name = _pick_frame_column(frame, ["Claim_Amount", "Payout Amount", "Amount"])
+        elif dataset_type == "sales" and metric_key == "gross_premium":
+            column_name = _pick_frame_column(frame, ["Customer Premium", "Premium", "Amount"])
+    if column_name is None:
+        return None
+
+    series = pd.to_numeric(frame[column_name], errors="coerce")
+    if series.notna().any():
+        return series.fillna(0.0)
+    return None
+
+
+def _aggregate_graph_metric_across_sources(
+    *,
+    db: Session,
+    sources: list[str],
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+    dimension: str,
+    metric: str,
+) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for source in sources:
+        rows = _chatbot_graph_rows(
+            db=db,
+            source=source,
+            dataset_type=dataset_type,
+            job_id=job_id,
+            dimension=dimension,
+            metric=metric,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        local = _aggregate_metric_by_dimension(rows, dimension=dimension, metric=metric)
+        for label, value in local.items():
+            totals[label] = totals.get(label, 0.0) + float(value)
+    return totals
+
+
+def _aggregate_raw_metric_across_frame(
+    *,
+    frame: pd.DataFrame,
+    dimension_column: str,
+    dataset_type: str,
+    metric_spec: dict[str, str],
+    time_bucket: str | None,
+) -> dict[str, float]:
+    if frame is None or frame.empty or dimension_column not in frame.columns:
+        return {}
+
+    working = frame.copy()
+    if time_bucket:
+        labels, sort_values = _parse_time_dimension_series(working[dimension_column], time_bucket)
+        working["__chart_label"] = labels
+        working["__chart_sort"] = sort_values
+        working = working[working["__chart_sort"].notna()].copy()
+    else:
+        working["__chart_label"] = working[dimension_column].map(_clean_categorical_value)
+        working = working[working["__chart_label"].astype(bool)].copy()
+
+    if working.empty:
+        return {}
+
+    aggregation = metric_spec.get("aggregation", "sum")
+    if aggregation == "count":
+        grouped = working.groupby("__chart_label", dropna=False).size()
+        return {str(label): float(value) for label, value in grouped.items()}
+
+    series = _metric_series_from_frame(
+        working,
+        metric_spec.get("metric", ""),
+        dataset_type,
+    )
+    if series is None:
+        return {}
+
+    working["__chart_value"] = series
+    grouped_obj = working.groupby("__chart_label", dropna=False)["__chart_value"]
+    if aggregation == "avg":
+        grouped = grouped_obj.mean()
+    else:
+        grouped = grouped_obj.sum()
+    return {str(label): float(value) for label, value in grouped.items()}
+
+
+def _resolve_chart_dimension(
+    *,
+    frame: pd.DataFrame,
+    message: str,
+    dataset_type: str,
+) -> tuple[str | None, str | None]:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if frame is None or frame.empty:
+        return None, None
+
+    if any(token in low for token in ("partner", "partners", "source", "sources")) and "__chatbot_source" in frame.columns:
+        return "__chatbot_source", "source"
+
+    requested_dimensions = _chatbot_requested_dimensions_from_text(message)
+    for dimension_key in requested_dimensions:
+        aliases = _CHATBOT_COLUMN_GROUP_ALIASES.get(dimension_key)
+        if not aliases:
+            continue
+        matches = _match_frame_columns(frame, aliases, limit=1)
+        if matches:
+            return matches[0], dimension_key
+
+    if _is_reason_query(message):
+        for group_key in _CHATBOT_REASON_GROUP_KEYS:
+            matches = _match_frame_columns(frame, _CHATBOT_COLUMN_GROUP_ALIASES[group_key], limit=1)
+            if matches:
+                return matches[0], group_key
+
+    message_match = _message_column_match(frame, message, exclude={"__chatbot_source"})
+    if message_match:
+        return message_match, _semantic_group_for_column(frame, message_match)
+
+    if any(token in low for token in ("trend", "timeline", "month", "monthly", "over time", "by date")):
+        matches = _match_frame_columns(frame, _CHATBOT_COLUMN_GROUP_ALIASES["month"], limit=1)
+        if matches:
+            return matches[0], "month"
+
+    fallback_order = (
+        ["month", "reason", "product_category", "state", "city", "channel", "source"]
+        if dataset_type == "claims"
+        else ["month", "product_category", "product_subcategory", "channel", "state", "source"]
+    )
+    for group_key in fallback_order:
+        aliases = _CHATBOT_COLUMN_GROUP_ALIASES.get(group_key)
+        if not aliases:
+            continue
+        matches = _match_frame_columns(frame, aliases, limit=1)
+        if matches:
+            return matches[0], group_key
+
+    return None, None
+
+
+def _resolve_chart_type(
+    *,
+    message: str,
+    dimension_key: str | None,
+    series_count: int,
+) -> str:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if "pie chart" in low or "donut chart" in low:
+        return "pie"
+    if series_count > 1:
+        return "composed"
+    if "bar chart" in low or "column chart" in low:
+        return "bar"
+    if "line chart" in low or "trend" in low or "time series" in low or "timeline" in low:
+        return "line"
+    if any(token in low for token in ("mix", "split", "share", "distribution")) and dimension_key != "month":
+        return "pie"
+    if dimension_key == "month":
+        return "line"
+    return "bar"
+
+
+def _sort_chart_rows(
+    rows: list[dict[str, Any]],
+    *,
+    chart_type: str,
+    primary_key: str,
+    ascending: bool = False,
+) -> list[dict[str, Any]]:
+    if chart_type == "line":
+        return sorted(rows, key=lambda row: str(row.get("__sort") or ""))
+    return sorted(
+        rows,
+        key=lambda row: float(row.get(primary_key) or 0.0),
+        reverse=not ascending,
+    )
+
+
+def _build_chart_rows(
+    *,
+    db: Session,
+    frame: pd.DataFrame,
+    sources: list[str],
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+    dimension_column: str,
+    dimension_key: str | None,
+    metric_specs: list[dict[str, str]],
+    message: str,
+) -> list[dict[str, Any]]:
+    if not metric_specs:
+        return []
+
+    time_bucket = _time_bucket_from_message(message) if dimension_key == "month" else None
+    label_to_row: dict[str, dict[str, Any]] = {}
+
+    for metric_spec in metric_specs:
+        metric_key = metric_spec.get("metric", "")
+        if (
+            dimension_key in _CHATBOT_ANALYTICS_DIMENSIONS
+            and metric_key in {"claims", "net_claims", "loss_ratio", "gross_premium", "earned_premium", "zopper_earned_premium", "quantity"}
+            and metric_spec.get("aggregation") != "avg"
+        ):
+            metric_rows = _aggregate_graph_metric_across_sources(
+                db=db,
+                sources=sources,
+                dataset_type=dataset_type,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+                dimension=dimension_key or "month",
+                metric=metric_key,
+            )
+        else:
+            metric_rows = _aggregate_raw_metric_across_frame(
+                frame=frame,
+                dimension_column=dimension_column,
+                dataset_type=dataset_type,
+                metric_spec=metric_spec,
+                time_bucket=time_bucket,
+            )
+
+        for label, value in metric_rows.items():
+            row = label_to_row.setdefault(label, {"label": label})
+            row[metric_spec["key"]] = float(value)
+
+    rows = list(label_to_row.values())
+    if not rows:
+        return []
+
+    if time_bucket:
+        parsed = pd.to_datetime([row.get("label") for row in rows], format="%d-%b-%y", errors="coerce")
+        if parsed.isna().all():
+            parsed = pd.to_datetime([row.get("label") for row in rows], format="%b-%y", errors="coerce")
+        for row, parsed_value in zip(rows, parsed):
+            row["__sort"] = parsed_value.isoformat() if pd.notna(parsed_value) else ""
+
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    ascending = any(token in low for token in ("lowest", "least", "bottom", "smallest"))
+    chart_type = _resolve_chart_type(
+        message=message,
+        dimension_key=dimension_key,
+        series_count=len(metric_specs),
+    )
+    rows = _sort_chart_rows(
+        rows,
+        chart_type=chart_type,
+        primary_key=metric_specs[0]["key"],
+        ascending=ascending,
+    )
+
+    if chart_type != "line":
+        rows = rows[: _extract_requested_limit(message, default=8)]
+
+    for row in rows:
+        row.pop("__sort", None)
+    return rows
+
+
+def _chart_scope_label(sources: list[str], context_payload: dict[str, Any]) -> str:
+    if not sources:
+        return "selected scope"
+    if len(sources) == 1:
+        return _source_display_name(sources[0])
+    if bool(context_payload.get("global_scope")):
+        return "Overall view across all available partners"
+    return ", ".join(_source_display_name(source) for source in sources[:3])
+
+
+def _chart_download_name(
+    *,
+    sources: list[str],
+    dataset_type: str,
+    dimension_column: str,
+    metric_specs: list[dict[str, str]],
+) -> str:
+    source_part = "overall" if len(sources) != 1 else _to_safe_key(_source_display_name(sources[0]))
+    metric_part = "-".join(_to_safe_key(spec.get("metric", "")) for spec in metric_specs[:2]) or "metric"
+    dimension_part = _to_safe_key(dimension_column) or "dimension"
+    dataset_part = _to_safe_key(dataset_type) or "dataset"
+    return f"chatbot-{source_part}-{dataset_part}-{dimension_part}-{metric_part}"
+
+
+def _build_chatbot_chart_response(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not _is_graph_request(payload.message):
+        return None
+
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
+    sources = _chatbot_scope_sources(
+        db=db,
+        context_payload=context_payload,
+        dataset_type=dataset_type,
+    )
+    if not sources:
+        return None
+
+    job_id = _normalize_chatbot_job_id(context_payload.get("job_id"))
+    from_date = _normalize_chatbot_date(context_payload.get("from_date"))
+    to_date = _normalize_chatbot_date(context_payload.get("to_date"))
+    frame = _load_chatbot_scope_frame(
+        db=db,
+        sources=sources,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if frame.empty:
+        return {
+            "response": _prepend_partner_scope_prompt(
+                "I could not find rows in the selected scope to build this chart.",
+                payload=payload,
+                context_payload=context_payload,
+            ),
+            "model": "rule-based-chart",
+        }
+
+    dimension_column, dimension_key = _resolve_chart_dimension(
+        frame=frame,
+        message=payload.message,
+        dataset_type=dataset_type,
+    )
+    if not dimension_column:
+        return {
+            "response": _prepend_partner_scope_prompt(
+                "I could not determine which field to plot. Mention a field such as month, state, city, product category, reason, call type, or call status.",
+                payload=payload,
+                context_payload=context_payload,
+            ),
+            "model": "rule-based-chart",
+        }
+
+    metric_specs = _resolve_chart_metric_specs(payload.message, dataset_type)
+    rows = _build_chart_rows(
+        db=db,
+        frame=frame,
+        sources=sources,
+        dataset_type=dataset_type,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+        dimension_column=dimension_column,
+        dimension_key=dimension_key,
+        metric_specs=metric_specs,
+        message=payload.message,
+    )
+    if not rows:
+        return {
+            "response": _prepend_partner_scope_prompt(
+                f"I found the field `{dimension_column}` but there was not enough usable data to render the chart.",
+                payload=payload,
+                context_payload=context_payload,
+            ),
+            "model": "rule-based-chart",
+        }
+
+    chart_type = _resolve_chart_type(
+        message=payload.message,
+        dimension_key=dimension_key,
+        series_count=len(metric_specs),
+    )
+    dimension_label = _pretty_label(dimension_column)
+    chart_title = f"{', '.join(spec['label'] for spec in metric_specs)} by {dimension_label}"
+    date_label = (
+        f"{from_date or 'start'} to {to_date or 'latest'}"
+        if (from_date or to_date)
+        else "all available data"
+    )
+    chart = {
+        "title": chart_title,
+        "subtitle": f"{_chart_scope_label(sources, context_payload)} | {dataset_type.title()} | {date_label}",
+        "chart_type": chart_type,
+        "x_key": "label",
+        "series": [
+            {
+                "key": spec["key"],
+                "label": spec["label"],
+                "format": spec["format"],
+                "render_as": "line" if chart_type == "composed" and idx == 1 else "bar",
+            }
+            for idx, spec in enumerate(metric_specs)
+        ],
+        "rows": rows,
+        "download_name": _chart_download_name(
+            sources=sources,
+            dataset_type=dataset_type,
+            dimension_column=dimension_column,
+            metric_specs=metric_specs,
+        ),
+    }
+
+    primary_series = metric_specs[0]
+    summary_bits: list[str] = []
+    for row in rows[:3]:
+        raw_value = _to_number(row.get(primary_series["key"]))
+        if raw_value is None:
+            continue
+        summary_bits.append(
+            f"{row.get('label')} ({_format_metric_value(primary_series['format'], float(raw_value))})"
+        )
+
+    response_lines = [f"I created a {chart_type} chart for {chart_title.lower()}."]
+    if summary_bits:
+        response_lines.append("Chart highlights: " + "; ".join(summary_bits) + ".")
+    response_lines.append(
+        "If you want, I can redraw it for a particular partner, state, city, branch, product, or narrower date range."
+    )
+
+    return {
+        "response": _prepend_partner_scope_prompt(
+            "\n".join(response_lines),
+            payload=payload,
+            context_payload=context_payload,
+        ),
+        "model": "rule-based-chart",
+        "chart": chart,
+    }
+
+
+def _sanitize_chatbot_response_text(response_text: str) -> str:
+    text = str(response_text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?think>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _build_dataset_field_profile(
     *,
     db: Session,
@@ -3018,32 +4392,27 @@ def _build_dataset_field_profile(
     if not columns:
         return None
 
-    col_preview = ", ".join(columns[:14])
-    if len(columns) > 14:
+    col_preview = ", ".join(columns[:18])
+    if len(columns) > 18:
         col_preview += ", ..."
 
+    semantic_map = _semantic_field_map_for_frame(frame)
     dim_candidates = [
         "month",
         "state",
         "city",
+        "zone",
+        "branch",
         "channel",
-        "brand",
-        "plan_category",
-        "device_plan_category",
+        "dealer",
         "product_category",
+        "product_subcategory",
+        "reason",
+        "operation",
+        "call_type",
+        "status",
     ]
-    detected_dims = [
-        dim
-        for dim in dim_candidates
-        if _pick_frame_column(
-            frame,
-            [
-                dim,
-                dim.replace("_", " "),
-                dim.replace("_", "-"),
-            ],
-        )
-    ]
+    detected_dims = [dim for dim in dim_candidates if semantic_map.get(dim)]
 
     price_col = _pick_frame_column(
         frame,
@@ -3087,12 +4456,44 @@ def _build_dataset_field_profile(
     price_text = price_col or "not found"
     qty_text = qty_col or "not found"
     cost_text = cost_or_margin_col or "not found"
+    semantic_parts: list[str] = []
+    if semantic_map.get("reason"):
+        semantic_parts.append(f"reason/cause fields={', '.join(semantic_map['reason'][:4])}")
+    extra_reason_fields = _unique_preserving_order(
+        [
+            *(semantic_map.get("operation") or []),
+            *(semantic_map.get("call_type") or []),
+            *(semantic_map.get("status") or []),
+        ]
+    )
+    if extra_reason_fields:
+        semantic_parts.append(f"supporting reason fields={', '.join(extra_reason_fields[:4])}")
+    product_fields = _unique_preserving_order(
+        [
+            *(semantic_map.get("product_category") or []),
+            *(semantic_map.get("product_subcategory") or []),
+        ]
+    )
+    if product_fields:
+        semantic_parts.append(f"product fields={', '.join(product_fields[:4])}")
+    location_fields = _unique_preserving_order(
+        [
+            *(semantic_map.get("state") or []),
+            *(semantic_map.get("city") or []),
+            *(semantic_map.get("zone") or []),
+            *(semantic_map.get("branch") or []),
+        ]
+    )
+    if location_fields:
+        semantic_parts.append(f"location fields={', '.join(location_fields[:4])}")
+    semantic_text = "; ".join(semantic_parts[:4]) if semantic_parts else "semantic fields not detected"
 
     return (
         f"{_source_display_name(source)} {dataset_type} dataset profile: "
-        f"rows={row_count:,}; columns sample={col_preview}; "
+        f"rows={row_count:,}; columns total={len(columns):,}; columns sample={col_preview}; "
         f"detected dimensions={dim_text}; pricing field={price_text}; "
-        f"quantity field={qty_text}; cost/margin related field={cost_text}."
+        f"quantity field={qty_text}; cost/margin related field={cost_text}; "
+        f"{semantic_text}."
     )
 
 
@@ -3376,8 +4777,8 @@ def _chatbot_dimension_candidates(source: str) -> list[str]:
     source_key = _normalize_source_key(source)
     if source_key == "reliance":
         return ["brand", "device_plan_category", "plan_category", "state", "month"]
-    if source_key == "godrej":
-        return ["product_category", "channel", "state", "month", "plan_category"]
+    if source_key in {"godrej", "hitachi"}:
+        return ["product_category", "product_subcategory", "plan_category", "channel", "state", "month", "reason"]
     return ["brand", "plan_category", "device_plan_category", "state", "month"]
 
 
@@ -4413,6 +5814,239 @@ def _is_pricing_query(message: str) -> bool:
         )
     business_tokens = ("revenue", "premium", "sales", "category", "segment", "plan")
     return has_price_intent and any(token in low for token in business_tokens)
+
+
+def _chatbot_recent_user_messages(payload: ChatbotPayload) -> list[str]:
+    messages = [payload.message]
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() != "user":
+            continue
+        messages.append(turn.content)
+    return messages
+
+
+def _extract_duration_months_from_text(text: str) -> int | None:
+    low = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not low:
+        return None
+
+    month_match = re.search(r"\b(\d{1,3})\s*(?:month|months|mo)\b", low)
+    if month_match:
+        try:
+            value = int(month_match.group(1))
+        except Exception:
+            value = 0
+        return value if value > 0 else None
+
+    year_match = re.search(r"\b(\d{1,2})\s*(?:year|years|yr|yrs)\b", low)
+    if year_match:
+        try:
+            value = int(year_match.group(1))
+        except Exception:
+            value = 0
+        return value * 12 if value > 0 else None
+
+    return None
+
+
+def _resolve_duration_months_from_payload(payload: ChatbotPayload) -> int | None:
+    for text in _chatbot_recent_user_messages(payload):
+        months = _extract_duration_months_from_text(text)
+        if months is not None:
+            return months
+    return None
+
+
+def _is_duration_asp_query(payload: ChatbotPayload) -> bool:
+    current_low = re.sub(r"\s+", " ", (payload.message or "").strip().lower())
+    if not current_low:
+        return False
+
+    asp_tokens = (
+        "asp",
+        "average selling price",
+        "avg selling price",
+        "average price",
+        "avg price",
+        "average premium",
+    )
+    duration_tokens = (
+        "duration",
+        "validity",
+        "tenure",
+        "zopper plan duration",
+        "2 year",
+        "2-year",
+        "24 month",
+        "24-month",
+    )
+    current_has_asp = any(token in current_low for token in asp_tokens)
+    current_has_duration = any(token in current_low for token in duration_tokens)
+    if current_has_asp and current_has_duration:
+        return True
+
+    if "zopper plan duration" in current_low or ("duration" in current_low and "refer" in current_low):
+        for text in _chatbot_recent_user_messages(payload)[1:]:
+            low = re.sub(r"\s+", " ", (text or "").strip().lower())
+            if any(token in low for token in asp_tokens) and (
+                any(token in low for token in duration_tokens) or _extract_duration_months_from_text(low) is not None
+            ):
+                return True
+    return False
+
+
+def _format_duration_label(duration_months: int) -> str:
+    if duration_months > 0 and duration_months % 12 == 0:
+        years = duration_months // 12
+        return f"{years}-year" if years == 1 else f"{years}-year"
+    return f"{duration_months}-month"
+
+
+def _build_duration_asp_answer(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_duration_asp_query(payload):
+        return None
+
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
+    if dataset_type != "sales":
+        return None
+
+    duration_months = _resolve_duration_months_from_payload(payload)
+    if duration_months is None or duration_months <= 0:
+        return None
+
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+    job_id = context_payload.get("job_id")
+    global_scope = bool(context_payload.get("global_scope"))
+
+    resolved_source = _normalize_source_key(_resolve_chatbot_source(payload) or "")
+    source_candidates: list[str] = []
+    if resolved_source:
+        source_candidates = [resolved_source]
+    elif global_scope:
+        scopes = _chatbot_available_scopes(db=db, job_id=job_id)
+        source_candidates = [
+            str(scope.get("source", ""))
+            for scope in scopes
+            if str(scope.get("dataset_type", "")).strip().lower() == "sales"
+        ]
+    else:
+        source = str(context_payload.get("source") or "").strip()
+        if source:
+            source_candidates = [source]
+
+    source_candidates = [src for src in source_candidates if src]
+    if not source_candidates:
+        return None
+
+    total_gross = 0.0
+    total_rows = 0
+    contributing_sources: list[str] = []
+
+    for source in source_candidates:
+        try:
+            frame = get_dataframe(
+                db=db,
+                job_id=job_id,
+                source=source,
+                dataset_type="sales",
+            )
+        except Exception:
+            logger.exception(
+                "Chatbot duration ASP fetch failed source=%s job_id=%s",
+                source,
+                job_id,
+            )
+            continue
+
+        if frame is None or getattr(frame, "empty", True):
+            continue
+
+        try:
+            scoped = frame.copy()
+        except Exception:
+            continue
+
+        if from_date or to_date:
+            scoped = filter_by_date_range(scoped, "sales", from_date, to_date)
+        if scoped is None or getattr(scoped, "empty", True):
+            continue
+
+        duration_col = _pick_frame_column(scoped, ["Zopper Plan Duration", "zopper_plan_duration", "Plan Duration"])
+        if not duration_col:
+            continue
+
+        gross_col = _pick_frame_column(
+            scoped,
+            [
+                "Customer Premium",
+                "Plan Selling Price",
+                "Amount",
+                "Gross Premium",
+                "gross_premium",
+                "premium",
+            ],
+        )
+        if not gross_col:
+            continue
+
+        duration_series = pd.to_numeric(scoped[duration_col], errors="coerce")
+        mask = duration_series.eq(duration_months)
+        if not bool(mask.any()):
+            continue
+
+        gross_series = pd.to_numeric(scoped[gross_col], errors="coerce").fillna(0.0)
+        gross_value = float(gross_series[mask].sum())
+        row_count = int(mask.sum())
+        if row_count <= 0:
+            continue
+
+        total_gross += gross_value
+        total_rows += row_count
+        contributing_sources.append(source)
+
+    if total_rows <= 0:
+        return _prepend_partner_scope_prompt(
+            f"I could not find sales rows with `Zopper Plan Duration = {duration_months}` in the selected scope.",
+            payload=payload,
+            context_payload=context_payload,
+        )
+
+    asp = total_gross / total_rows if total_rows > 0 else 0.0
+    duration_label = _format_duration_label(duration_months)
+    if len(source_candidates) == 1:
+        scope_label = _source_display_name(source_candidates[0])
+    else:
+        scope_label = "all available partners"
+    period_label = (
+        f"{from_date or 'start'} to {to_date or 'latest'}"
+        if (from_date or to_date)
+        else "all available data"
+    )
+
+    answer = (
+        f"For {scope_label}, ASP for {duration_label} plans "
+        f"(using `Zopper Plan Duration = {duration_months}`) is "
+        f"{_format_metric_value('gross_premium', float(asp))}. "
+        f"That is based on gross premium {_format_metric_value('gross_premium', float(total_gross))} "
+        f"across {total_rows:,} plans for {period_label}."
+    )
+    if len(source_candidates) > 1 and contributing_sources:
+        answer += (
+            " Sources contributing duration-matched rows: "
+            + ", ".join(_source_display_name(source) for source in contributing_sources[:8])
+            + "."
+        )
+    return _prepend_partner_scope_prompt(
+        answer,
+        payload=payload,
+        context_payload=context_payload,
+    )
 
 
 def _aggregate_metric_by_dimension(
@@ -5526,6 +7160,12 @@ def _looks_incomplete_response(response_text: str) -> bool:
     if text.endswith((".", "!", "?", "\"", "'", ".)", "!)", "?)", "...")):
         return False
 
+    if text.count("**") % 2 == 1 or text.count("__") % 2 == 1:
+        return True
+    backtick_count = text.count("`")
+    if backtick_count and backtick_count % 2 == 1:
+        return True
+
     if text.endswith((",", ":", ";", "-", "/")):
         return True
     if text.endswith(("(", "[", "{")):
@@ -5553,6 +7193,13 @@ def _looks_incomplete_response(response_text: str) -> bool:
         "some", "any", "if", "because", "while", "when", "then",
     }
     if last_word in dangling_words:
+        return True
+
+    if len(words) >= 10:
+        return True
+
+    last_line = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+    if last_line and re.search(r"[A-Za-z]{1,2}$", last_line):
         return True
 
     return False
@@ -5775,6 +7422,23 @@ def chatbot_message(
         }
 
     dashboard_context, context_payload = _build_chatbot_dashboard_context(db=db, payload=payload)
+    chart_response = _build_chatbot_chart_response(
+        db=db,
+        payload=payload,
+        context_payload=context_payload,
+    )
+    if chart_response:
+        return chart_response
+    reason_breakdown_answer = _build_reason_breakdown_answer(
+        db=db,
+        payload=payload,
+        context_payload=context_payload,
+    )
+    if reason_breakdown_answer:
+        return {
+            "response": reason_breakdown_answer,
+            "model": "rule-based-reason-breakdown",
+        }
     claims_average_answer = _build_claim_average_answer(
         db=db,
         payload=payload,
@@ -5784,6 +7448,16 @@ def chatbot_message(
         return {
             "response": claims_average_answer,
             "model": "rule-based-claims-avg",
+        }
+    duration_asp_answer = _build_duration_asp_answer(
+        db=db,
+        payload=payload,
+        context_payload=context_payload,
+    )
+    if duration_asp_answer:
+        return {
+            "response": duration_asp_answer,
+            "model": "rule-based-duration-asp",
         }
     pricing_answer = _build_pricing_recommendation_answer(
         db=db,
@@ -5841,6 +7515,7 @@ def chatbot_message(
         "If key context is missing, state the gap and provide the closest defensible answer with explicit assumptions.",
         "Give a direct answer first, then supporting evidence and implications.",
         "Prefer precise metrics and avoid generic statements.",
+        "Never reveal hidden reasoning, chain-of-thought, or <think> blocks.",
         "Do not re-introduce AI Sahyogi unless the user explicitly asks.",
         "End with a complete final sentence and close any opened bracket.",
         "For forecasting questions, estimate next-month values only from monthly history in context and mark it as directional.",
@@ -5854,18 +7529,12 @@ def chatbot_message(
             "and still provide the combined all-partner answer."
         ),
         "If the user asks for sales or claims explicitly, follow the asked dataset even if UI context is on the other dataset.",
+        "If dataset profile lists complaint, cause, operation, type, or status fields, use those fields directly before saying reasons are unavailable.",
         (
             "Apply source-specific taxonomy and mappings. Do not use Samsung glossary, Samsung fixed price matrix, "
             "or Samsung model-code mapping unless the selected source is Samsung."
         ),
     ]
-    if include_samsung_rules:
-        hard_constraints.extend(
-            [
-                "If Samsung model codes appear (A06/F15/A16/A17/F17/A26/A35/A36/F55/A56/S24/S25/Fold6/Fold7/Flip7), use the mapping provided in context to infer device category.",
-                "Use Samsung plan abbreviations consistently: ADLD=Accidental Damage and Liquid Damage, EW=Extended Warranty, SP/SPP=Screen Protection Plan, CPP=Comprehensive Protection Plan, Combo=ADLD + EW.",
-            ]
-        )
     hard_constraints_text = "\n".join(
         f"{idx}) {constraint}" for idx, constraint in enumerate(hard_constraints, start=1)
     )
@@ -5875,11 +7544,19 @@ def chatbot_message(
         f"{hard_constraints_text}\n"
     )
     model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
-    temperature = payload.temperature if payload.temperature is not None else _env_float("CHATBOT_TEMPERATURE", 0.15)
+    temperature = (
+        payload.temperature
+        if payload.temperature is not None
+        else _env_float("CHATBOT_TEMPERATURE", 0.15)
+    )
     max_tokens = _resolve_chatbot_num_predict(payload)
     timeout_seconds = max(12, _env_int("CHATBOT_TIMEOUT_SECONDS", 65))
-    retry_timeout_seconds = max(8, min(timeout_seconds, _env_int("CHATBOT_RETRY_TIMEOUT_SECONDS", 30)))
-    retry_num_predict = max(128, min(max_tokens, _env_int("CHATBOT_RETRY_NUM_PREDICT", 640)))
+    retry_timeout_seconds = max(
+        8, min(timeout_seconds, _env_int("CHATBOT_RETRY_TIMEOUT_SECONDS", 30))
+    )
+    retry_num_predict = max(
+        128, min(max_tokens, _env_int("CHATBOT_RETRY_NUM_PREDICT", 640))
+    )
     max_num_predict_cap = max(max_tokens, _env_int("CHATBOT_MAX_NUM_PREDICT", 4096))
     keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip()
     num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
@@ -6011,6 +7688,9 @@ def chatbot_message(
             num_thread=num_thread,
         )
 
+    response_text = _sanitize_chatbot_response_text(response_text)
+    if not response_text:
+        response_text = "I could not generate a usable answer for this query. Please try rephrasing the question."
     response_text = _prepend_partner_scope_prompt(
         response_text,
         payload=payload,

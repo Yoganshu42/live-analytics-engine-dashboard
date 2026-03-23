@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useReducedMotion } from "framer-motion"
 import {
   BarChart3,
   CircleDollarSign,
@@ -24,7 +25,7 @@ import {
 
 import DateRangePicker from "@/components/DateRangePicker"
 import { fetchMasterDashboard, type MasterDashboardResponse } from "@/app/lib/api"
-import { SAMSUNG_PARTNERS, type SamsungPartnerKey } from "@/lib/samsungPartners"
+import { VISIBLE_SAMSUNG_PARTNERS, type SamsungPartnerKey } from "@/lib/samsungPartners"
 
 type Props = {
   jobId?: string | null
@@ -64,6 +65,11 @@ type MasterData = {
     salesRows: Array<Record<string, number | string>>
     claimsRows: Array<Record<string, number | string>>
   }
+  hitachi: {
+    kpis: KpiValues
+    salesRows: Array<Record<string, number | string>>
+    claimsRows: Array<Record<string, number | string>>
+  }
 }
 
 type ExpandableChartId =
@@ -73,6 +79,8 @@ type ExpandableChartId =
   | "reliance-claims"
   | "godrej-premium"
   | "godrej-claims"
+  | "hitachi-premium"
+  | "hitachi-claims"
 
 type KpiCardMeta = {
   key: keyof KpiValues
@@ -132,6 +140,8 @@ const CHART_TITLES: Record<ExpandableChartId, string> = {
   "reliance-claims": "Reliance Claims Cost Trend",
   "godrej-premium": "Godrej Premium Trend",
   "godrej-claims": "Godrej Claims Cost Trend",
+  "hitachi-premium": "Hitachi Premium Trend",
+  "hitachi-claims": "Hitachi Claims Cost Trend",
 }
 
 const toSafeKey = (value: string) =>
@@ -324,9 +334,15 @@ const EMPTY_KPIS: KpiValues = {
   claims: 0,
 }
 
+const hasChartSignal = (
+  rows: Array<Record<string, number | string>>,
+  keys: string[],
+) => rows.some((row) => keys.some((key) => Math.abs(asNumber(row[key])) > 0))
+
 const SAMSUNG_MASTER_PREFIX: Record<SamsungPartnerKey, string> = {
   samsung_vs: "vs",
   samsung_croma: "croma",
+  samsung_croma_dsdsg: "croma_dsdsg",
   samsung_reliance_digital: "reliance_digital",
 }
 
@@ -334,12 +350,13 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
   const summaries = payload?.summaries || {}
   const rows = payload?.rows || {}
 
-  const samsungSalesSummary = summaries.samsung_sales || {}
   const relianceSalesSummary = summaries.reliance_sales || {}
   const godrejSalesSummary = summaries.godrej_sales || {}
+  const hitachiSalesSummary = summaries.hitachi_sales || {}
 
   const relianceClaimsSummary = summaries.reliance_claims || {}
   const godrejClaimsSummary = summaries.godrej_claims || {}
+  const hitachiClaimsSummary = summaries.hitachi_claims || {}
 
   const relianceGrossRows = Array.isArray(rows.reliance_gross) ? rows.reliance_gross : []
   const relianceEarnedRows = Array.isArray(rows.reliance_earned) ? rows.reliance_earned : []
@@ -347,11 +364,15 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
   const godrejGrossRows = Array.isArray(rows.godrej_gross) ? rows.godrej_gross : []
   const godrejEarnedRows = Array.isArray(rows.godrej_earned) ? rows.godrej_earned : []
   const godrejZopperRows = Array.isArray(rows.godrej_zopper) ? rows.godrej_zopper : []
+  const hitachiGrossRows = Array.isArray(rows.hitachi_gross) ? rows.hitachi_gross : []
+  const hitachiEarnedRows = Array.isArray(rows.hitachi_earned) ? rows.hitachi_earned : []
+  const hitachiZopperRows = Array.isArray(rows.hitachi_zopper) ? rows.hitachi_zopper : []
 
   const relianceClaimsRows = Array.isArray(rows.reliance_claims) ? rows.reliance_claims : []
   const godrejClaimsRows = Array.isArray(rows.godrej_claims) ? rows.godrej_claims : []
+  const hitachiClaimsRows = Array.isArray(rows.hitachi_claims) ? rows.hitachi_claims : []
 
-  const samsungPartnerSnapshots = SAMSUNG_PARTNERS.map((partner) => {
+  const samsungPartnerSnapshots = VISIBLE_SAMSUNG_PARTNERS.map((partner) => {
     const prefix = SAMSUNG_MASTER_PREFIX[partner.key]
     return {
       partner,
@@ -397,13 +418,29 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
     claims: toMonthlySeries(godrejClaimsRows, "claims"),
   })
 
+  const hitachiSalesRows = mergeSeries({
+    gross: toMonthlySeries(hitachiGrossRows, "gross_premium"),
+    earned: toMonthlySeries(hitachiEarnedRows, "earned_premium"),
+    zopper: toMonthlySeries(hitachiZopperRows, "zopper_earned_premium"),
+  })
+
+  const hitachiClaimsChartRows = mergeSeries({
+    claims: toMonthlySeries(hitachiClaimsRows, "claims"),
+  })
+
   const samsungKpisBase = samsungPartnerSnapshots.reduce(
     (acc, snapshot) => addKpis(acc, toKpis(snapshot.salesSummary as Summary, snapshot.claimsSummary as Summary)),
     EMPTY_KPIS
   )
 
-  const samsungSummaryEarned = asNumber((samsungSalesSummary as Summary)?.earned_premium)
-  const samsungSummaryZopper = asNumber((samsungSalesSummary as Summary)?.zopper_earned_premium)
+  const samsungSummaryEarned = samsungPartnerSnapshots.reduce(
+    (sum, snapshot) => sum + asNumber((snapshot.salesSummary as Summary)?.earned_premium),
+    0
+  )
+  const samsungSummaryZopper = samsungPartnerSnapshots.reduce(
+    (sum, snapshot) => sum + asNumber((snapshot.salesSummary as Summary)?.zopper_earned_premium),
+    0
+  )
   const samsungEarnedFromRows = samsungPartnerSnapshots.reduce(
     (sum, snapshot) => sum + sumSeriesValues(samsungSalesSeries[`${snapshot.prefix}_earned`]),
     0
@@ -431,13 +468,15 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
 
   const relianceKpis = toKpis(relianceSalesSummary as Summary, relianceClaimsSummary as Summary)
   const godrejKpis = toKpis(godrejSalesSummary as Summary, godrejClaimsSummary as Summary)
-  const totals = addKpis(addKpis(samsungKpis, relianceKpis), godrejKpis)
+  const hitachiKpis = toKpis(hitachiSalesSummary as Summary, hitachiClaimsSummary as Summary)
+  const totals = addKpis(addKpis(addKpis(samsungKpis, relianceKpis), godrejKpis), hitachiKpis)
 
   return {
     totals,
     samsung: { kpis: samsungKpis, salesRows: samsungSalesRows, claimsRows: samsungClaimsChartRows },
     reliance: { kpis: relianceKpis, salesRows: relianceSalesRows, claimsRows: relianceClaimsChartRows },
     godrej: { kpis: godrejKpis, salesRows: godrejSalesRows, claimsRows: godrejClaimsChartRows },
+    hitachi: { kpis: hitachiKpis, salesRows: hitachiSalesRows, claimsRows: hitachiClaimsChartRows },
   }
 }
 
@@ -530,10 +569,11 @@ export default function MasterDashboardView({
   const [draftToDate, setDraftToDate] = useState("")
   const [localRefreshTick, setLocalRefreshTick] = useState(0)
   const lastAutoSyncKeyRef = useRef("")
+  const prefersReducedMotion = useReducedMotion()
 
   const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
   const maxPickerDate = useMemo(
-    () => (defaultToDate ? (defaultToDate > todayIso ? todayIso : defaultToDate) : todayIso),
+    () => (defaultToDate || todayIso),
     [defaultToDate, todayIso]
   )
   const orderedExternalRange = useMemo(() => {
@@ -583,13 +623,14 @@ export default function MasterDashboardView({
     let isCancelled = false
 
     const bootstrap = async () => {
-      const payload = await loadMasterData(undefined, todayIso)
+      const payload = await loadMasterData()
       if (isCancelled || !payload) {
         return
       }
       const min = String(payload.date_bounds?.min_date || "").trim()
-      const max = todayIso
-      const effectiveMin = min
+      const rawMax = String(payload.date_bounds?.max_date || "").trim()
+      const max = rawMax || todayIso
+      const effectiveMin = min && min <= max ? min : ""
 
       setDefaultFromDate(effectiveMin)
       setDefaultToDate(max)
@@ -677,10 +718,25 @@ export default function MasterDashboardView({
     await loadMasterData(defaultFromDate || undefined, defaultToDate || undefined)
   }
 
-  const samsungSeriesMeta = SAMSUNG_PARTNERS.map((partner) => ({
+  const samsungSeriesMeta = VISIBLE_SAMSUNG_PARTNERS.map((partner) => ({
     ...partner,
     prefix: SAMSUNG_MASTER_PREFIX[partner.key],
   }))
+  const showSamsungClaimsChart = Boolean(
+    data && hasChartSignal(data.samsung.claimsRows, samsungSeriesMeta.map((series) => `${series.prefix}_claims`))
+  )
+  const showRelianceClaimsChart = Boolean(
+    data && hasChartSignal(data.reliance.claimsRows, ["claims"])
+  )
+  const showGodrejClaimsChart = Boolean(
+    data && hasChartSignal(data.godrej.claimsRows, ["claims"])
+  )
+  const showHitachiPremiumChart = Boolean(
+    data && hasChartSignal(data.hitachi.salesRows, ["gross", "earned", "zopper"])
+  )
+  const showHitachiClaimsChart = Boolean(
+    data && hasChartSignal(data.hitachi.claimsRows, ["claims"])
+  )
 
   const renderChart = useCallback(
     (chartId: ExpandableChartId, expanded = false) => {
@@ -726,6 +782,7 @@ export default function MasterDashboardView({
                     name={`${series.shortLabel} Gross Premium`}
                     stroke={series.color}
                     strokeWidth={2.4}
+                    isAnimationActive={!prefersReducedMotion}
                     dot={<ArrowPointDot />}
                     activeDot={{ r: 5 }}
                   />
@@ -754,6 +811,7 @@ export default function MasterDashboardView({
                     name={`${series.shortLabel} Claims Cost`}
                     stroke={series.color}
                     strokeWidth={2.4}
+                    isAnimationActive={!prefersReducedMotion}
                     dot={<ArrowPointDot />}
                     activeDot={{ r: 5 }}
                   />
@@ -774,9 +832,9 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -793,7 +851,7 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -810,31 +868,71 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
         )
       }
 
-      return (
-        <div style={{ height: chartHeight }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data.godrej.claimsRows}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#dbe5f2" />
-              <XAxis dataKey="month" tick={{ fontSize: 11 }} />
-              <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
-              <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
-              <Legend />
-              <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      )
+      if (chartId === "godrej-claims") {
+        return (
+          <div style={{ height: chartHeight }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data.godrej.claimsRows}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#dbe5f2" />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
+                <Legend />
+                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )
+      }
+
+      if (chartId === "hitachi-premium") {
+        return (
+          <div style={{ height: chartHeight }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data.hitachi.salesRows}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#dbe5f2" />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
+                <Legend />
+                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )
+      }
+
+      if (chartId === "hitachi-claims") {
+        return (
+          <div style={{ height: chartHeight }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={data.hitachi.claimsRows}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#dbe5f2" />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
+                <Legend />
+                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )
+      }
+
+      return null
     },
-    [data, samsungSeriesMeta]
+    [data, samsungSeriesMeta, prefersReducedMotion]
   )
 
   return (
@@ -890,8 +988,8 @@ export default function MasterDashboardView({
         {!loading && !error && data && (
           <div className="space-y-6">
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-              <KpiStrip title="Samsung KPI (Vijay Sales + Croma + Reliance Digital)" values={data.samsung.kpis} showTotalLossRatio />
-              <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <KpiStrip title="Samsung KPI (Vijay Sales + Croma + Croma DS/DSG + Reliance Digital)" values={data.samsung.kpis} showTotalLossRatio />
+              <div className={`mt-4 grid grid-cols-1 gap-4 ${showSamsungClaimsChart ? "lg:grid-cols-2" : ""}`}>
                 <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                   <div className="mb-2 flex items-center justify-between gap-3">
                     <div className="text-xs font-bold text-slate-700">Samsung Premium Trend (Gross Scale)</div>
@@ -909,28 +1007,30 @@ export default function MasterDashboardView({
                   {renderChart("samsung-premium")}
                 </div>
 
-                <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <div className="text-xs font-bold text-slate-700">Samsung Claims Cost Trend</div>
-                    <button
-                      type="button"
-                      onClick={() => setExpandedChart("samsung-claims")}
-                      className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
-                    >
-                      <span className="inline-flex items-center gap-1">
-                        <Maximize2 className="h-3.5 w-3.5" />
-                        Expand
-                      </span>
-                    </button>
+                {showSamsungClaimsChart && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-xs font-bold text-slate-700">Samsung Claims Cost Trend</div>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedChart("samsung-claims")}
+                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <Maximize2 className="h-3.5 w-3.5" />
+                          Expand
+                        </span>
+                      </button>
+                    </div>
+                    {renderChart("samsung-claims")}
                   </div>
-                  {renderChart("samsung-claims")}
-                </div>
+                )}
               </div>
             </section>
 
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
               <KpiStrip title="Reliance ResQ KPI" values={data.reliance.kpis} showTotalLossRatio />
-              <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <div className={`mt-4 grid grid-cols-1 gap-4 ${showRelianceClaimsChart ? "lg:grid-cols-2" : ""}`}>
                 <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                   <div className="mb-2 flex items-center justify-between gap-3">
                     <div className="text-xs font-bold text-slate-700">Reliance Premium Trend</div>
@@ -948,28 +1048,30 @@ export default function MasterDashboardView({
                   {renderChart("reliance-premium")}
                 </div>
 
-                <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <div className="text-xs font-bold text-slate-700">Reliance Claims Cost Trend</div>
-                    <button
-                      type="button"
-                      onClick={() => setExpandedChart("reliance-claims")}
-                      className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
-                    >
-                      <span className="inline-flex items-center gap-1">
-                        <Maximize2 className="h-3.5 w-3.5" />
-                        Expand
-                      </span>
-                    </button>
+                {showRelianceClaimsChart && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-xs font-bold text-slate-700">Reliance Claims Cost Trend</div>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedChart("reliance-claims")}
+                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <Maximize2 className="h-3.5 w-3.5" />
+                          Expand
+                        </span>
+                      </button>
+                    </div>
+                    {renderChart("reliance-claims")}
                   </div>
-                  {renderChart("reliance-claims")}
-                </div>
+                )}
               </div>
             </section>
 
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
               <KpiStrip title="Godrej KPI" values={data.godrej.kpis} showTotalLossRatio />
-              <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <div className={`mt-4 grid grid-cols-1 gap-4 ${showGodrejClaimsChart ? "lg:grid-cols-2" : ""}`}>
                 <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                   <div className="mb-2 flex items-center justify-between gap-3">
                     <div className="text-xs font-bold text-slate-700">Godrej Premium Trend</div>
@@ -987,22 +1089,67 @@ export default function MasterDashboardView({
                   {renderChart("godrej-premium")}
                 </div>
 
-                <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <div className="text-xs font-bold text-slate-700">Godrej Claims Cost Trend</div>
-                    <button
-                      type="button"
-                      onClick={() => setExpandedChart("godrej-claims")}
-                      className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
-                    >
-                      <span className="inline-flex items-center gap-1">
-                        <Maximize2 className="h-3.5 w-3.5" />
-                        Expand
-                      </span>
-                    </button>
+                {showGodrejClaimsChart && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-xs font-bold text-slate-700">Godrej Claims Cost Trend</div>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedChart("godrej-claims")}
+                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <Maximize2 className="h-3.5 w-3.5" />
+                          Expand
+                        </span>
+                      </button>
+                    </div>
+                    {renderChart("godrej-claims")}
                   </div>
-                  {renderChart("godrej-claims")}
-                </div>
+                )}
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+              <KpiStrip title="Hitachi KPI" values={data.hitachi.kpis} showTotalLossRatio />
+              <div className={`mt-4 grid grid-cols-1 gap-4 ${showHitachiClaimsChart ? "lg:grid-cols-2" : ""}`}>
+                {showHitachiPremiumChart && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-xs font-bold text-slate-700">Hitachi Premium Trend</div>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedChart("hitachi-premium")}
+                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <Maximize2 className="h-3.5 w-3.5" />
+                          Expand
+                        </span>
+                      </button>
+                    </div>
+                    {renderChart("hitachi-premium")}
+                  </div>
+                )}
+
+                {showHitachiClaimsChart && (
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div className="text-xs font-bold text-slate-700">Hitachi Claims Cost Trend</div>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedChart("hitachi-claims")}
+                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-100"
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <Maximize2 className="h-3.5 w-3.5" />
+                          Expand
+                        </span>
+                      </button>
+                    </div>
+                    {renderChart("hitachi-claims")}
+                  </div>
+                )}
               </div>
             </section>
           </div>

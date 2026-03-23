@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$serverIP = "43.205.134.36"
+$serverIP = "13.235.56.166"
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
 $remoteUser = "ubuntu"
 $remotePath = "/home/ubuntu/live-dashboard"
@@ -60,10 +60,10 @@ services:
     build:
       context: ./frontend/my-app
       args:
-        NEXT_PUBLIC_API_BASE: http://43.205.134.36:8000
+        NEXT_PUBLIC_API_BASE: http://13.235.56.166:8000
     image: live-dashboard-frontend:latest
     environment:
-      NEXT_PUBLIC_API_BASE: http://43.205.134.36:8000
+      NEXT_PUBLIC_API_BASE: http://13.235.56.166:8000
     ports:
       - "3000:3000"
     depends_on:

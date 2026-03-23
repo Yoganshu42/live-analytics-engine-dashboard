@@ -65,6 +65,8 @@ def _source_variants(source: str) -> list[str]:
         return ["samsung_vs", "samsung_vijay_sales"]
     if samsung_source in SAMSUNG_PARTNER_SOURCES:
         return [samsung_source]
+    if key == "hitachi":
+        return ["hitachi"]
     if key in {"reliance", "reliance_resq", "reliance-resq", "reliance resq", "resq"}:
         return ["reliance"]
     if key in {"godrej", "goodrej", "goddrej"}:
@@ -81,6 +83,8 @@ def _partners_for_source(source: str) -> set[str]:
         return {"samsung_vs"}
     if samsung_source in SAMSUNG_PARTNER_SOURCES:
         return {samsung_source}
+    if key == "hitachi":
+        return {"hitachi"}
     if key in {"reliance", "reliance_resq", "reliance-resq", "reliance resq", "resq"}:
         return {"reliance"}
     if key in {"godrej", "goodrej", "goddrej"}:

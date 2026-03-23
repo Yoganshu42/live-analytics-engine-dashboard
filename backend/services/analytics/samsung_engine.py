@@ -318,7 +318,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         src = (self.source or "").strip().lower()
         # Partner-specific queries already scope rows at source level; do not
         # rely on marketplace text because vendor files are often inconsistent.
-        if src in {"samsung_vs", "samsung_vijay_sales", "samsung_croma", "samsung_reliance_digital"}:
+        if src in SAMSUNG_PARTNER_SOURCES or src == "samsung_vijay_sales":
             return df
         is_vs = ("vijay" in src) or src in {"samsung_vs", "samsung_vijay_sales"}
         is_croma = "croma" in src
@@ -359,7 +359,7 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
         if df.empty or "Month" not in df.columns:
             return df
         src = (self.source or "").strip().lower()
-        if src != "samsung_croma":
+        if not src.startswith("samsung_croma"):
             return df
 
         month_key = pd.to_datetime(df["Month"], errors="coerce").dt.to_period("M").dt.to_timestamp()
@@ -1299,6 +1299,15 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
             ],
             "plan_category": ["Plan_Category", "Plan Category"],
             "device_plan_category": ["Device_Plan_Category", "Device Plan Category"],
+            "model_code": [
+                "Model Code",
+                "Model Code-1",
+                "Model",
+                "Product_Category",
+                "Product Category",
+                "Product Description",
+                "Plan_Product",
+            ],
         }
 
         def _norm(s: str) -> str:
@@ -1370,6 +1379,16 @@ class SamsungAnalyticsEngine(BaseAnalyticsEngine):
                     model_ref = df[model_col] if model_ref is None else model_ref.fillna(df[model_col])
             df = df.copy()
             df[dim] = self._canonicalize_device_plan_category(df[dim], model_ref)
+        elif dim_key == "model_code" and dim in df.columns:
+            df = df.copy()
+            cleaned_model = self._clean_text_series(df[dim])
+            cleaned_model = (
+                cleaned_model.astype("string")
+                .str.replace(r"\|\|.*$", "", regex=True)
+                .str.replace(r"\s+", " ", regex=True)
+                .str.strip()
+            )
+            df[dim] = cleaned_model.replace({"": pd.NA})
 
         if dim_key == "month":
             if self.dataset_type == "claims":

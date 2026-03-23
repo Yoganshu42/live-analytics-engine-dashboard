@@ -31,6 +31,8 @@ def _source_variants(source: str | None) -> list[str]:
     if source_key in {"godrej", "goodrej", "goddrej"}:
         # Legacy uploads contain mixed spellings for Godrej.
         return ["godrej", "goodrej", "goddrej"]
+    if source_key == "hitachi":
+        return ["hitachi"]
     if source_key in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
         # Keep legacy Reliance ResQ aliases readable without forcing a migration first.
         return ["reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"]
@@ -65,6 +67,8 @@ def invalidate_dataframe_cache(
                 src_values = {"samsung_vs", "samsung_vijay_sales"}
             elif samsung_source in SAMSUNG_PARTNER_SOURCES:
                 src_values = {samsung_source}
+            elif src == "hitachi":
+                src_values = {"hitachi"}
             elif src in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
                 src_values = {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}
             elif src in {"godrej", "goodrej", "goddrej"}:

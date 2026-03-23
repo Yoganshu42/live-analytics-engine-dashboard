@@ -16,6 +16,7 @@ type Props = {
 }
 
 type PresetKey =
+  | "last_week"
   | "this_month"
   | "last_month"
   | "last_6_months"
@@ -23,6 +24,7 @@ type PresetKey =
   | "since_inception"
 
 const PRESETS: Array<{ key: PresetKey; label: string }> = [
+  { key: "last_week", label: "Last Week" },
   { key: "this_month", label: "This Month" },
   { key: "last_month", label: "Last Month" },
   { key: "last_6_months", label: "Last 6 Months" },
@@ -162,13 +164,17 @@ export default function DateRangePicker({
   }, [minBound, maxBound, visibleMonth])
 
   const handlePreset = (preset: PresetKey) => {
-    // If data starts in the future (relative to today), anchor presets to the
-    // first available date so preset ranges do not collapse to an empty day.
-    const base = clampDate(today, minBound, maxBound)
+    // Anchor quick ranges to the latest available data date when the caller
+    // provides one, so future-valid datasets (for example warranty start views)
+    // do not get silently cut back to today.
+    const base = maxBound || clampDate(today, minBound, maxBound)
     let from = base
     let to = base
 
-    if (preset === "last_6_months") {
+    if (preset === "last_week") {
+      from = addDays(base, -6)
+      to = base
+    } else if (preset === "last_6_months") {
       const sixMonthsBack = addMonths(base, -5)
       from = startOfMonth(sixMonthsBack)
       to = base

@@ -4,8 +4,6 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import {
   Bot,
-  Download,
-  FileUp,
   Loader2,
   Maximize2,
   MessageCircle,
@@ -15,14 +13,16 @@ import {
 } from "lucide-react"
 import {
   sendChatbotMessage,
-  transformChatbotFile,
+  type ChatbotChart,
   type ChatbotTurn,
 } from "@/app/lib/api"
+import ChatbotGeneratedChart from "@/components/ChatbotGeneratedChart"
 import { normalizeSamsungSource } from "@/lib/samsungPartners"
 
 type ChatMessage = {
   role: "user" | "assistant"
   content: string
+  chart?: ChatbotChart
 }
 
 type Props = {
@@ -36,16 +36,8 @@ type AssistantBlock =
 
 const INITIAL_ASSISTANT_MESSAGE: ChatMessage = {
   role: "assistant",
-  content: "AI Sahyogi is ready. Ask dashboard questions, or upload a CSV/XLS/XLSX file and tell me what to fill.",
+  content: "AI Sahyogi is ready. Ask dashboard questions or ask for a chart and I will generate it here.",
 }
-
-const FILE_INSTRUCTION_EXAMPLES = [
-  "keep rows from 2025-01-01 to 2025-03-31",
-  "Plan Price will be Total Billing Amount",
-  "Brand is Article_Brand",
-  "fill missing Plan Category with ADLD",
-  "remove duplicates from column Item_Serial_Number",
-]
 
 const normalizeDate = (value: string) => {
   const cleaned = (value || "").trim()
@@ -196,11 +188,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_ASSISTANT_MESSAGE])
   const [input, setInput] = useState("")
   const [isSending, setIsSending] = useState(false)
-  const [isTransforming, setIsTransforming] = useState(false)
-  const [transformFile, setTransformFile] = useState<File | null>(null)
-  const [downloadUrl, setDownloadUrl] = useState("")
-  const [downloadName, setDownloadName] = useState("")
-  const [transformSummary, setTransformSummary] = useState("")
 
   const cardListRef = useRef<HTMLDivElement | null>(null)
   const panelListRef = useRef<HTMLDivElement | null>(null)
@@ -236,15 +223,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [isExpanded])
-
-  useEffect(() => {
-    return () => {
-      if (downloadUrl) {
-        URL.revokeObjectURL(downloadUrl)
-      }
-    }
-  }, [downloadUrl])
-
   useEffect(() => {
     if (typeof window === "undefined") return
 
@@ -265,13 +243,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
       contextKeyRef.current = nextKey
       setMessages([INITIAL_ASSISTANT_MESSAGE])
       setInput("")
-      setTransformFile(null)
-      setTransformSummary("")
-      setDownloadName("")
-      setDownloadUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev)
-        return ""
-      })
     }
 
     contextKeyRef.current = readContextKey()
@@ -300,8 +271,8 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
     setIsExpanded(true)
   }
 
-  const appendAssistantMessage = (content: string) => {
-    setMessages((prev) => [...prev, { role: "assistant", content }])
+  const appendAssistantMessage = (content: string, chart?: ChatbotChart) => {
+    setMessages((prev) => [...prev, { role: "assistant", content, chart }])
   }
 
   const getAuthToken = () =>
@@ -316,7 +287,7 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
 
   const sendChatMessage = async () => {
     const text = input.trim()
-    if (!text || isSending || isTransforming) return
+    if (!text || isSending) return
 
     setInput("")
     setMessages((prev) => [...prev, { role: "user", content: text }])
@@ -328,7 +299,7 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
     setIsSending(true)
     try {
       const compactText = text.replace(/\s+/g, " ").trim()
-      const maxTokens = Math.max(900, Math.min(4096, Math.ceil(compactText.length * 4.5)))
+      const maxTokens = Math.max(1400, Math.min(4096, Math.ceil(compactText.length * 6)))
 
       const useJobFilter =
         typeof window !== "undefined" && localStorage.getItem("use_job_filter") === "1"
@@ -362,7 +333,7 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
         ui_context: buildUiContextSnapshot(),
       })
       const reply = (result.response || "").trim() || "No response generated."
-      appendAssistantMessage(reply)
+      appendAssistantMessage(reply, result.chart)
     } catch (err) {
       const detail =
         err instanceof Error
@@ -371,51 +342,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
       appendAssistantMessage(detail)
     } finally {
       setIsSending(false)
-    }
-  }
-
-  const applyFileInstruction = async () => {
-    const instruction = input.trim()
-    if (!transformFile || !instruction || isTransforming || isSending) return
-
-    setMessages((prev) => [...prev, { role: "user", content: `File task: ${instruction}` }])
-    setInput("")
-
-    if (!ensureAuthorized()) {
-      return
-    }
-
-    const source = normalizeSource(
-      typeof window !== "undefined" ? localStorage.getItem("dashboard_brand") || "" : ""
-    )
-    const datasetType = normalizeDatasetType(
-      typeof window !== "undefined" ? localStorage.getItem("dashboard_mode") || "" : ""
-    )
-
-    setIsTransforming(true)
-    try {
-      const result = await transformChatbotFile({
-        file: transformFile,
-        instruction,
-        source: source || undefined,
-        dataset_type: datasetType,
-      })
-
-      if (downloadUrl) {
-        URL.revokeObjectURL(downloadUrl)
-      }
-      const nextUrl = URL.createObjectURL(result.blob)
-      setDownloadUrl(nextUrl)
-      setDownloadName(result.filename)
-      setTransformSummary(result.summary || "File updated successfully.")
-      appendAssistantMessage(
-        `${result.summary || "File updated."} Download is ready below as ${result.filename}.`
-      )
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : "Failed to update the uploaded file."
-      appendAssistantMessage(detail)
-    } finally {
-      setIsTransforming(false)
     }
   }
 
@@ -566,6 +492,7 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
                             </ul>
                           )
                         })}
+                        {message.chart ? <ChatbotGeneratedChart chart={message.chart} /> : null}
                       </div>
                     )}
                   </div>
@@ -586,125 +513,30 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
               </div>
             </div>
           )}
-          {isTransforming && (
-            <div className="flex w-full justify-start">
-              <div className="flex items-end gap-2">
-                <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-cyan-100 bg-cyan-50 text-cyan-700">
-                  <FileUp size={14} />
-                </span>
-                <div className="inline-flex items-center gap-2 rounded-2xl rounded-bl-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm">
-                  <Loader2 size={14} className="animate-spin" />
-                  Updating file...
-                </div>
-              </div>
-            </div>
-          )}
         </div>
 
         <div className={`border-t border-slate-200/80 bg-white/95 ${isFullMode ? "p-3 sm:p-4" : "p-3"}`}>
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50">
-              <FileUp size={13} />
-              {transformFile ? "Change File" : "Upload File"}
-              <input
-                type="file"
-                accept=".csv,.xlsx,.xls"
-                className="hidden"
-                onChange={(event) => {
-                  const next = event.target.files?.[0] || null
-                  setTransformFile(next)
-                  setDownloadName("")
-                  setTransformSummary("")
-                  if (downloadUrl) {
-                    URL.revokeObjectURL(downloadUrl)
-                    setDownloadUrl("")
-                  }
-                }}
-              />
-            </label>
-            {transformFile && (
-              <button
-                type="button"
-                onClick={() => {
-                  setTransformFile(null)
-                  setDownloadName("")
-                  setTransformSummary("")
-                  if (downloadUrl) {
-                    URL.revokeObjectURL(downloadUrl)
-                    setDownloadUrl("")
-                  }
-                }}
-                className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
-              >
-                Clear
-              </button>
-            )}
-            {transformFile && (
-              <span className="truncate text-[11px] text-slate-500" title={transformFile.name}>
-                {transformFile.name}
-              </span>
-            )}
-          </div>
-          {transformFile && (
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              {FILE_INSTRUCTION_EXAMPLES.map((example) => (
-                <button
-                  key={example}
-                  type="button"
-                  onClick={() => setInput(example)}
-                  className="rounded-full border border-cyan-200 bg-cyan-50 px-2 py-1 text-[10px] font-semibold text-cyan-800 hover:bg-cyan-100"
-                  title={example}
-                >
-                  {example}
-                </button>
-              ))}
-            </div>
-          )}
-
           <div className="flex items-end gap-2">
             <textarea
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onInputKeyDown}
               rows={isFullMode ? 3 : 2}
-              placeholder={transformFile ? "Describe what to fill in the uploaded file..." : "Ask about dashboard insights..."}
+              placeholder="Ask about dashboard insights or request a chart..."
               className="min-h-[44px] flex-1 resize-none rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none ring-indigo-500 transition focus:border-indigo-300 focus:ring-2"
             />
             <button
               type="button"
               onClick={() => void sendChatMessage()}
-              disabled={!input.trim() || isSending || isTransforming}
+              disabled={!input.trim() || isSending}
               className={`flex items-center justify-center rounded-xl bg-indigo-600 text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 ${isFullMode ? "h-11 w-11" : "h-10 w-10"}`}
               aria-label="Send message"
             >
               <Send size={15} />
             </button>
-            <button
-              type="button"
-              onClick={() => void applyFileInstruction()}
-              disabled={!transformFile || !input.trim() || isSending || isTransforming}
-              className={`flex items-center justify-center rounded-xl bg-cyan-600 px-3 text-white transition hover:bg-cyan-700 disabled:cursor-not-allowed disabled:opacity-50 ${isFullMode ? "h-11" : "h-10"}`}
-              aria-label="Apply instruction to file"
-              title="Apply instruction to uploaded file"
-            >
-              <FileUp size={14} />
-            </button>
           </div>
-          {downloadUrl && downloadName && (
-            <a
-              href={downloadUrl}
-              download={downloadName}
-              className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
-            >
-              <Download size={13} />
-              Download Updated File
-            </a>
-          )}
-          {transformSummary && (
-            <p className="mt-2 text-[11px] font-medium text-slate-500">{transformSummary}</p>
-          )}
           <p className="mt-2 text-[11px] font-medium text-slate-400">
-            Press Enter to send chat. Upload a file and click the cyan button to apply your fill instruction.
+            Press Enter to send. Ask for an overall answer, or name a partner/reference for a focused reply. Ask for a graph to render one here.
           </p>
         </div>
       </aside>

@@ -1,0 +1,66 @@
+Amount
+Appliance Model Name
+Brand
+Brand Warranty Duration
+Business ID
+Business Name
+Channel
+Channel Share %
+City
+Customer Premium
+Customer_City
+Customer_State
+Date
+Device Plan Category
+Device_Plan_Category
+Distributor ID
+Distributor Name
+End Date
+End_Date
+Godrej Share %
+Gross Premium
+Insured_Company
+Insured_Status
+Invoice_Number
+Model Code
+Month
+Month Name
+Month_Name
+Payment_Status
+Plan Category
+Plan End Date
+Plan Selling Price
+Plan Start Date
+Plan_Category
+Product Category
+Product Purchased Date
+Product_Category
+Product_Category_ID
+Product_Coverage
+Product_Serial_Number
+Retail Premium
+Retailer Premium
+Start Date
+Start_Date
+State
+Store ID
+Store Name
+Store Type
+Warranty Activation Code
+Warranty End Date
+Warranty Purchase Date
+Warranty Serial No.
+Warranty Start Date
+Warranty Status
+Warranty Type
+Warranty Verified
+Warranty_Mode
+Zopper Plan Duration
+Zopper Share %
+display_plan_name
+los_number
+model_code
+parent_channel
+payment_mode
+sla_number
+source

@@ -1,6 +1,7 @@
 export type SamsungPartnerKey =
   | "samsung_vs"
   | "samsung_croma"
+  | "samsung_croma_dsdsg"
   | "samsung_reliance_digital"
 
 export type SamsungPartnerConfig = {
@@ -25,9 +26,17 @@ export const SAMSUNG_PARTNERS: readonly SamsungPartnerConfig[] = [
     key: "samsung_croma",
     label: "Samsung Croma",
     shortLabel: "Croma",
-    cardLabel: "Samsung Croma",
+    cardLabel: "Croma",
     logo: "/croma_logo.jpg",
     color: "#0ea5a4",
+  },
+  {
+    key: "samsung_croma_dsdsg",
+    label: "Samsung Croma DSDSG",
+    shortLabel: "Croma DSDSG",
+    cardLabel: "Croma DSDSG",
+    logo: "/croma_logo.jpg",
+    color: "#14b8a6",
   },
   {
     key: "samsung_reliance_digital",
@@ -39,7 +48,16 @@ export const SAMSUNG_PARTNERS: readonly SamsungPartnerConfig[] = [
   },
 ] as const
 
-export const SAMSUNG_PARTNER_KEYS = SAMSUNG_PARTNERS.map((partner) => partner.key)
+export const VISIBLE_SAMSUNG_PARTNERS = SAMSUNG_PARTNERS.filter(
+  (partner) => partner.key !== "samsung_croma_dsdsg"
+)
+
+export const SAMSUNG_PARTNER_KEYS: readonly SamsungPartnerKey[] = [
+  "samsung_vs",
+  "samsung_croma",
+  "samsung_croma_dsdsg",
+  "samsung_reliance_digital",
+]
 
 export const normalizeSamsungSource = (value: string) => {
   const key = (value || "").trim().toLowerCase()
@@ -47,7 +65,26 @@ export const normalizeSamsungSource = (value: string) => {
   if (key === "samsung_vs" || key === "samsung vs" || key === "samsung vijay sales" || key === "vijay sales") {
     return "samsung_vs"
   }
-  if (key === "samsung_croma" || key === "samsung croma" || key === "croma") {
+  if (
+    key === "samsung_croma"
+    || key === "samsung croma"
+    || key === "croma"
+    || key === "samsung protect max"
+    || key === "samsung protect max croma"
+    || key === "protect max"
+    || key === "protect max croma"
+    || key === "croma protect max"
+    || key === "samsung_croma_dsdsg"
+    || key === "samsung croma dsdsg"
+    || key === "samsung croma ds dsg"
+    || key === "samsung_croma_ds_dsg"
+    || key === "croma ds dsg"
+    || key === "croma ds/dsg"
+    || key === "dsdsg"
+    || key === "ds dsg"
+    || key === "ds/dsg"
+    || key === "ds-dsg"
+  ) {
     return "samsung_croma"
   }
   if (

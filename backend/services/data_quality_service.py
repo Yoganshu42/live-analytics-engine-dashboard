@@ -14,12 +14,14 @@ def _clean_key(value: Any) -> str:
 
 def _normalize_source(source: str) -> str:
     key = _clean_key(source)
-    if key in {"samsungvs", "samsungvijaysales", "samsungcroma", "samsungreliancedigital", "reliancedigital", "samsung"}:
+    if key.startswith("samsung") or key in {"samsungvs", "samsungvijaysales", "samsungcroma", "samsungreliancedigital", "reliancedigital"}:
         return "samsung"
     if key in {"relianceresq", "reliance", "resq"}:
         return "reliance"
     if key in {"godrej", "goodrej", "goddrej"}:
         return "godrej"
+    if key == "hitachi":
+        return "hitachi"
     return key
 
 
@@ -136,6 +138,24 @@ SOURCE_KEY_CANDIDATES: dict[str, dict[str, list[str]]] = {
             "Reference Number",
         ],
     },
+    "hitachi": {
+        "sales": [
+            "Plan ID",
+            "Policy Number",
+            "Contract ID",
+            "Invoice Number",
+            "Order ID",
+        ],
+        "claims": [
+            "Call No",
+            "Care+ Plan ID",
+            "Claim ID",
+            "Claim Number",
+            "Case ID",
+            "Ticket ID",
+            "Reference Number",
+        ],
+    },
 }
 
 
@@ -150,7 +170,7 @@ def get_primary_key_candidate_order(*, source: str, dataset_type: str) -> list[s
 def _classify_key_role(dataset_type: str, column_name: str | None) -> str:
     norm = _clean_key(column_name or "")
     if dataset_type == "claims":
-        if "claim" in norm:
+        if any(token in norm for token in ("claim", "case", "ticket", "reference", "complaint", "sr", "call", "careplan")):
             return "claim_id"
         return "claim_key_fallback"
     if "plan" in norm or "policy" in norm:
@@ -192,6 +212,8 @@ COMPOSITE_KEY_SUPPORT_CANDIDATES: dict[str, list[str]] = {
         "Claim Date",
         "Date",
         "Month",
+        "Call No",
+        "Care+ Plan ID",
         "Case ID",
         "Ticket ID",
         "Reference Number",

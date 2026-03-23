@@ -207,6 +207,43 @@ const normalizeDimValue = (value: unknown, dimKey: string) => {
   return raw
 }
 
+const FILTERED_LABEL_DIMENSIONS = new Set([
+  "state",
+  "region",
+  "channel",
+  "product_category",
+  "product_subcategory",
+  "plan_category",
+  "device_plan_category",
+  "article_brand",
+  "brand",
+])
+
+const UNKNOWN_LIKE_LABELS = new Set([
+  "",
+  "0",
+  "unknown",
+  "nan",
+  "none",
+  "null",
+  "na",
+  "other",
+  "others",
+])
+
+const shouldFilterDimensionLabels = (dimKey: string) => {
+  const safe = toSafeKey(dimKey)
+  if (FILTERED_LABEL_DIMENSIONS.has(safe)) return true
+  return Array.from(FILTERED_LABEL_DIMENSIONS).some((candidate) => safe.includes(candidate))
+}
+
+const isRelatableDimensionLabel = (value: unknown) => {
+  const label = String(value ?? "").trim()
+  if (!label) return false
+  const compact = label.toLowerCase().replace(/[^a-z0-9]/g, "")
+  return !UNKNOWN_LIKE_LABELS.has(compact)
+}
+
 const DIMENSION_ALIASES: Record<string, string[]> = {
   plan_category: ["device_plan_category"],
   device_plan_category: ["plan_category"],
@@ -250,6 +287,11 @@ const mergeRowsByDimension = (rows: Row[], dimKey: string): Row[] => {
     })
   })
   return Array.from(merged.values())
+}
+
+const filterRelatableRows = (rows: Row[], dimKey: string): Row[] => {
+  if (!shouldFilterDimensionLabels(dimKey)) return rows
+  return rows.filter((row) => isRelatableDimensionLabel(row[dimKey]))
 }
 
 const LOG_PLOT_SUFFIX = "__log_plot"
@@ -372,7 +414,7 @@ type FetchRowsResult = {
   usedRangeFallback?: boolean
 }
 
-const GRAPH_RESULT_TTL_MS = 300000
+const GRAPH_RESULT_TTL_MS = 30000
 const graphResultCache = new Map<string, { expiresAt: number; value: FetchRowsResult }>()
 const graphInFlight = new Map<string, Promise<FetchRowsResult>>()
 
@@ -431,7 +473,11 @@ const API_FALLBACKS = Array.from(
       .filter(Boolean)
   )
 )
-const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
+const API_REQUEST_TIMEOUT_MS = Number(
+  process.env.NEXT_PUBLIC_ANALYTICS_TIMEOUT_MS
+  || process.env.NEXT_PUBLIC_API_TIMEOUT_MS
+  || 60000
+)
 let preferredApiBase = API_FALLBACKS[0] || ""
 
 const orderedApiBases = () => {
@@ -581,6 +627,7 @@ const fetchRows = async (params: GraphFetchParams): Promise<FetchRowsResult> => 
         if (dimKey.includes("product_category")) {
           processed = mergeRowsByDimension(processed, dimKey)
         }
+        processed = filterRelatableRows(processed, dimKey)
 
         return {
           ts: Date.now(),
@@ -703,7 +750,10 @@ const normalizeStateLookupKey = (value: string) =>
 
 const INDIA_STATE_KEY_TO_ID: Record<string, string> = INDIA_MAP_LOCATIONS.reduce(
   (acc, location) => {
-    acc[normalizeStateLookupKey(location.name)] = location.id
+    const nameKey = normalizeStateLookupKey(location.name)
+    if (nameKey) acc[nameKey] = location.id
+    const idKey = normalizeStateLookupKey(location.id)
+    if (idKey) acc[idKey] = location.id
     return acc
   },
   {} as Record<string, string>
@@ -717,6 +767,9 @@ const STATE_NAME_ALIASES: Record<string, string> = {
   newdelhi: "delhi",
   andamanandnicobar: "andamanandnicobarislands",
   andamannicobar: "andamanandnicobarislands",
+  dadraandnagarhavelianddamananddiu: "dadraandnagarhavelianddamananddiu",
+  dnhdd: "dadraandnagarhavelianddamananddiu",
+  dnh: "dadraandnagarhavelianddamananddiu",
   jandk: "jammuandkashmir",
   jk: "jammuandkashmir",
   up: "uttarpradesh",
@@ -761,10 +814,29 @@ Object.entries(STATE_NAME_ALIASES).forEach(([aliasKey, canonicalKey]) => {
   if (canonicalId) INDIA_STATE_KEY_TO_ID[aliasKey] = canonicalId
 })
 
-const mapStateToIndiaStateId = (stateValue: string): string | null => {
+const COMBINED_UT_KEY = normalizeStateLookupKey("Dadra and Nagar Haveli and Daman and Diu")
+const COMBINED_UT_ALIASES = new Set<string>([
+  COMBINED_UT_KEY,
+  "dnhdd",
+  "dnh",
+  "dadraandnagarhavelianddamananddiu",
+])
+const COMBINED_UT_COMPONENT_KEYS = [
+  normalizeStateLookupKey("Dadra and Nagar Haveli"),
+  normalizeStateLookupKey("Daman and Diu"),
+]
+
+const mapStateToIndiaStateIds = (stateValue: string): string[] => {
   const key = normalizeStateLookupKey(stateValue)
-  if (!key) return null
-  return INDIA_STATE_KEY_TO_ID[key] || null
+  if (!key) return []
+  if (COMBINED_UT_ALIASES.has(key)) {
+    const ids = COMBINED_UT_COMPONENT_KEYS
+      .map(componentKey => INDIA_STATE_KEY_TO_ID[componentKey])
+      .filter((id): id is string => Boolean(id))
+    return Array.from(new Set(ids))
+  }
+  const resolved = INDIA_STATE_KEY_TO_ID[key]
+  return resolved ? [resolved] : []
 }
 
 const interpolateHex = (fromHex: string, toHex: string, t: number) => {
@@ -784,12 +856,22 @@ type HoverDetailMetricKey =
   | "gross_premium"
   | "earned_premium"
   | "zopper_earned_premium"
+  | "claims"
+  | "net_claims"
+  | "loss_ratio"
   | "quantity"
 
-const HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
+const SALES_HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
   "gross_premium",
   "earned_premium",
   "zopper_earned_premium",
+  "quantity",
+]
+
+const CLAIMS_HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
+  "claims",
+  "net_claims",
+  "loss_ratio",
   "quantity",
 ]
 
@@ -797,6 +879,9 @@ const HOVER_DETAIL_LABELS: Record<HoverDetailMetricKey, string> = {
   gross_premium: "Gross Premium",
   earned_premium: "Earned Premium",
   zopper_earned_premium: "Zopper Earned Premium",
+  claims: "Claims Cost",
+  net_claims: "Net Claims Paid",
+  loss_ratio: "Loss Ratio",
   quantity: "Quantity",
 }
 
@@ -967,6 +1052,7 @@ export default function GraphView({
     Record<string, Partial<Record<HoverDetailMetricKey, number>>>
   >({})
   const [hoverDetailLoadingKey, setHoverDetailLoadingKey] = useState<string | null>(null)
+  const [hoverDetailLoadingAll, setHoverDetailLoadingAll] = useState(false)
   const [hoverCard, setHoverCard] = useState<{
     key: string
     label: string
@@ -979,7 +1065,10 @@ export default function GraphView({
   const requestIdRef = useRef(0)
   const gradientId = useId()
   const gradientIdAlt = useId()
-  const gradientIdThird = useId()
+  const compareGradientBase = (gradientId || "compare").replace(/[^a-zA-Z0-9_-]/g, "")
+  const hoverDetailMetrics = useMemo<HoverDetailMetricKey[]>(() => (
+    datasetType === "claims" ? CLAIMS_HOVER_DETAIL_METRICS : SALES_HOVER_DETAIL_METRICS
+  ), [datasetType])
   const normalizedCategoryFilters = useMemo<GraphCategoryFilter[]>(() => (
     (categoryFilters || [])
       .map((filter) => ({
@@ -1003,6 +1092,7 @@ export default function GraphView({
     setHoverCard(null)
     setHoverDetailByStateId({})
     setHoverDetailLoadingKey(null)
+    setHoverDetailLoadingAll(false)
   }, [source, dimension, metric, datasetType, bucket, chartType, fromDate, toDate, jobId, categoryFiltersKey])
 
   useEffect(() => {
@@ -1235,23 +1325,134 @@ export default function GraphView({
     normalizedCategoryFilters,
   ])
 
+  const indiaMapStateKeys = useMemo(() => {
+    if (chartType !== "india_map") return [] as string[]
+    const stateDimensionKey = toSafeKey(dimension || "state")
+    const keys = new Set<string>()
+    for (const row of data) {
+      const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
+      if (!stateName) continue
+      mapStateToIndiaStateIds(stateName).forEach((stateId) => keys.add(stateId))
+    }
+    return Array.from(keys)
+  }, [chartType, data, dimension])
+
+  useEffect(() => {
+    if (chartType !== "india_map" || !source || !indiaMapStateKeys.length) return
+
+    const hasAllMetrics = indiaMapStateKeys.every((stateId) => (
+      hoverDetailMetrics.every((detailMetric) => hoverDetailByStateId[stateId]?.[detailMetric] != null)
+    ))
+    if (hasAllMetrics) return
+
+    let active = true
+    const baseFilters = normalizedCategoryFilters.filter((filter) => filter.dimension !== "state").slice(0, 2)
+
+    const timer = setTimeout(async () => {
+      if (!active) return
+      setHoverDetailLoadingAll(true)
+
+      try {
+        const stateDimensionKey = toSafeKey(dimension || "state")
+        const detailRows = await Promise.all(
+          hoverDetailMetrics.map(async (detailMetric) => {
+            const result = await fetchRowsWithRangeFallback({
+              source,
+              dimension: "state",
+              metric: detailMetric,
+              datasetType,
+              bucket,
+              jobId,
+              from_date: fromDate,
+              to_date: toDate,
+              categoryFilters: baseFilters,
+            })
+            return {
+              detailMetric,
+              measureKey: toSafeKey(result.measure || detailMetric),
+              rows: result.data || [],
+            }
+          })
+        )
+
+        if (!active) return
+
+        const nextByStateId: Record<string, Partial<Record<HoverDetailMetricKey, number>>> = {}
+        indiaMapStateKeys.forEach((stateId) => {
+          nextByStateId[stateId] = {}
+        })
+
+        detailRows.forEach(({ detailMetric, measureKey, rows }) => {
+          rows.forEach((row) => {
+            const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
+            if (!stateName) return
+            const stateIds = mapStateToIndiaStateIds(stateName)
+            if (!stateIds.length) return
+            const value = asNumber(row[measureKey] ?? row[detailMetric])
+            const apportionedValue = stateIds.length > 1 ? value / stateIds.length : value
+            stateIds.forEach((stateId) => {
+              const target = nextByStateId[stateId] || {}
+              target[detailMetric] = asNumber(target[detailMetric]) + apportionedValue
+              nextByStateId[stateId] = target
+            })
+          })
+          indiaMapStateKeys.forEach((stateId) => {
+            const target = nextByStateId[stateId] || {}
+            if (target[detailMetric] == null) {
+              target[detailMetric] = 0
+            }
+            nextByStateId[stateId] = target
+          })
+        })
+
+        setHoverDetailByStateId((prev) => ({
+          ...prev,
+          ...nextByStateId,
+        }))
+      } catch {
+        // Keep the map interactive even if the eager KPI preload misses.
+      } finally {
+        if (!active) return
+        setHoverDetailLoadingAll(false)
+      }
+    }, 0)
+
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [
+    chartType,
+    source,
+    dimension,
+    bucket,
+    jobId,
+    fromDate,
+    toDate,
+    datasetType,
+    indiaMapStateKeys,
+    hoverDetailByStateId,
+    hoverDetailMetrics,
+    normalizedCategoryFilters,
+  ])
+
   const hoverDetailQueryLabel = useMemo(() => {
     if (chartType !== "india_map" || !hoverCard?.key) return ""
     const stateDimensionKey = toSafeKey(dimension || "state")
     for (const row of data) {
       const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
       if (!stateName) continue
-      const stateId = mapStateToIndiaStateId(stateName)
-      if (stateId === hoverCard.key) return stateName
+      const stateIds = mapStateToIndiaStateIds(stateName)
+      if (stateIds.includes(hoverCard.key)) return stateName
     }
     return hoverCard.label || ""
   }, [chartType, data, dimension, hoverCard])
 
   useEffect(() => {
-    if (chartType !== "india_map" || !source || !hoverCard?.key || !hoverDetailQueryLabel) return
+    if (chartType !== "india_map" || !source || !hoverCard?.key || !hoverDetailQueryLabel || hoverDetailLoadingAll) return
 
     const cachedMetrics = hoverDetailByStateId[hoverCard.key] || {}
-    const pendingMetrics = HOVER_DETAIL_METRICS.filter((detailMetric) => cachedMetrics[detailMetric] == null)
+    const pendingMetrics = hoverDetailMetrics.filter((detailMetric) => cachedMetrics[detailMetric] == null)
     if (!pendingMetrics.length) return
 
     let active = true
@@ -1272,7 +1473,7 @@ export default function GraphView({
               source,
               dimension: "state",
               metric: detailMetric,
-              datasetType: "sales",
+              datasetType,
               bucket,
               jobId,
               from_date: fromDate,
@@ -1308,9 +1509,12 @@ export default function GraphView({
     jobId,
     fromDate,
     toDate,
+    datasetType,
     hoverCard?.key,
     hoverDetailByStateId,
     hoverDetailQueryLabel,
+    hoverDetailLoadingAll,
+    hoverDetailMetrics,
     normalizedCategoryFilters,
   ])
 
@@ -1360,10 +1564,10 @@ export default function GraphView({
   const useLogScale = false
   const primaryPlotKey = useLogScale ? toLogPlotKey(measure) : measure
   const ewCountPlotKey = useLogScale ? toLogPlotKey("ew_count") : "ew_count"
-  const samsungCompareSeries = SAMSUNG_PARTNERS.map((partner, index) => ({
+  const samsungCompareSeries = SAMSUNG_PARTNERS.map((partner) => ({
     ...partner,
     plotKey: useLogScale ? toLogPlotKey(partner.key) : partner.key,
-    gradientId: index === 0 ? gradientId : index === 1 ? gradientIdAlt : gradientIdThird,
+    gradientId: `${compareGradientBase}-${partner.key}`,
   }))
   const isSamsungSource = source === "samsung"
   const isRelianceSource = source === "reliance"
@@ -1451,28 +1655,39 @@ export default function GraphView({
         : formatValue(value, measure),
     }
   })
-  const radarData = chartData.map((row) => {
-    const next: Row = {
-      name: String(row[dimKey] ?? "Unknown"),
-      [measure]: Math.max(0, asNumber(row[measure])),
-    }
-    SAMSUNG_PARTNERS.forEach((partner) => {
-      next[partner.key] = Math.max(0, asNumber(row[partner.key]))
+  const radarData = chartData
+    .map((row) => {
+      const next: Row = {
+        name: String(row[dimKey] ?? "Unknown"),
+        [measure]: Math.max(0, asNumber(row[measure])),
+      }
+      SAMSUNG_PARTNERS.forEach((partner) => {
+        next[partner.key] = Math.max(0, asNumber(row[partner.key]))
+      })
+      return next
     })
-    return next
-  })
+    .sort((a, b) => {
+      if (compareMode) {
+        return sumSamsungPartnerValues(b as Record<string, unknown>) - sumSamsungPartnerValues(a as Record<string, unknown>)
+      }
+      return asNumber(b[measure]) - asNumber(a[measure])
+    })
+    .slice(0, 12)
   const indiaMapValuesByStateId = new Map<string, number>()
   INDIA_MAP_LOCATIONS.forEach((location) => {
     indiaMapValuesByStateId.set(location.id, 0)
   })
   chartData.forEach((row) => {
     const stateName = String(row[dimKey] ?? "").trim()
-    const stateId = mapStateToIndiaStateId(stateName)
-    if (!stateId) return
+    const stateIds = mapStateToIndiaStateIds(stateName)
+    if (!stateIds.length) return
     const value = compareMode
       ? Math.max(0, sumSamsungPartnerValues(row as Record<string, unknown>))
       : Math.max(0, asNumber(row[measure]))
-    indiaMapValuesByStateId.set(stateId, (indiaMapValuesByStateId.get(stateId) || 0) + value)
+    const perStateValue = value / stateIds.length
+    stateIds.forEach((stateId) => {
+      indiaMapValuesByStateId.set(stateId, (indiaMapValuesByStateId.get(stateId) || 0) + perStateValue)
+    })
   })
   const indiaMapEntries = INDIA_MAP_LOCATIONS.map((location) => {
     const value = indiaMapValuesByStateId.get(location.id) || 0
@@ -1620,12 +1835,12 @@ export default function GraphView({
                   {hoverCard.label}
                 </div>
                 <div className={hoverCard.compact ? "space-y-0.5" : "space-y-1"}>
-                  {HOVER_DETAIL_METRICS.map((detailMetric) => {
+                  {hoverDetailMetrics.map((detailMetric) => {
                     const value = hoverMetricValues[detailMetric]
                     const hasValue = value != null
                     const formatted = hasValue
                       ? formatValue(asNumber(value), detailMetric)
-                      : hoverDetailLoadingKey === hoverCard.key
+                      : hoverDetailLoadingAll || hoverDetailLoadingKey === hoverCard.key
                         ? "Loading..."
                         : "N/A"
                     return (
@@ -1793,12 +2008,12 @@ export default function GraphView({
                 <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.15)} stopOpacity={0.55} />
                 <stop offset="100%" stopColor={secondaryColor} stopOpacity={0.04} />
               </linearGradient>
-              {samsungCompareSeries[2] && (
-                <linearGradient id={gradientIdThird} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={mixWithWhite(samsungCompareSeries[2].color, 0.15)} stopOpacity={0.55} />
-                  <stop offset="100%" stopColor={samsungCompareSeries[2].color} stopOpacity={0.04} />
+              {samsungCompareSeries.map((series) => (
+                <linearGradient key={`compare-grad-${series.key}`} id={series.gradientId} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={mixWithWhite(series.color, 0.15)} stopOpacity={0.55} />
+                  <stop offset="100%" stopColor={series.color} stopOpacity={0.04} />
                 </linearGradient>
-              )}
+              ))}
             </defs>
             <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
             <XAxis
@@ -1985,12 +2200,12 @@ export default function GraphView({
                 <stop offset="0%" stopColor={mixWithWhite(secondaryColor, 0.35)} />
                 <stop offset="100%" stopColor={secondaryColor} />
               </linearGradient>
-              {samsungCompareSeries[2] && (
-                <linearGradient id={gradientIdThird} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={mixWithWhite(samsungCompareSeries[2].color, 0.35)} />
-                  <stop offset="100%" stopColor={samsungCompareSeries[2].color} />
+              {samsungCompareSeries.map((series) => (
+                <linearGradient key={`compare-grad-${series.key}`} id={series.gradientId} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={mixWithWhite(series.color, 0.35)} />
+                  <stop offset="100%" stopColor={series.color} />
                 </linearGradient>
-              )}
+              ))}
             </defs>
             <CartesianGrid strokeDasharray="4 4" vertical={false} stroke="#e2e8f0" />
             <XAxis

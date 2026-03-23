@@ -43,8 +43,11 @@ def normalize_claims(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- PREMIUM CALCULATIONS ----------
 
-def compute_premiums(df: pd.DataFrame) -> pd.DataFrame:
+def compute_premiums(df: pd.DataFrame, valuation_date: pd.Timestamp | None = None) -> pd.DataFrame:
     df = df.copy()
+    
+    # Use provided valuation_date or default to fixed valuation if none provided
+    v_date = valuation_date if valuation_date is not None else VALUATION_DATE
 
     required = {
         "Plan Start Date",
@@ -61,8 +64,14 @@ def compute_premiums(df: pd.DataFrame) -> pd.DataFrame:
     ).dt.days.clip(lower=1)
 
     df["Exposure Days"] = (
-        VALUATION_DATE - df["Plan Start Date"]
+        v_date - df["Plan Start Date"]
     ).dt.days.clip(lower=0)
+
+    # Cap exposure days to coverage days (cannot earn more than written)
+    df["Exposure Days"] = df["Exposure Days"].where(
+        df["Exposure Days"] <= df["Coverage Days"], 
+        df["Coverage Days"]
+    )
 
     df["Written Premium"] = df["Zopper Shared ( Transfer Price )"] * 1.18
     df["Zopper Earned Premium"] = (
@@ -103,7 +112,7 @@ def aggregate_dimension(
     if dimension not in sales.columns:
         return pd.DataFrame()
 
-    # ❌ Drop pandas junk columns FIRST
+    # Drop pandas junk columns FIRST
     sales = sales.loc[:, ~sales.columns.str.lower().str.startswith("unnamed")]
     claims = claims.loc[:, ~claims.columns.str.lower().str.startswith("unnamed")]
 
@@ -131,7 +140,7 @@ def aggregate_dimension(
 
         sales[col] = pd.to_numeric(sales[col], errors="coerce")
 
-    # --- Detect valid measures (NO unnamed allowed) ---
+    # --- Detect valid measures ---
     measures = [
         c for c in sales.columns
         if c != dimension
@@ -185,6 +194,7 @@ def plans_vs_claims(
     ).replace([np.inf, -np.inf], 0).fillna(0)
 
     return result.reset_index()
+
 def aggregate_by_dimension(df: pd.DataFrame, dimension: str, metric: str):
     if df.empty or dimension not in df.columns:
         return df.iloc[0:0]
@@ -321,18 +331,8 @@ def _parse_datetime_series(series: pd.Series) -> pd.Series:
     parsed = pd.Series(pd.NaT, index=cleaned.index, dtype="datetime64[ns]")
 
     month_map = {
-        "jan": 1,
-        "feb": 2,
-        "mar": 3,
-        "apr": 4,
-        "may": 5,
-        "jun": 6,
-        "jul": 7,
-        "aug": 8,
-        "sep": 9,
-        "oct": 10,
-        "nov": 11,
-        "dec": 12,
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
     }
     month_year = cleaned.str.extract(r"^(?:\d{1,2}[-/\s])?(?P<mon>[A-Za-z]{3,9})[-/\s](?P<yr>\d{2}|\d{4})$")
     month_num = month_year["mon"].str.lower().str.slice(0, 3).map(month_map)
@@ -424,56 +424,23 @@ def filter_by_date_range(
 
     # Candidate date columns by dataset
     sales_candidates = [
-        "Start_Date",
-        "Start Date",
-        "Plan Start Date",
-        "Warranty Start Date",
-        "Warranty Start_Date",
-        "Warranty Purchase Date",
-        "Invoice_Date_",
-        "Invoice Date",
-        "Bill Created Date",
-        "Payment_date",
-        "Payment Date",
-        "Month",
-        "Month Name",
-        "Month_Name",
-        "Plan End Date",
-        "End Date",
-        "End_Date",
+        "Start_Date", "Start Date", "Plan Start Date", "Warranty Start Date",
+        "Warranty Start_Date", "Warranty Purchase Date", "Invoice_Date_",
+        "Invoice Date", "Bill Created Date", "Payment_date", "Payment Date",
+        "Month", "Month Name", "Month_Name", "Plan End Date", "End Date", "End_Date",
     ]
     claims_candidates = [
-        "Day of Call_Date",
-        "Call_Date",
-        "Call Date",
-        "Call_Registered_Date",
-        "Call Registered Date",
-        "Call_Initiated_Date",
-        "Call Initiated Date",
-        "Month",
-        "Month Name",
-        "Month_Name",
-        "Month-Year",
-        "Month Year",
-        "Month_Year",
-        "Fiscal Month",
-        "Invoice_Date_",
-        "Invoice Date",
-        "Payment_date",
-        "Payment Date",
-        "Posting Date",
-        "Complete Date",
-        "Bill Created Date",
-        "Warranty_start_date_",
-        "Warranty Start Date",
-        "Date",
+        "Day of Call_Date", "Call_Date", "Call Date", "Call_Registered_Date",
+        "Call Registered Date", "Call_Initiated_Date", "Call Initiated Date",
+        "Month", "Month Name", "Month_Name", "Month-Year", "Month Year",
+        "Month_Year", "Fiscal Month", "Invoice_Date_", "Invoice Date",
+        "Payment_date", "Payment Date", "Posting Date", "Complete Date",
+        "Bill Created Date", "Warranty_start_date_", "Warranty Start Date", "Date",
     ]
 
     candidates = sales_candidates if dataset_type == "sales" else claims_candidates
     series = _coalesce_datetime_candidates(df, candidates)
     if series.isna().all():
-        # Date filters are explicit. If no parseable date columns exist, return no rows
-        # to avoid silently showing unfiltered data.
         return df.iloc[0:0]
 
     if dataset_type == "claims":
@@ -505,34 +472,24 @@ def get_latest_date(df: pd.DataFrame):
             month = series.dt.month
             fixed = series
 
-            # Fix bogus years (e.g., 0001) by mapping to current year
+            # Fix bogus years
             bad_year = year < 2000
             if bad_year.any():
                 fixed = fixed.where(
                     ~bad_year,
                     pd.to_datetime(
-                        {
-                            "year": current_year,
-                            "month": month.clip(1, 12),
-                            "day": 1,
-                        },
+                        {"year": current_year, "month": month.clip(1, 12), "day": 1},
                         errors="coerce",
                     ),
                 )
 
-            # If month/year are in the future, map them to last year
-            future_mask = (year > current_year) | (
-                (year == current_year) & (month > current_month)
-            )
+            # Map future to last year
+            future_mask = (year > current_year) | ((year == current_year) & (month > current_month))
             if future_mask.any():
                 fixed = fixed.where(
                     ~future_mask,
                     pd.to_datetime(
-                        {
-                            "year": current_year - 1,
-                            "month": month.clip(1, 12),
-                            "day": 1,
-                        },
+                        {"year": current_year - 1, "month": month.clip(1, 12), "day": 1},
                         errors="coerce",
                     ),
                 )

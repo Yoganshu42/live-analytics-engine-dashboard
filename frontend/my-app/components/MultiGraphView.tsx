@@ -539,6 +539,52 @@ const GODREJ_CLAIMS_PRESETS: Preset[] = [
   },
 ]
 
+const HITACHI_SALES_PRESETS: Preset[] = [
+  {
+    group: "time",
+    dimension: "month",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "region",
+    dimension: "state",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "category",
+    dimension: "plan_category",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "product",
+    dimension: "product_category",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+]
+
+const HITACHI_CLAIMS_PRESETS: Preset[] = [
+  {
+    group: "time",
+    dimension: "month",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "region",
+    dimension: "state",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "category",
+    dimension: "plan_category",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+  {
+    group: "product",
+    dimension: "product_category",
+    metrics: ["gross_premium", "earned_premium", "zopper_earned_premium", "quantity", "net_claims", "claims", "loss_ratio"],
+  },
+]
+
 const GODREJ_GROUP_TITLES: Record<string, string> = {
   time: "Time Trend Desk",
   region: "Regional Signal Board",
@@ -559,9 +605,11 @@ const METRIC_LINE_COLORS: Record<string, string> = {
 const SOURCE_FALLBACK_METRIC_KEYS: Record<string, string[]> = {
   samsung_vs: ["samsung_vs"],
   samsung_croma: ["samsung_croma"],
+  samsung_croma_dsdsg: ["samsung_croma_dsdsg"],
   samsung_reliance_digital: ["samsung_reliance_digital"],
   reliance: ["reliance", "reliance_resq"],
   godrej: ["godrej"],
+  hitachi: ["hitachi"],
 }
 
 const getMetricLabel = (metric: string) => {
@@ -579,9 +627,10 @@ const getMetricLabel = (metric: string) => {
 const getDimensionLabel = (dimension: string, source?: string) => {
   const d = dimension.toLowerCase()
   if (d.includes("month") || d.includes("date")) return "Month"
-  if (d.includes("state")) return source === "godrej" ? "Region" : "State"
+  if (d.includes("state")) return source === "godrej" || source === "hitachi" ? "Region" : "State"
   if (d === "article_brand" || d === "brand") return "Brand Category"
   if (d.includes("channel")) return "Channel"
+  if (d.includes("product_subcategory")) return "Product Subcategory"
   if (d.includes("product_category")) return "Product Category"
   if (d.includes("device_plan_category")) return source === "reliance" ? "Brand Category" : "Device Segment"
   if (d.includes("plan_category")) return "Plan Type"
@@ -684,7 +733,7 @@ const getSectionMainChartMode = (
   const dimKey = (dimension || "").trim().toLowerCase()
 
   if (
-    (sourceKey === "godrej" && (dimKey === "channel" || dimKey === "plan_category"))
+    ((sourceKey === "godrej" || sourceKey === "hitachi") && (dimKey === "channel" || dimKey === "plan_category"))
     || (sourceKey === "reliance" && dimKey === "plan_category")
     || (isSamsungPartnerSource(sourceKey) && dimKey === "plan_category")
   ) {
@@ -694,7 +743,7 @@ const getSectionMainChartMode = (
   if (
     (isSamsungPartnerSource(sourceKey) && dimKey === "device_plan_category")
     || (sourceKey === "reliance" && (dimKey === "article_brand" || dimKey === "brand"))
-    || (sourceKey === "godrej" && dimKey === "product_category")
+    || ((sourceKey === "godrej" || sourceKey === "hitachi") && dimKey === "product_category")
   ) {
     return "metric_strips"
   }
@@ -788,32 +837,53 @@ export default function MultiGraphView({
     },
     [datasetType]
   )
-  const isGodrej = source === "godrej"
-  const isGodrejClaims = isGodrej && datasetType === "claims"
+  const isApplianceSource = source === "godrej" || source === "hitachi"
+  const isHitachiSource = source === "hitachi"
+  const isApplianceClaims = isApplianceSource && datasetType === "claims"
   const activeGroupOrder = useMemo(
     () => (
-      isGodrej
+      isHitachiSource
+        ? ["time", "region", "category", "product"]
+        : isApplianceSource
         ? ["time", "region", "channel", "product"]
         : GROUP_ORDER
     ),
-    [isGodrej]
+    [isApplianceSource, isHitachiSource]
   )
   const activePresets = useMemo(
     () => (
-      isGodrej
-        ? (isGodrejClaims ? GODREJ_CLAIMS_PRESETS : GODREJ_SALES_PRESETS)
+      isHitachiSource
+        ? (isApplianceClaims ? HITACHI_CLAIMS_PRESETS : HITACHI_SALES_PRESETS)
+        : isApplianceSource
+        ? (isApplianceClaims ? GODREJ_CLAIMS_PRESETS : GODREJ_SALES_PRESETS)
         : Object.values(GRAPH_PRESETS)
     ),
-    [isGodrej, isGodrejClaims]
+    [isApplianceSource, isApplianceClaims, isHitachiSource]
   )
   const sideCardMetric = datasetType === "sales" ? "quantity" : "claims"
   const partnerSideCards = useMemo<PartnerSideCard[]>(() => {
     if (isSamsungOverview) return []
 
-    if (source === "godrej") {
+    if (isHitachiSource) {
       return [
         {
-          id: "godrej-channel-distribution",
+          id: `${source}-plan-distribution`,
+          title: datasetType === "sales" ? "Plan Distribution Pie" : "Plan Claims Pie",
+          subtitle:
+            datasetType === "sales"
+              ? "Share of total volume by plan category."
+              : "Share of claims cost by Care+ Plan Name.",
+          dimension: "plan_category",
+          metric: sideCardMetric,
+          chartType: "pie",
+        },
+      ]
+    }
+
+    if (isApplianceSource) {
+      return [
+        {
+          id: `${source}-channel-distribution`,
           title: datasetType === "sales" ? "Channel Distribution" : "Channel Claims Distribution",
           subtitle:
             datasetType === "sales"
@@ -824,7 +894,7 @@ export default function MultiGraphView({
           chartType: "pie",
         },
         {
-          id: "godrej-product-distribution",
+          id: `${source}-product-distribution`,
           title: datasetType === "sales" ? "Product Distribution Radar" : "Product Claims Radar",
           subtitle:
             datasetType === "sales"
@@ -888,7 +958,7 @@ export default function MultiGraphView({
         chartType: "radar",
       },
     ]
-  }, [datasetType, isSamsungOverview, sideCardMetric, source])
+  }, [datasetType, isSamsungOverview, isApplianceSource, isHitachiSource, sideCardMetric, source])
 
   const [fullscreen, setFullscreen] = useState<FullscreenGraph>(null)
   const [fullscreenFromDate, setFullscreenFromDate] = useState(fromDate || "")
@@ -1020,7 +1090,24 @@ export default function MultiGraphView({
       }
     }
 
-    if (source === "godrej") {
+    if (isHitachiSource) {
+      return {
+        primary: {
+          dimension: "product_category",
+          label: "Product Distribution",
+          sectionTitle: "Product Distribution",
+          missingText: "No product-distribution data found.",
+        } as RegionalCategoryDescriptor,
+        secondary: {
+          dimension: "channel",
+          label: "Channel Distribution",
+          sectionTitle: "Channel Distribution",
+          missingText: "No channel-distribution data found.",
+        } as RegionalCategoryDescriptor,
+      }
+    }
+
+    if (isApplianceSource) {
       return {
         primary: {
           dimension: "channel",
@@ -1051,11 +1138,25 @@ export default function MultiGraphView({
         missingText: "No device-category data found.",
       } as RegionalCategoryDescriptor,
     }
-  }, [source])
+  }, [isApplianceSource, isHitachiSource, source])
   const activeRegionalPrimaryDescriptor = regionalCategoryConfig.primary
   const activeRegionalSecondaryDescriptor = regionalCategoryConfig.secondary
   const regionalMapFilterConfig = useMemo(() => {
-    if (source === "godrej") {
+    if (isHitachiSource) {
+      return {
+        primary: {
+          dimension: "product_category",
+          label: "Product",
+          allLabel: "All Products",
+        } as RegionalMapFilterDescriptor,
+        secondary: {
+          dimension: "channel",
+          label: "Channel",
+          allLabel: "All Channels",
+        } as RegionalMapFilterDescriptor,
+      }
+    }
+    if (isApplianceSource) {
       return {
         primary: {
           dimension: "channel",
@@ -1095,7 +1196,7 @@ export default function MultiGraphView({
         allLabel: "All Device Plan Categories",
       } as RegionalMapFilterDescriptor,
     }
-  }, [source])
+  }, [isApplianceSource, isHitachiSource, source])
   const activeRegionalMapFilters = useMemo(() => {
     const filters: Array<{ dimension: RegionalCategoryDimension; values: string[] }> = []
     if (regionalMapPrimaryValue) {
@@ -1185,11 +1286,34 @@ export default function MultiGraphView({
     regionalMapFilterConfig.primary.dimension,
     regionalMapFilterConfig.secondary.dimension,
   ])
+  const showRegionalPrimaryFilter = regionalMapPrimaryOptions.length > 0
+  const showRegionalSecondaryFilter = regionalMapSecondaryOptions.length > 0
+  const regionalMixLabels = useMemo(() => {
+    const labels: string[] = []
+    if (showRegionalPrimaryFilter) {
+      labels.push(activeRegionalPrimaryDescriptor.label)
+    }
+    if (
+      showRegionalSecondaryFilter
+      && activeRegionalSecondaryDescriptor.label !== activeRegionalPrimaryDescriptor.label
+    ) {
+      labels.push(activeRegionalSecondaryDescriptor.label)
+    }
+    if (!labels.length) {
+      labels.push(activeRegionalPrimaryDescriptor.label)
+    }
+    return labels
+  }, [
+    activeRegionalPrimaryDescriptor.label,
+    activeRegionalSecondaryDescriptor.label,
+    showRegionalPrimaryFilter,
+    showRegionalSecondaryFilter,
+  ])
   const getSectionTitle = useCallback((group: string) => {
-    if (isGodrej) return GODREJ_GROUP_TITLES[group] || group
+    if (isApplianceSource) return GODREJ_GROUP_TITLES[group] || group
     if (group === "device_category" && source === "reliance") return "Brand Segment Pulse"
     return GROUP_TITLES[group] || group
-  }, [isGodrej, source])
+  }, [isApplianceSource, source])
   const sectionConfigs = useMemo(() => {
     if (isSamsungOverview) return []
     return activeGroupOrder
@@ -1216,6 +1340,15 @@ export default function MultiGraphView({
       })
       .filter(section => section.entries.length > 0)
   }, [isSamsungOverview, activeGroupOrder, activePresets, datasetType, source])
+  const visibleSectionConfigs = useMemo(
+    () => sectionConfigs.filter(({ group }) => {
+      const sectionData = sectionMergedMap[group]
+      if (!sectionData) return true
+      if (sectionData.loading || sectionData.error) return true
+      return sectionData.rows.length > 0
+    }),
+    [sectionConfigs, sectionMergedMap]
+  )
 
   const navigableGraphs = useMemo(() => {
     if (isSamsungOverview) {
@@ -1229,7 +1362,7 @@ export default function MultiGraphView({
         tooltipMetricOverride: card.tooltipMetricOverride,
       }))
     }
-    const fallbackSection = sectionConfigs[0]?.group || "time"
+    const fallbackSection = visibleSectionConfigs[0]?.group || sectionConfigs[0]?.group || "time"
     const sectionTitle = getSectionTitle(fallbackSection)
     return partnerSideCards.map((card) => ({
       group: fallbackSection,
@@ -1240,7 +1373,7 @@ export default function MultiGraphView({
       chartType: card.chartType,
       tooltipMetricOverride: card.tooltipMetricOverride,
     }))
-  }, [isSamsungOverview, samsungOverviewCards, sectionConfigs, getSectionTitle, partnerSideCards, datasetType])
+  }, [isSamsungOverview, samsungOverviewCards, visibleSectionConfigs, sectionConfigs, getSectionTitle, partnerSideCards, datasetType])
 
   const fullscreenGraphIndex = useMemo(() => {
     if (!fullscreen) return -1
@@ -1263,7 +1396,8 @@ export default function MultiGraphView({
     if (isSamsungOverview || !sectionConfigs.length) return
 
     let active = true
-    const timer = setTimeout(async () => {
+    let idleHandle: number | null = null
+    const run = async () => {
       if (!active) return
 
       const loadingState: Record<string, SectionMergedState> = {}
@@ -1356,11 +1490,34 @@ export default function MultiGraphView({
           [section.group]: state,
         }))
       }
-    }, 0)
+    }
+
+    const scheduleIdle = () => {
+      if (typeof window === "undefined") return
+      const w = window as Window & {
+        requestIdleCallback?: (cb: IdleRequestCallback, opts?: IdleRequestOptions) => number
+        cancelIdleCallback?: (id: number) => void
+      }
+      if (w.requestIdleCallback) {
+        idleHandle = w.requestIdleCallback(() => { void run() }, { timeout: 1200 })
+      } else {
+        idleHandle = window.setTimeout(() => { void run() }, 0)
+      }
+    }
+
+    const timer = window.setTimeout(scheduleIdle, 120)
 
     return () => {
       active = false
-      clearTimeout(timer)
+      window.clearTimeout(timer)
+      if (idleHandle !== null) {
+        const w = window as Window & { cancelIdleCallback?: (id: number) => void }
+        if (w.cancelIdleCallback) {
+          w.cancelIdleCallback(idleHandle)
+        } else {
+          window.clearTimeout(idleHandle)
+        }
+      }
     }
   }, [isSamsungOverview, sectionConfigs, source, datasetType, jobId, fromDate, toDate])
 
@@ -1718,8 +1875,9 @@ export default function MultiGraphView({
     activeRegionalSecondaryDescriptor.label,
   ])
 
-  const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
-  const pickerMaxDate = useMemo(() => todayIso, [todayIso])
+  const pickerMaxDate = useMemo(() => (
+    (resetToDate || toDate || fullscreenToDate || "").trim() || undefined
+  ), [resetToDate, toDate, fullscreenToDate])
 
   const handleApplyFullscreenDateRange = (nextFromRaw: string, nextToRaw: string) => {
     if (!onDateRangeApply) return
@@ -1746,7 +1904,7 @@ export default function MultiGraphView({
       return
     }
     const nextFrom = (resetFromDate || fromDate || fullscreenFromDate || "").trim()
-    const nextTo = todayIso
+    const nextTo = (resetToDate || toDate || fullscreenToDate || "").trim()
     if (!nextFrom && !nextTo) return
     const orderedFrom = nextFrom && nextTo && nextFrom > nextTo ? nextTo : nextFrom
     const orderedTo = nextFrom && nextTo && nextFrom > nextTo ? nextFrom : nextTo
@@ -1838,7 +1996,7 @@ export default function MultiGraphView({
         animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
         transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
         whileHover={prefersReducedMotion ? undefined : { y: -4 }}
-        className="smooth-surface relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-5"
+        className="smooth-surface content-auto relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-5"
       >
         <div className="pointer-events-none absolute -top-16 right-[-58px] h-32 w-32 rounded-full bg-cyan-100/60 blur-2xl" />
         <div className="relative">
@@ -1882,7 +2040,7 @@ export default function MultiGraphView({
               chartType={card.chartType}
               tooltipMetricOverride={card.tooltipMetricOverride}
               deferUntilVisible
-              fetchDelayMs={layout === "main" ? index * 80 : 140 + index * 120}
+              fetchDelayMs={layout === "main" ? index * 40 : 80 + index * 60}
               heightClassName={layout === "main" ? "h-[360px] sm:h-[430px]" : "h-[300px] sm:h-[340px]"}
             />
           </div>
@@ -1903,7 +2061,7 @@ export default function MultiGraphView({
         animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
         transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
         whileHover={prefersReducedMotion ? undefined : { y: -4 }}
-        className="smooth-surface relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-3 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-4"
+        className="smooth-surface content-auto relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-3 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-4"
       >
         <div className="pointer-events-none absolute -top-16 right-[-58px] h-28 w-28 rounded-full bg-cyan-100/60 blur-2xl" />
         <div className="relative">
@@ -1944,9 +2102,9 @@ export default function MultiGraphView({
               chartType={card.chartType}
               tooltipMetricOverride={card.tooltipMetricOverride}
               deferUntilVisible
-              fetchDelayMs={160 + index * 120}
+              fetchDelayMs={60 + index * 60}
               heightClassName={
-                card.chartType === "pie"
+                card.chartType === "pie" || card.chartType === "bar"
                   ? "h-[230px] sm:h-[260px]"
                   : "h-[180px] sm:h-[210px]"
               }
@@ -1973,7 +2131,7 @@ export default function MultiGraphView({
       ) : (
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(300px,1fr)] xl:items-start">
           <div className="space-y-2">
-            {sectionConfigs.map(({ group, entries }) => {
+            {visibleSectionConfigs.map(({ group, entries }) => {
         const sectionTitle = getSectionTitle(group)
         const entry = entries[0]
         const dimKey = entry?.preset.dimension || "month"
@@ -2033,7 +2191,7 @@ export default function MultiGraphView({
         return (
           <div
             key={group}
-            className="relative mb-6 overflow-hidden rounded-[24px] border border-slate-200/80 bg-white shadow-[0_22px_60px_-38px_rgba(15,23,42,0.45)] sm:mb-10 sm:rounded-[28px]"
+            className="content-auto relative mb-6 overflow-hidden rounded-[24px] border border-slate-200/80 bg-white shadow-[0_22px_60px_-38px_rgba(15,23,42,0.45)] sm:mb-10 sm:rounded-[28px]"
           >
             <div className="pointer-events-none absolute -top-24 right-[-140px] h-64 w-64 rounded-full bg-cyan-100/70 blur-3xl" />
             <div className="pointer-events-none absolute -bottom-24 left-[-120px] h-56 w-56 rounded-full bg-amber-100/70 blur-3xl" />
@@ -2062,7 +2220,7 @@ export default function MultiGraphView({
                   initial={prefersReducedMotion ? false : { opacity: 0, y: 16 }}
                   animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
                   transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
-                  className="smooth-surface relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm sm:p-5"
+                  className="smooth-surface content-auto relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm sm:p-5"
                 >
                   <div className="pointer-events-none absolute -top-16 right-[-58px] h-32 w-32 rounded-full bg-cyan-100/60 blur-2xl" />
                   <div className="relative">
@@ -2112,8 +2270,8 @@ export default function MultiGraphView({
                           fromDate={fromDate}
                           toDate={toDate}
                           chartType="india_map"
-                          deferUntilVisible
-                          heightClassName="h-full"
+                        deferUntilVisible
+                        heightClassName="h-full"
                         />
                       ) : sectionData.loading ? (
                         <div className="flex h-full items-center justify-center text-sm text-slate-500">
@@ -2465,47 +2623,51 @@ export default function MultiGraphView({
                             </select>
                           </div>
 
-                          <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                            <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
-                              {regionalMapFilterConfig.primary.label}
+                          {showRegionalPrimaryFilter && (
+                            <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                              <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                                {regionalMapFilterConfig.primary.label}
+                              </div>
+                              <select
+                                value={regionalMapPrimaryValue}
+                                onChange={(e) => setRegionalMapPrimaryValue(e.target.value)}
+                                className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
+                              >
+                                <option value="">{regionalMapFilterConfig.primary.allLabel}</option>
+                                {regionalMapPrimaryOptions.map((option) => (
+                                  <option
+                                    key={`regional-map-primary-value-${option}`}
+                                    value={option}
+                                  >
+                                    {option}
+                                  </option>
+                                ))}
+                              </select>
                             </div>
-                            <select
-                              value={regionalMapPrimaryValue}
-                              onChange={(e) => setRegionalMapPrimaryValue(e.target.value)}
-                              className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
-                            >
-                              <option value="">{regionalMapFilterConfig.primary.allLabel}</option>
-                              {regionalMapPrimaryOptions.map((option) => (
-                                <option
-                                  key={`regional-map-primary-value-${option}`}
-                                  value={option}
-                                >
-                                  {option}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
+                          )}
 
-                          <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                            <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
-                              {regionalMapFilterConfig.secondary.label}
+                          {showRegionalSecondaryFilter && (
+                            <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                              <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
+                                {regionalMapFilterConfig.secondary.label}
+                              </div>
+                              <select
+                                value={regionalMapSecondaryValue}
+                                onChange={(e) => setRegionalMapSecondaryValue(e.target.value)}
+                                className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
+                              >
+                                <option value="">{regionalMapFilterConfig.secondary.allLabel}</option>
+                                {regionalMapSecondaryOptions.map((option) => (
+                                  <option
+                                    key={`regional-map-secondary-value-${option}`}
+                                    value={option}
+                                  >
+                                    {option}
+                                  </option>
+                                ))}
+                              </select>
                             </div>
-                            <select
-                              value={regionalMapSecondaryValue}
-                              onChange={(e) => setRegionalMapSecondaryValue(e.target.value)}
-                              className="w-full rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-700"
-                            >
-                              <option value="">{regionalMapFilterConfig.secondary.allLabel}</option>
-                              {regionalMapSecondaryOptions.map((option) => (
-                                <option
-                                  key={`regional-map-secondary-value-${option}`}
-                                  value={option}
-                                >
-                                  {option}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
+                          )}
 
                           <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
                             <div className="mb-1 text-[9px] font-black uppercase tracking-[0.16em] text-slate-400">
@@ -2945,7 +3107,7 @@ export default function MultiGraphView({
                             {`${geographyLabel} Compare Mix`}
                           </h4>
                           <div className="text-[11px] text-slate-500 mt-1">
-                            {`For every selected ${geographyLabel.toLowerCase()} in Compare ${geographyLabelPlural}, view gradient pie splits for ${activeRegionalPrimaryDescriptor.label} and ${activeRegionalSecondaryDescriptor.label}.`}
+                            {`For every selected ${geographyLabel.toLowerCase()} in Compare ${geographyLabelPlural}, view distribution charts for ${regionalMixLabels.join(" and ")}.`}
                           </div>
                         </div>
                       </div>
@@ -2956,7 +3118,7 @@ export default function MultiGraphView({
                         </div>
                       ) : !activeComparisonStates.length ? (
                         <div className="text-sm text-slate-500">
-                          {`Select at least 1 ${geographyLabel.toLowerCase()} in Compare ${geographyLabelPlural} to render comparison pies.`}
+                          {`Select at least 1 ${geographyLabel.toLowerCase()} in Compare ${geographyLabelPlural} to render comparison charts.`}
                         </div>
                       ) : stateComparisonMixLoading ? (
                         <div className="text-sm text-slate-500">Loading mix distribution...</div>
@@ -2967,16 +3129,33 @@ export default function MultiGraphView({
                               {stateComparisonMixError}
                             </div>
                           )}
-                          <div className={`grid ${stateComparisonLayout.gridClass} gap-4`}>
-                            {stateComparisonMixRows.map((mixRow) => {
-                              const stateSlug = toDomId(mixRow.state)
-                              const planSlices = toMixSlices(mixRow.planRows, `plan-${stateSlug}`)
-                              const deviceSlices = toMixSlices(mixRow.deviceRows, `device-${stateSlug}`)
-                              return (
-                                <div
-                                  key={mixRow.state}
-                                  className={`rounded-2xl border border-slate-200 bg-gradient-to-br from-white via-slate-50/80 to-cyan-50/40 p-4 ${stateComparisonLayout.cardMinHeightClass}`}
-                                >
+                            <div className={`grid ${stateComparisonLayout.gridClass} gap-4`}>
+                              {stateComparisonMixRows.map((mixRow) => {
+                                const stateSlug = toDomId(mixRow.state)
+                                const planSlices = toMixSlices(mixRow.planRows, `plan-${stateSlug}`)
+                                const deviceSlices = toMixSlices(mixRow.deviceRows, `device-${stateSlug}`)
+                                const mixSections = [
+                                  {
+                                    key: `primary-${stateSlug}`,
+                                    title: activeRegionalPrimaryDescriptor.sectionTitle,
+                                    slices: planSlices,
+                                    emptyText: mixRow.planMessage || activeRegionalPrimaryDescriptor.missingText,
+                                  },
+                                  {
+                                    key: `secondary-${stateSlug}`,
+                                    title: activeRegionalSecondaryDescriptor.sectionTitle,
+                                    slices: deviceSlices,
+                                    emptyText: mixRow.deviceMessage || activeRegionalSecondaryDescriptor.missingText,
+                                  },
+                                ].filter((section, index, items) => (
+                                  index === 0 || section.title !== items[0].title
+                                ))
+                                const visibleMixSections = mixSections.filter((section) => section.slices.length > 0)
+                                return (
+                                  <div
+                                    key={mixRow.state}
+                                    className={`rounded-2xl border border-slate-200 bg-gradient-to-br from-white via-slate-50/80 to-cyan-50/40 p-4 ${stateComparisonLayout.cardMinHeightClass}`}
+                                  >
                                   <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
                                     <div>
                                       <div className="text-sm font-bold text-slate-800">
@@ -2987,22 +3166,22 @@ export default function MultiGraphView({
                                       </div>
                                     </div>
                                     <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">
-                                      2 Pie Charts
+                                      {`${visibleMixSections.length || 1} ${visibleMixSections.length === 1 ? "Chart" : "Charts"}`}
                                     </span>
                                   </div>
 
                                   <div className="grid grid-cols-1 gap-3">
-                                    <div className="rounded-xl border border-slate-200 bg-white p-3">
-                                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
-                                        {activeRegionalPrimaryDescriptor.sectionTitle}
-                                      </div>
-                                      {planSlices.length ? (
+                                    {visibleMixSections.length ? visibleMixSections.map((section) => (
+                                      <div key={section.key} className="rounded-xl border border-slate-200 bg-white p-3">
+                                        <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
+                                          {section.title}
+                                        </div>
                                         <div className="mt-2 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(170px,1fr)] gap-3 items-center">
                                           <div style={{ height: `${comparisonPieSizing.height}px` }}>
                                             <ResponsiveContainer width="100%" height="100%">
                                               <PieChart>
                                                 <defs>
-                                                  {planSlices.map((slice) => (
+                                                  {section.slices.map((slice) => (
                                                     <linearGradient
                                                       key={slice.gradientId}
                                                       id={slice.gradientId}
@@ -3017,7 +3196,7 @@ export default function MultiGraphView({
                                                   ))}
                                                 </defs>
                                                 <Pie
-                                                  data={planSlices}
+                                                  data={section.slices}
                                                   dataKey="value"
                                                   nameKey="label"
                                                   innerRadius={comparisonPieSizing.innerRadius}
@@ -3027,7 +3206,7 @@ export default function MultiGraphView({
                                                   isAnimationActive={!prefersReducedMotion}
                                                   animationDuration={prefersReducedMotion ? 0 : 450}
                                                 >
-                                                  {planSlices.map((slice) => (
+                                                  {section.slices.map((slice) => (
                                                     <Cell
                                                       key={slice.gradientId}
                                                       fill={`url(#${slice.gradientId})`}
@@ -3041,7 +3220,7 @@ export default function MultiGraphView({
                                                     const payload = (entry?.payload || {}) as MixSlice
                                                     const rawValue = asNumber(Array.isArray(value) ? value[0] : value)
                                                     return [
-                                                      `${rawValue.toLocaleString()} plans`,
+                                                      `${rawValue.toLocaleString()} records`,
                                                       `${payload.label} (${payload.percentage.toFixed(1)}%)`,
                                                     ]
                                                   }}
@@ -3050,7 +3229,7 @@ export default function MultiGraphView({
                                             </ResponsiveContainer>
                                           </div>
                                           <ul className="max-h-44 overflow-y-auto space-y-1.5 pr-1">
-                                            {planSlices.map((slice) => (
+                                            {section.slices.map((slice) => (
                                               <li key={slice.gradientId} className="flex items-center gap-2 text-[11px] text-slate-600">
                                                 <span
                                                   className="inline-block h-2.5 w-2.5 rounded-full border border-white/80"
@@ -3066,93 +3245,12 @@ export default function MultiGraphView({
                                             ))}
                                           </ul>
                                         </div>
-                                      ) : (
-                                        <div className="mt-2 text-xs text-slate-500">
-                                          {mixRow.planMessage || activeRegionalPrimaryDescriptor.missingText}
-                                        </div>
-                                      )}
-                                    </div>
-
-                                    <div className="rounded-xl border border-slate-200 bg-white p-3">
-                                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
-                                        {activeRegionalSecondaryDescriptor.sectionTitle}
                                       </div>
-                                      {deviceSlices.length ? (
-                                        <div className="mt-2 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(170px,1fr)] gap-3 items-center">
-                                          <div style={{ height: `${comparisonPieSizing.height}px` }}>
-                                            <ResponsiveContainer width="100%" height="100%">
-                                              <PieChart>
-                                                <defs>
-                                                  {deviceSlices.map((slice) => (
-                                                    <linearGradient
-                                                      key={slice.gradientId}
-                                                      id={slice.gradientId}
-                                                      x1="0%"
-                                                      y1="0%"
-                                                      x2="100%"
-                                                      y2="100%"
-                                                    >
-                                                      <stop offset="0%" stopColor={slice.gradient.from} />
-                                                      <stop offset="100%" stopColor={slice.gradient.to} />
-                                                    </linearGradient>
-                                                  ))}
-                                                </defs>
-                                                <Pie
-                                                  data={deviceSlices}
-                                                  dataKey="value"
-                                                  nameKey="label"
-                                                  innerRadius={comparisonPieSizing.innerRadius}
-                                                  outerRadius={comparisonPieSizing.outerRadius}
-                                                  paddingAngle={1.8}
-                                                  stroke="none"
-                                                  isAnimationActive={!prefersReducedMotion}
-                                                  animationDuration={prefersReducedMotion ? 0 : 450}
-                                                >
-                                                  {deviceSlices.map((slice) => (
-                                                    <Cell
-                                                      key={slice.gradientId}
-                                                      fill={`url(#${slice.gradientId})`}
-                                                      stroke="#ffffff"
-                                                      strokeWidth={1}
-                                                    />
-                                                  ))}
-                                                </Pie>
-                                                <RechartsTooltip
-                                                  formatter={(value, _name, entry) => {
-                                                    const payload = (entry?.payload || {}) as MixSlice
-                                                    const rawValue = asNumber(Array.isArray(value) ? value[0] : value)
-                                                    return [
-                                                      `${rawValue.toLocaleString()} plans`,
-                                                      `${payload.label} (${payload.percentage.toFixed(1)}%)`,
-                                                    ]
-                                                  }}
-                                                />
-                                              </PieChart>
-                                            </ResponsiveContainer>
-                                          </div>
-                                          <ul className="max-h-44 overflow-y-auto space-y-1.5 pr-1">
-                                            {deviceSlices.map((slice) => (
-                                              <li key={slice.gradientId} className="flex items-center gap-2 text-[11px] text-slate-600">
-                                                <span
-                                                  className="inline-block h-2.5 w-2.5 rounded-full border border-white/80"
-                                                  style={{
-                                                    backgroundImage: `linear-gradient(135deg, ${slice.gradient.from}, ${slice.gradient.to})`,
-                                                  }}
-                                                />
-                                                <span className="truncate">{slice.label}</span>
-                                                <span className="ml-auto font-semibold text-slate-500">
-                                                  {slice.percentage.toFixed(1)}%
-                                                </span>
-                                              </li>
-                                            ))}
-                                          </ul>
-                                        </div>
-                                      ) : (
-                                        <div className="mt-2 text-xs text-slate-500">
-                                          {mixRow.deviceMessage || activeRegionalSecondaryDescriptor.missingText}
-                                        </div>
-                                      )}
-                                    </div>
+                                    )) : (
+                                      <div className="rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-500">
+                                        {mixSections.find((section) => section.emptyText)?.emptyText || `No relatable mix data found for ${mixRow.state}.`}
+                                      </div>
+                                    )}
                                   </div>
                                 </div>
                               )

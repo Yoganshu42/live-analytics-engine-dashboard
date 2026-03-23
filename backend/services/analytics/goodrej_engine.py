@@ -2,12 +2,19 @@ import pandas as pd
 import numpy as np
 import time
 import logging
+import threading
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
 
 LOSS_RATIO_CAP_PERCENT = 300.0
 logger = logging.getLogger(__name__)
+GODREJ_LOAD_CACHE_TTL_SECONDS = 300
+_godrej_load_cache_lock = threading.Lock()
+_godrej_load_cache: dict[
+    tuple[str, str, str, str, str, bool, bool],
+    tuple[float, dict[str, pd.DataFrame]],
+] = {}
 
 REVENUE_SPLIT = {
     "D2D": {"Channel": 0.25, "Godrej": 0.35, "Zopper": 0.40},
@@ -17,7 +24,45 @@ REVENUE_SPLIT = {
     "Amazon": {"Channel": 0.40, "Godrej": 0.35, "Zopper": 0.25},
 }
 
+
+def invalidate_godrej_load_cache(
+    source: str | None = None,
+    dataset_type: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    source_scope: set[str] | None = None
+    if source is not None:
+        source_key = (source or "").strip().lower()
+        if source_key in {"godrej", "goodrej", "goddrej"}:
+            source_scope = {"godrej", "goodrej", "goddrej"}
+        else:
+            source_scope = {source_key}
+
+    dataset_scope = (dataset_type or "").strip().lower() if dataset_type is not None else None
+    job_scope = (job_id or "").strip() if job_id is not None else None
+
+    with _godrej_load_cache_lock:
+        if source_scope is None and dataset_scope is None and job_scope is None:
+            _godrej_load_cache.clear()
+            return None
+
+        keys_to_delete: list[tuple[str, str, str, str, str, bool, bool]] = []
+        for key in _godrej_load_cache.keys():
+            key_source, key_dataset, key_job, _from_key, _to_key, _sales, _claims = key
+            if source_scope is not None and key_source not in source_scope:
+                continue
+            if dataset_scope is not None and key_dataset != dataset_scope:
+                continue
+            if job_scope is not None and key_job != job_scope:
+                continue
+            keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            _godrej_load_cache.pop(key, None)
+    return None
+
 class GodrejAnalyticsEngine(BaseAnalyticsEngine):
+    SOURCE_PATTERNS = ("godrej%", "goodrej%", "goddrej%")
     CLAIM_CHANNEL_MAP = {
         "d2d": "D2D",
         "pod": "POD",
@@ -76,11 +121,56 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         self.apply_date_filter = bool(self.report_start is not None or self.report_end is not None)
         self.valuation_date = self._resolve_valuation_date(self.report_end)
 
+    def _shared_load_cache_key(self, include_sales: bool, include_claims: bool) -> tuple[str, str, str, str, str, bool, bool]:
+        from_key = self.report_start.date().isoformat() if self.report_start is not None else ""
+        to_key = self.report_end.date().isoformat() if self.report_end is not None else ""
+        return (
+            (self.source or "").strip().lower(),
+            (self.dataset_type or "").strip().lower(),
+            (self.job_id or "").strip(),
+            from_key,
+            to_key,
+            include_sales,
+            include_claims,
+        )
+
+    def _clone_loaded_data(self, data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        return {
+            "sales": data.get("sales", pd.DataFrame()).copy(deep=False),
+            "claims": data.get("claims", pd.DataFrame()).copy(deep=False),
+        }
+
     # --------------------------------------------------
     # LOAD DATA
     # --------------------------------------------------
 
     def load_data(self, include_sales: bool = True, include_claims: bool = True) -> dict[str, pd.DataFrame]:
+        cache_key = (include_sales, include_claims)
+        if cache_key in self._loaded_data_cache:
+            return self._loaded_data_cache[cache_key]
+
+        shared_key = self._shared_load_cache_key(include_sales, include_claims)
+        now = time.time()
+        with _godrej_load_cache_lock:
+            shared_cached = _godrej_load_cache.get(shared_key)
+            if shared_cached is not None:
+                expires_at, cached_value = shared_cached
+                if expires_at >= now:
+                    cloned = self._clone_loaded_data(cached_value)
+                    self._loaded_data_cache[cache_key] = cloned
+                    return cloned
+                _godrej_load_cache.pop(shared_key, None)
+
+            result = self._load_data_uncached(include_sales=include_sales, include_claims=include_claims)
+            cloned = self._clone_loaded_data(result)
+            _godrej_load_cache[shared_key] = (
+                time.time() + GODREJ_LOAD_CACHE_TTL_SECONDS,
+                cloned,
+            )
+            self._loaded_data_cache[cache_key] = self._clone_loaded_data(cloned)
+            return self._loaded_data_cache[cache_key]
+
+    def _load_data_uncached(self, include_sales: bool = True, include_claims: bool = True) -> dict[str, pd.DataFrame]:
         cache_key = (include_sales, include_claims)
         if cache_key in self._loaded_data_cache:
             return self._loaded_data_cache[cache_key]
@@ -104,11 +194,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
     def _load_rows(self, dataset_type):
         q = self.db.query(DataRow.data).filter(DataRow.dataset_type == dataset_type)
         if self.source:
-            q = q.filter(
-                (DataRow.source.ilike("godrej%")) |
-                (DataRow.source.ilike("goodrej%")) |
-                (DataRow.source.ilike("goddrej%"))
-            )
+            q = self._apply_source_filter(q)
         base_query = q
         tag = (self.job_id or "").strip()
         aggregate_claims_across_tags = dataset_type == "claims" and self.dataset_type == "claims"
@@ -145,13 +231,24 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                     col_map[col] = "Warranty End Date"
                 elif key in {"channel", "channel name", "channel_name"}:
                     col_map[col] = "Channel"
+                elif key in {"retail premium", "retail_premium"}:
+                    col_map[col] = "Retail Premium"
             if col_map:
                 df = df.rename(columns=col_map)
         if dataset_type == "claims" and not df.empty:
             col_map = {}
             for col in df.columns:
                 key = str(col).strip().lower()
-                if key in {"claim amount", "claim_amount", "net claim amount", "net_claim_amount"}:
+                if key in {
+                    "claim amount",
+                    "claim_amount",
+                    "net claim amount",
+                    "net_claim_amount",
+                    "payout amount",
+                    "payout_amount",
+                    "claims costing",
+                    "claims_costing",
+                }:
                     col_map[col] = "Claim_Amount"
                 elif key in {"customer premium", "customer_premium", "premium"}:
                     col_map[col] = "Customer Premium"
@@ -169,6 +266,17 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         else:
             df = self._normalize_claims(df)
         return df
+
+    @classmethod
+    def _apply_source_filter(cls, query):
+        filters = [DataRow.source.ilike(pattern) for pattern in cls.SOURCE_PATTERNS]
+        if not filters:
+            return query
+
+        condition = filters[0]
+        for extra in filters[1:]:
+            condition = condition | extra
+        return query.filter(condition)
 
     # --------------------------------------------------
     # PREMIUM CALCULATION
@@ -239,13 +347,14 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             df.loc[missing_start, "Unearned_Premium"] = df.loc[missing_start, "Customer Premium"]
 
         df["Channel"] = self._canonical_sales_channel(df["Channel"])
+        zopper_total = self._zopper_total_share_amount_series(df)
+        earned_ratio = (df["Used_Days"] / df["Coverage_Days"]).fillna(0.0)
         split_df = pd.DataFrame(df["Channel"].map(REVENUE_SPLIT).tolist(), index=df.index).fillna(0)
-        zopper_share = split_df.get("Zopper", split_df.get("zopper", 0))
         godrej_share = split_df.get("Godrej", split_df.get("godrej", 0))
         channel_share = split_df.get("Channel", split_df.get("channel", 0))
 
-        df["Zopper_Share_EP"] = df["Earned_Premium"] * zopper_share
-        df["Zopper_Unearned"] = df["Unearned_Premium"] * zopper_share
+        df["Zopper_Share_EP"] = zopper_total * earned_ratio
+        df["Zopper_Unearned"] = (zopper_total - df["Zopper_Share_EP"]).clip(lower=0)
         df["Godrej_Share_EP"] = df["Earned_Premium"] * godrej_share
         df["Channel_Share_EP"] = df["Earned_Premium"] * channel_share
 
@@ -270,6 +379,21 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         if index is None:
             return pd.Series(value)
         return pd.Series(value, index=index)
+
+    @classmethod
+    def _numeric_series_from_frame(
+        cls,
+        df: pd.DataFrame,
+        column: str,
+        *,
+        default: float = 0.0,
+    ) -> pd.Series:
+        if column in df.columns:
+            return pd.to_numeric(
+                cls._as_series(df[column], index=df.index),
+                errors="coerce",
+            ).fillna(float(default))
+        return pd.Series(float(default), index=df.index, dtype="float64")
 
     @staticmethod
     def _normalize_col_key(value: str) -> str:
@@ -311,6 +435,16 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         mapped = normalized.map(cls.CLAIM_CHANNEL_MAP)
         original = series.astype(str).str.strip()
         return mapped.where(mapped.notna(), original)
+
+    def _zopper_total_share_amount_series(self, sales_df: pd.DataFrame) -> pd.Series:
+        channel_series = (
+            self._canonical_sales_channel(sales_df.get("Channel", pd.Series("", index=sales_df.index)))
+            if "Channel" in sales_df.columns
+            else pd.Series("", index=sales_df.index)
+        )
+        zopper_share = channel_series.map(lambda ch: float((REVENUE_SPLIT.get(ch) or {}).get("Zopper", 0.0)))
+        customer_premium = self._numeric_series_from_frame(sales_df, "Customer Premium")
+        return customer_premium * zopper_share.fillna(0.0)
 
     @classmethod
     def _canonical_state(cls, series: pd.Series) -> pd.Series:
@@ -398,6 +532,8 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "Claim Amount",
                 "Net Claim Amount",
                 "Net_Claim_Amount",
+                "Payout Amount",
+                "Payout_Amount",
                 "Amount",
                 "Invoice Amount",
                 "Payment Amount",
@@ -474,6 +610,8 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "Claim Amount",
                 "Net Claim Amount",
                 "Net_Claim_Amount",
+                "Payout Amount",
+                "Payout_Amount",
                 "Amount",
                 "Invoice Amount",
                 "Payment Amount",
@@ -720,6 +858,15 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "Product_Category_Name",
                 "Product Category Name",
                 "Category",
+            ],
+            "product_subcategory": [
+                "Appliance Model Name",
+                "Model Code",
+                "model_code",
+                "Item Description",
+                "Product Model",
+                "Product_Model",
+                "display_plan_name",
             ],
             "month": [
                 *(month_candidates_claims if dataset_type == "claims" else month_candidates_sales),
@@ -1019,19 +1166,12 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             start_dt = pd.to_datetime(sales_df[start_col], errors="coerce")
             end_col = _pick_column(sales_df, ["Warranty End Date", "Warranty End_Date", "End Date", "End_Date"])
             end_dt = pd.to_datetime(sales_df[end_col], errors="coerce") if end_col is not None else pd.Series(pd.NaT, index=sales_df.index)
-            coverage_days = pd.to_numeric(sales_df.get("Coverage_Days", 0), errors="coerce").fillna(0)
+            coverage_days = self._numeric_series_from_frame(sales_df, "Coverage_Days")
             computed_end = start_dt + pd.to_timedelta((coverage_days - 1).clip(lower=0), unit="D")
             end_dt = end_dt.where(end_dt.notna(), computed_end)
             policy_days = (end_dt - start_dt).dt.days + 1
 
-            channel_series = (
-                self._canonical_sales_channel(sales_df.get("Channel", pd.Series("", index=sales_df.index)))
-                if "Channel" in sales_df.columns
-                else pd.Series("", index=sales_df.index)
-            )
-            zopper_share = channel_series.map(lambda ch: float((REVENUE_SPLIT.get(ch) or {}).get("Zopper", 0.0)))
-            customer_premium = pd.to_numeric(sales_df.get("Customer Premium", 0), errors="coerce").fillna(0.0)
-            zopper_total = customer_premium * zopper_share.fillna(0.0)
+            zopper_total = self._zopper_total_share_amount_series(sales_df)
 
             valid = start_dt.notna() & end_dt.notna() & policy_days.gt(0) & zopper_total.ne(0)
             sales_monthly = pd.Series(0.0, index=month_index, dtype="float64")
@@ -1188,27 +1328,33 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
 
         if self.dataset_type == "claims":
             claim_amount = self._claim_amount_series(df)
-            positive_claims = claim_amount > 0
-            if not positive_claims.any():
-                return []
-            df = df[positive_claims].copy()
-            claim_amount = claim_amount[positive_claims]
-
-            if metric == "claims":
+            if metric == "quantity":
+                # Quantity should reflect all claim cases in scope, even if the
+                # settled/payout amount for some rows is zero.
+                df["_value"] = 1
+            elif metric == "claims":
+                positive_claims = claim_amount > 0
+                if not positive_claims.any():
+                    return []
+                df = df[positive_claims].copy()
+                claim_amount = claim_amount[positive_claims]
                 df["_value"] = claim_amount
             elif metric == "net_claims":
+                positive_claims = claim_amount > 0
+                if not positive_claims.any():
+                    return []
+                df = df[positive_claims].copy()
+                claim_amount = claim_amount[positive_claims]
                 df["_value"] = claim_amount
-            elif metric == "quantity":
-                df["_value"] = 1
             else:
                 return []
         else:
             if metric == "gross_premium":
-                df["_value"] = pd.to_numeric(df.get("Customer Premium", 0), errors="coerce").fillna(0)
+                df["_value"] = self._numeric_series_from_frame(df, "Customer Premium")
             elif metric == "earned_premium":
-                df["_value"] = pd.to_numeric(df.get("Earned_Premium", 0), errors="coerce").fillna(0)
+                df["_value"] = self._numeric_series_from_frame(df, "Earned_Premium")
             elif metric == "zopper_earned_premium":
-                df["_value"] = pd.to_numeric(df.get("Zopper_Share_EP", 0), errors="coerce").fillna(0)
+                df["_value"] = self._numeric_series_from_frame(df, "Zopper_Share_EP")
             elif metric == "quantity":
                 df["_value"] = 1
             else:
@@ -1277,19 +1423,12 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 }
             claim_amount = self._claim_amount_series(df)
             positive_claims = claim_amount > 0
-            if not positive_claims.any():
-                return {
-                    "gross_premium": 0,
-                    "earned_premium": 0,
-                    "zopper_earned_premium": 0,
-                    "units_sold": 0,
-                }
-            claims = claim_amount[positive_claims].sum()
+            claims = claim_amount[positive_claims].sum() if positive_claims.any() else 0.0
             return {
                 "gross_premium": float(claims),
                 "earned_premium": float(claims),
                 "zopper_earned_premium": float(claims),
-                "units_sold": int(positive_claims.sum()),
+                "units_sold": int(len(df)),
             }
 
         df = data["sales"]
@@ -1306,9 +1445,9 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         df_all = df
         df_period = self._apply_date_filter(df, "sales")
 
-        gross = pd.to_numeric(df_all.get("Customer Premium", 0), errors="coerce").fillna(0).sum()
-        earned = pd.to_numeric(df_period.get("Earned_Premium", 0), errors="coerce").fillna(0).sum()
-        zopper_earned = pd.to_numeric(df_period.get("Zopper_Share_EP", 0), errors="coerce").fillna(0).sum()
+        gross = self._numeric_series_from_frame(df_all, "Customer Premium").sum()
+        earned = self._numeric_series_from_frame(df_period, "Earned_Premium").sum()
+        zopper_earned = self._numeric_series_from_frame(df_period, "Zopper_Share_EP").sum()
 
         return {
             "gross_premium": float(gross),
@@ -1319,4 +1458,3 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
 
     def compute(self) -> dict:
         return {}
-

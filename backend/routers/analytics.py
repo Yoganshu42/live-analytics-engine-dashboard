@@ -4,6 +4,7 @@ from typing import Any
 import re
 import time
 import logging
+import threading
 
 from fastapi import APIRouter, Query, Depends
 import pandas as pd
@@ -13,6 +14,7 @@ from collections import Counter
 from datetime import datetime
 
 from db.deps import get_db
+from db.session import SessionLocal
 from services.analytics import ENGINE_REGISTRY
 from services.analytics_repository import get_dataframe
 from services.analytics_engine import (
@@ -36,6 +38,10 @@ from services.samsung_partner_config import (
 )
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 logger = logging.getLogger(__name__)
+APPLIANCE_SOURCES = {"godrej", "hitachi"}
+
+_master_rebuild_lock = threading.Lock()
+_master_rebuild_inflight: set[str] = set()
 
 
 def _normalize_source(source: str) -> tuple[str, str]:
@@ -48,6 +54,8 @@ def _normalize_source(source: str) -> tuple[str, str]:
         resolved = "reliance"
     elif source_key in {"godrej", "goodrej", "goddrej"}:
         resolved = "godrej"
+    elif source_key == "hitachi":
+        resolved = "hitachi"
     else:
         resolved = source_key
 
@@ -125,6 +133,45 @@ def _sanitize_range(
     safe_from = from_dt.date().isoformat() if from_dt is not None and from_dt is not pd.NaT else None
     safe_to = to_dt.date().isoformat() if to_dt is not None and to_dt is not pd.NaT else None
     return safe_from, safe_to
+
+
+def _resolve_job_id_fallback(
+    *,
+    db: Session,
+    resolved_source: str,
+    dataset_key: str,
+    job_id: str | None,
+    context: str,
+) -> str | None:
+    job_key = (job_id or "").strip()
+    if not job_key:
+        return None
+
+    if resolved_source not in {"reliance", *APPLIANCE_SOURCES}:
+        return job_key
+
+    def _has_rows(tag: str | None) -> bool:
+        query = (
+            db.query(func.count(DataRow.id))
+            .filter(DataRow.source == resolved_source)
+            .filter(DataRow.dataset_type == dataset_key)
+        )
+        if tag is None:
+            query = query.filter(DataRow.job_id.is_(None))
+        else:
+            query = query.filter(DataRow.job_id == tag)
+        return int(query.scalar() or 0) > 0
+
+    if not _has_rows(job_key) and _has_rows(None):
+        logger.warning(
+            "Job filter %s had no rows for %s/%s; falling back to untagged data.",
+            job_key,
+            resolved_source,
+            dataset_key,
+        )
+        return None
+
+    return job_key
 
 
 def _latest_from_columns(df: pd.DataFrame, columns: list[str]) -> pd.Timestamp | None:
@@ -684,8 +731,16 @@ def _metric_series_for_city_breakdown(
                 "Net_Amount",
                 "Claim Amount",
                 "Claim_Amount",
+                "Payout Amount",
+                "Payout_Amount",
                 "Zopper's Cost",
                 "Zoppers Cost",
+                "Claims Costing",
+                "Claim Costing",
+                "Paid Amount",
+                "Approved Amount",
+                "Claim Cost",
+                "Paid_Amount",
             ],
         )
         if not claims_col:
@@ -760,6 +815,8 @@ def _resolve_category_dimension_column(df: pd.DataFrame, dimension: str) -> str 
             [
                 "Plan Category",
                 "Plan_Category",
+                "Care+ Plan Name",
+                "Care+ Plan",
                 "Plan Type",
                 "Plan_Type",
                 "Warranty Type",
@@ -768,6 +825,19 @@ def _resolve_category_dimension_column(df: pd.DataFrame, dimension: str) -> str 
                 "Product_Category",
                 "Category",
                 "Type",
+            ],
+        )
+
+    if dim_key == "reason":
+        return _find_column(
+            df,
+            [
+                "Nature of Complaint",
+                "Major call Operation",
+                "Fault Code",
+                "Fault_Code",
+                "Reason",
+                "Complaint Type",
             ],
         )
 
@@ -839,6 +909,42 @@ def _resolve_category_dimension_column(df: pd.DataFrame, dimension: str) -> str 
                 "item",
             ],
         )
+    if dim_key == "product_subcategory":
+        return _find_column(
+            df,
+            [
+                "Appliance Model Name",
+                "Model Code",
+                "model_code",
+                "Item Description",
+                "Product Model",
+                "Product_Model",
+                "display_plan_name",
+            ],
+        )
+    if dim_key in {"state", "region"}:
+        return _find_column(
+            df,
+            [
+                "State",
+                "STATE3",
+                "State Name",
+                "State_Name",
+                "Customer_State",
+                "Customer State",
+                "Region",
+                "Region Name",
+                "Region_Name",
+                "Zone",
+                "Zone Name",
+                "Location",
+                "City",
+                "Customer City",
+                "Customer_City",
+                "State/City",
+                "State / City",
+            ],
+        )
     return None
 
 
@@ -859,6 +965,37 @@ def _parse_filter_values(raw_values: str | None) -> list[str]:
         seen.add(compact)
         values.append(label)
     return values
+
+
+def _clean_category_label_series(
+    labels: pd.Series,
+    *,
+    engine: Any | None = None,
+) -> pd.Series:
+    cleaned = (
+        labels.astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .replace(
+            {
+                "": pd.NA,
+                "nan": pd.NA,
+                "none": pd.NA,
+                "null": pd.NA,
+                "NaN": pd.NA,
+                "None": pd.NA,
+                "NULL": pd.NA,
+            }
+        )
+    )
+    blocked = {"", "0", "nan", "none", "null", "unknown", "na", "other", "others"}
+    cleaned = cleaned.where(
+        ~cleaned.fillna("").map(lambda value: _collapse_bucket_value(value) in blocked),
+        pd.NA,
+    )
+    if engine is not None and hasattr(engine, "_is_identifier_like"):
+        cleaned = cleaned.where(~cleaned.fillna("").map(engine._is_identifier_like), pd.NA)
+    return cleaned
 
 
 def _canonical_plan_category_value(value: Any) -> str:
@@ -915,6 +1052,10 @@ def _build_dimension_filters(
         "brand",
         "channel",
         "product_category",
+        "product_subcategory",
+        "state",
+        "region",
+        "reason",
     }
     raw_specs = [
         (filter_1_dimension, filter_1_values),
@@ -964,6 +1105,15 @@ def _apply_dimension_filters_to_frame(
         elif dim_key == "device_plan_category":
             allowed_compact = {_collapse_bucket_value(_canonical_device_plan_category_value(v)) for v in values}
             series = scoped[dim_col].astype(str).str.strip().map(_canonical_device_plan_category_value)
+            compact_series = series.map(_collapse_bucket_value)
+        elif dim_key in {"state", "region"}:
+            allowed_compact = {
+                _collapse_bucket_value(_canonical_geo_label(v, kind="state"))
+                for v in values
+            }
+            series = scoped[dim_col].astype(str).str.strip().map(
+                lambda v: _canonical_geo_label(v, kind="state")
+            )
             compact_series = series.map(_collapse_bucket_value)
         else:
             allowed_compact = {_collapse_bucket_value(v) for v in values}
@@ -1077,14 +1227,15 @@ def _load_godrej_claims_dataframe(
     job_id: str | None,
     from_date: str | None,
     to_date: str | None,
+    source: str = "godrej",
 ):
-    engine_cls = ENGINE_REGISTRY.get("godrej")
+    engine_cls = ENGINE_REGISTRY.get(source)
     if engine_cls is None:
         return None, pd.DataFrame()
     engine = engine_cls(
         db=db,
         job_id=job_id,
-        source="godrej",
+        source=source,
         dataset_type="claims",
         from_date=from_date,
         to_date=to_date,
@@ -1357,7 +1508,7 @@ def compute_by_dimension_rows(
             to_date=to_date,
         )
         if active_category_filters:
-            if engine_key in {"samsung", "godrej"}:
+            if engine_key in {"samsung", "godrej", "hitachi"}:
                 needs_sales = dataset_type == "sales" or metric == "loss_ratio"
                 needs_claims = dataset_type == "claims" or metric == "loss_ratio"
                 payload = engine.load_data(
@@ -1444,6 +1595,13 @@ def analytics_by_dimension(
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
+    job_id = _resolve_job_id_fallback(
+        db=db,
+        resolved_source=resolved_source,
+        dataset_key=normalized_dataset,
+        job_id=job_id,
+        context="by_dimension",
+    )
 
     bucket_key = (bucket or "").strip().lower() or None
     if bucket_key not in {None, "day", "week", "month"}:
@@ -1502,7 +1660,12 @@ def analytics_by_dimension(
         and normalized_dataset == "claims"
         and dimension_key in {"month", "date"}
     )
-    cached = None if (force_live_samsung_sales_metrics or force_live_samsung_claims_trend) else get_precomputed_graph(
+    force_live_hitachi_sales_graph = (
+        resolved_source == "hitachi"
+        and normalized_dataset == "sales"
+        and (dimension_key in {"month", "date"} or bool(from_date or to_date))
+    )
+    cached = None if (force_live_samsung_sales_metrics or force_live_samsung_claims_trend or force_live_hitachi_sales_graph) else get_precomputed_graph(
         db=db,
         source=resolved_source,
         dataset_type=normalized_dataset,
@@ -1522,6 +1685,7 @@ def analytics_by_dimension(
         is_stale_godrej_claims_range_mismatch = False
         is_stale_godrej_sales_month_mismatch = False
         is_stale_loss_ratio_period_window = False
+        is_stale_reliance_month_floor = False
         dimension_key = _to_safe_key(dimension or "")
         if isinstance(cached[0], dict):
             row_keys = {_to_safe_key(str(k)) for k in cached[0].keys()}
@@ -1780,6 +1944,39 @@ def analytics_by_dimension(
                 if to_month is not None and cached_max_month > to_month:
                     is_stale_godrej_sales_month_mismatch = True
 
+        if resolved_source == "reliance" and dimension_key in {"month", "date"}:
+            month_values: list[str] = []
+            for row in cached:
+                if not isinstance(row, dict):
+                    continue
+                safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                dim_col = safe_map.get(dimension_key) or safe_map.get(_to_safe_key(dimension or ""))
+                if dim_col is None:
+                    continue
+                raw_val = row.get(dim_col)
+                if raw_val is None:
+                    continue
+                month_values.append(str(raw_val))
+
+            if month_values:
+                parsed = _parse_series(pd.Series(month_values)).dropna()
+                if not parsed.empty:
+                    cached_min = parsed.min().to_period("M").to_timestamp()
+                    expected_start = pd.to_datetime(from_date, errors="coerce") if from_date else None
+                    if expected_start is not None and not pd.isna(expected_start):
+                        expected_start = pd.Timestamp(expected_start).to_period("M").to_timestamp()
+                    else:
+                        expected_start, _ = _date_bounds_for_source_dataset(
+                            db=db,
+                            job_id=job_id,
+                            source=resolved_source,
+                            dataset_type=normalized_dataset,
+                        )
+                        if expected_start is not None and not pd.isna(expected_start):
+                            expected_start = pd.Timestamp(expected_start).to_period("M").to_timestamp()
+                    if expected_start is not None and cached_min > expected_start:
+                        is_stale_reliance_month_floor = True
+
         if (
             is_stale_cached_shape
             or is_stale_zero_metric
@@ -1788,6 +1985,7 @@ def analytics_by_dimension(
             or is_stale_godrej_legacy_region
             or is_stale_godrej_claims_range_mismatch
             or is_stale_godrej_sales_month_mismatch
+            or is_stale_reliance_month_floor
             or is_stale_loss_ratio_period_window
         ):
             if is_stale_cached_shape:
@@ -1802,6 +2000,8 @@ def analytics_by_dimension(
                 reason = "godrej_range_mismatch"
             elif is_stale_godrej_sales_month_mismatch:
                 reason = "godrej_sales_month_mismatch"
+            elif is_stale_reliance_month_floor:
+                reason = "reliance_month_floor"
             elif is_stale_loss_ratio_period_window:
                 reason = "loss_ratio_period_window"
             else:
@@ -1826,7 +2026,7 @@ def analytics_by_dimension(
                 (time.perf_counter() - started) * 1000,
             )
             return normalized_cached
-    if cached == [] and (resolved_source.startswith("samsung") or resolved_source == "reliance"):
+    if cached == [] and (resolved_source.startswith("samsung") or resolved_source in {"reliance", *APPLIANCE_SOURCES}):
         logger.warning(
             "Empty precomputed graph detected; recomputing live source=%s dataset=%s dimension=%s metric=%s from=%s to=%s",
             resolved_source,
@@ -1858,6 +2058,53 @@ def analytics_by_dimension(
         )
         out = []
 
+    fallback_job_id: str | None = job_id
+    if (
+        not out
+        and job_id is not None
+        and resolved_source == "reliance"
+    ):
+        def _has_rows(tag: str | None) -> bool:
+            query = (
+                db.query(func.count(DataRow.id))
+                .filter(DataRow.source == resolved_source)
+                .filter(DataRow.dataset_type == normalized_dataset)
+            )
+            if tag is None:
+                query = query.filter(DataRow.job_id.is_(None))
+            else:
+                query = query.filter(DataRow.job_id == tag)
+            return int(query.scalar() or 0) > 0
+
+        if not _has_rows(job_id) and _has_rows(None):
+            try:
+                out = compute_by_dimension_rows(
+                    db=db,
+                    job_id=None,
+                    dimension=dimension,
+                    metric=metric,
+                    source=source,
+                    dataset_type=normalized_dataset,
+                    bucket=bucket_key,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                fallback_job_id = None
+                logger.warning(
+                    "Reliance job_id %s had no rows; served untagged data instead for dimension=%s metric=%s",
+                    job_id,
+                    dimension,
+                    metric,
+                )
+            except Exception:
+                logger.exception(
+                    "Fallback compute failed for reliance source=%s dataset=%s dimension=%s metric=%s",
+                    source,
+                    dataset_type,
+                    dimension,
+                    metric,
+                )
+
     logger.info(
         "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=live rows=%s duration_ms=%.2f",
         source,
@@ -1872,7 +2119,7 @@ def analytics_by_dimension(
             db=db,
             source=resolved_source,
             dataset_type=normalized_dataset,
-            job_id=job_id,
+            job_id=fallback_job_id,
             dimension=dimension,
             metric=metric,
             bucket=bucket_key,
@@ -1909,12 +2156,13 @@ def analytics_city_breakdown(
     normalized_dataset = (dataset_type or "").strip().lower()
     resolved_source, _ = _normalize_source(source)
 
-    if resolved_source == "godrej" and normalized_dataset == "claims":
+    if resolved_source in APPLIANCE_SOURCES and normalized_dataset == "claims":
         engine, df = _load_godrej_claims_dataframe(
             db=db,
             job_id=job_id,
             from_date=from_date,
             to_date=to_date,
+            source=resolved_source,
         )
         if df is None or df.empty:
             return {
@@ -2175,21 +2423,24 @@ def analytics_category_percentage(
         "brand",
         "channel",
         "product_category",
+        "product_subcategory",
+        "reason",
     }:
         return {
             "dimension": dimension,
             "metric": metric,
             "state": state,
             "rows": [],
-            "message": "Supported dimensions: plan_category, device_plan_category, article_brand, brand, channel, product_category.",
+            "message": "Supported dimensions: plan_category, device_plan_category, article_brand, brand, channel, product_category, product_subcategory, reason.",
         }
 
-    if resolved_source == "godrej" and normalized_dataset == "claims":
+    if resolved_source in APPLIANCE_SOURCES and normalized_dataset == "claims":
         engine, df = _load_godrej_claims_dataframe(
             db=db,
             job_id=job_id,
             from_date=from_date,
             to_date=to_date,
+            source=resolved_source,
         )
         if df is None or df.empty:
             return {
@@ -2271,24 +2522,7 @@ def analytics_category_percentage(
                 "message": f"Metric '{metric}' is unavailable for this percentage breakdown.",
             }
 
-        labels = (
-            scoped[dim_col]
-            .astype(str)
-            .str.strip()
-            .str.replace(r"\s+", " ", regex=True)
-            .replace(
-                {
-                    "": pd.NA,
-                    "nan": pd.NA,
-                    "none": pd.NA,
-                    "null": pd.NA,
-                    "NaN": pd.NA,
-                    "None": pd.NA,
-                    "NULL": pd.NA,
-                }
-            )
-        )
-        labels = labels.where(~labels.fillna("").map(engine._is_identifier_like), pd.NA)
+        labels = _clean_category_label_series(scoped[dim_col], engine=engine)
 
         scoped = scoped.copy()
         scoped["_label"] = labels
@@ -2385,22 +2619,7 @@ def analytics_category_percentage(
             "message": f"Metric '{metric}' is unavailable for this percentage breakdown.",
         }
 
-    labels = (
-        scoped[dim_col]
-        .astype(str)
-        .str.strip()
-        .replace(
-            {
-                "": pd.NA,
-                "nan": pd.NA,
-                "none": pd.NA,
-                "null": pd.NA,
-                "NaN": pd.NA,
-                "None": pd.NA,
-                "NULL": pd.NA,
-            }
-        )
-    )
+    labels = _clean_category_label_series(scoped[dim_col])
 
     scoped = scoped.copy()
     scoped["_label"] = labels
@@ -2520,7 +2739,16 @@ def compute_summary_values(
                     return float(pd.to_numeric(df[name], errors="coerce").fillna(0).sum())
             return 0.0
 
-        claims_total = _sum_col("Net Amount", "Net_Amount", "Net Claims", "Net_Claims")
+        claims_total = _sum_col(
+            "Net Amount",
+            "Net_Amount",
+            "Net Claims",
+            "Net_Claims",
+            "Claim_Amount",
+            "Claim Amount",
+            "Payout Amount",
+            "Payout_Amount",
+        )
         otd_total = _sum_col(
             "OTD Amount",
             "OTD_Amount",
@@ -2715,6 +2943,35 @@ def _date_bounds_for_source_dataset(
         if product_purchase_min is not None or product_purchase_max is not None:
             return product_purchase_min, product_purchase_max
 
+    if dataset_key == "sales" and src_key == "hitachi":
+        # Hitachi sales filters and quick ranges should track the sale/purchase date.
+        # Warranty-start dates can extend into future coverage periods and break presets.
+        purchase_min, purchase_max = _bounds_from_columns(
+            df,
+            [
+                "Warranty Purchase Date",
+                "Plan Start Date",
+                "Date",
+                "Start_Date",
+                "Start Date",
+            ],
+        )
+        if purchase_min is not None or purchase_max is not None:
+            return purchase_min, purchase_max
+        month_min, month_max = _bounds_from_columns(df, ["Month"])
+        if month_min is not None or month_max is not None:
+            return month_min, month_max
+        warranty_min, warranty_max = _bounds_from_columns(
+            df,
+            [
+                "Warranty Start Date",
+                "Warranty Start_Date",
+                "Product Purchased Date",
+            ],
+        )
+        if warranty_min is not None or warranty_max is not None:
+            return warranty_min, warranty_max
+
     if dataset_key == "sales":
         if src_key == "reliance":
             # Reliance trends align to warranty/plan start.
@@ -2822,7 +3079,7 @@ def _master_source_bounds(
     min_dt: pd.Timestamp | None = None
     max_dt: pd.Timestamp | None = None
 
-    for source_key in [*SAMSUNG_PARTNER_SOURCES, "reliance", "godrej"]:
+    for source_key in [*SAMSUNG_PARTNER_SOURCES, "reliance", "godrej", "hitachi"]:
         for dataset_key in ["sales", "claims"]:
             for candidate_job_id in _master_job_candidates(source_key, job_id):
                 local_min, local_max = _date_bounds_for_source_dataset(
@@ -2849,7 +3106,7 @@ def _master_job_candidates(source: str, requested_job_id: str | None) -> list[st
     if source_key == "godrej":
         return [None]
     if requested_job_id:
-        if source_key == "reliance":
+        if source_key in {"reliance", "hitachi"}:
             return [requested_job_id, None]
         return [requested_job_id]
     return [None]
@@ -2866,6 +3123,8 @@ def _load_master_summary(
 ) -> tuple[dict[str, Any], str | None]:
     source_key = (source or "").strip().lower()
     force_live_summary = source_key in SAMSUNG_PARTNER_SOURCES and dataset_type in {"sales", "claims"}
+    if source_key == "hitachi" and dataset_type == "sales":
+        force_live_summary = True
     selected_summary: dict[str, Any] = {}
     selected_job_id: str | None = candidate_job_ids[0] if candidate_job_ids else None
     for candidate_job_id in candidate_job_ids:
@@ -2880,23 +3139,32 @@ def _load_master_summary(
                 to_date=to_date,
             )
         if summary is None:
-            summary = compute_summary_values(
-                db=db,
-                job_id=candidate_job_id,
-                source=source,
-                dataset_type=dataset_type,
-                from_date=from_date,
-                to_date=to_date,
-            )
-            upsert_precomputed_summary(
-                db=db,
-                source=source,
-                dataset_type=dataset_type,
-                job_id=candidate_job_id,
-                from_date=from_date,
-                to_date=to_date,
-                summary=summary if isinstance(summary, dict) else {},
-            )
+            try:
+                summary = compute_summary_values(
+                    db=db,
+                    job_id=candidate_job_id,
+                    source=source,
+                    dataset_type=dataset_type,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                upsert_precomputed_summary(
+                    db=db,
+                    source=source,
+                    dataset_type=dataset_type,
+                    job_id=candidate_job_id,
+                    from_date=from_date,
+                    to_date=to_date,
+                    summary=summary if isinstance(summary, dict) else {},
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to compute master summary source=%s dataset=%s job_id=%s",
+                    source,
+                    dataset_type,
+                    candidate_job_id,
+                )
+                summary = {}
 
         selected_summary = summary if isinstance(summary, dict) else {}
         selected_job_id = candidate_job_id
@@ -2919,6 +3187,8 @@ def _load_master_metric_rows(
 ) -> list[dict[str, Any]]:
     source_key = (source or "").strip().lower()
     force_live_rows = source_key in SAMSUNG_PARTNER_SOURCES and dataset_type in {"sales", "claims"}
+    if source_key == "hitachi" and dataset_type == "sales":
+        force_live_rows = True
     ordered_candidates: list[str | None] = []
     if preferred_job_id in candidate_job_ids:
         ordered_candidates.append(preferred_job_id)
@@ -2961,29 +3231,39 @@ def _load_master_metric_rows(
                 )
                 should_recompute_live = True
         if rows is None or should_recompute_live:
-            rows = compute_by_dimension_rows(
-                db=db,
-                job_id=candidate_job_id,
-                dimension="month",
-                metric=metric,
-                source=source,
-                dataset_type=dataset_type,
-                bucket="month",
-                from_date=from_date,
-                to_date=to_date,
-            )
-            upsert_precomputed_graph(
-                db=db,
-                source=source,
-                dataset_type=dataset_type,
-                job_id=candidate_job_id,
-                dimension="month",
-                metric=metric,
-                bucket="month",
-                from_date=from_date,
-                to_date=to_date,
-                rows=rows if isinstance(rows, list) else [],
-            )
+            try:
+                rows = compute_by_dimension_rows(
+                    db=db,
+                    job_id=candidate_job_id,
+                    dimension="month",
+                    metric=metric,
+                    source=source,
+                    dataset_type=dataset_type,
+                    bucket="month",
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                upsert_precomputed_graph(
+                    db=db,
+                    source=source,
+                    dataset_type=dataset_type,
+                    job_id=candidate_job_id,
+                    dimension="month",
+                    metric=metric,
+                    bucket="month",
+                    from_date=from_date,
+                    to_date=to_date,
+                    rows=rows if isinstance(rows, list) else [],
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to compute master metric rows source=%s dataset=%s metric=%s job_id=%s",
+                    source,
+                    dataset_type,
+                    metric,
+                    candidate_job_id,
+                )
+                rows = []
 
         selected_rows = rows if isinstance(rows, list) else []
         if _rows_have_values(selected_rows, metric):
@@ -3024,9 +3304,11 @@ def _build_master_dashboard_payload(
     source_configs = [
         ("samsung_vs", "samsung_vs"),
         ("samsung_croma", "samsung_croma"),
+        ("samsung_croma_dsdsg", "samsung_croma_dsdsg"),
         ("samsung_reliance_digital", "samsung_reliance_digital"),
         ("reliance", "reliance"),
         ("godrej", "godrej"),
+        ("hitachi", "hitachi"),
     ]
 
     for source_key, prefix in source_configs:
@@ -3120,6 +3402,56 @@ def _build_master_dashboard_payload(
     }
 
 
+def _schedule_master_dashboard_rebuild(
+    *,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+    cache_source: str,
+) -> None:
+    key = f"{job_id or ''}|{from_date or ''}|{to_date or ''}|{cache_source}"
+    with _master_rebuild_lock:
+        if key in _master_rebuild_inflight:
+            return
+        _master_rebuild_inflight.add(key)
+
+    def _worker() -> None:
+        worker_db = SessionLocal()
+        try:
+            payload = _build_master_dashboard_payload(
+                db=worker_db,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            upsert_precomputed_summary(
+                db=worker_db,
+                source=cache_source,
+                dataset_type="overview",
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+                summary=payload,
+            )
+            worker_db.commit()
+        except Exception:
+            worker_db.rollback()
+            logger.exception(
+                "Failed background master dashboard rebuild job_id=%s",
+                job_id,
+            )
+        finally:
+            worker_db.close()
+            with _master_rebuild_lock:
+                _master_rebuild_inflight.discard(key)
+
+    threading.Thread(
+        target=_worker,
+        name=f"master-dashboard-rebuild-{job_id or 'untagged'}",
+        daemon=True,
+    ).start()
+
+
 def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -3132,14 +3464,18 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "samsung_claims",
         "samsung_vs_sales",
         "samsung_croma_sales",
+        "samsung_croma_dsdsg_sales",
         "samsung_reliance_digital_sales",
         "reliance_sales",
         "godrej_sales",
         "samsung_vs_claims",
         "samsung_croma_claims",
+        "samsung_croma_dsdsg_claims",
         "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
+        "hitachi_sales",
+        "hitachi_claims",
     }
     if any(key not in summaries for key in required_summary_keys):
         return False
@@ -3150,6 +3486,9 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "samsung_croma_gross",
         "samsung_croma_earned",
         "samsung_croma_zopper",
+        "samsung_croma_dsdsg_gross",
+        "samsung_croma_dsdsg_earned",
+        "samsung_croma_dsdsg_zopper",
         "samsung_reliance_digital_gross",
         "samsung_reliance_digital_earned",
         "samsung_reliance_digital_zopper",
@@ -3159,15 +3498,91 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "godrej_gross",
         "godrej_earned",
         "godrej_zopper",
+        "hitachi_gross",
+        "hitachi_earned",
+        "hitachi_zopper",
         "samsung_vs_claims",
         "samsung_croma_claims",
+        "samsung_croma_dsdsg_claims",
         "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
+        "hitachi_claims",
     }
     if any(key not in rows for key in required_row_keys):
         return False
     return True
+
+
+def _empty_master_payload(
+    *,
+    from_date: str | None,
+    to_date: str | None,
+) -> dict[str, Any]:
+    required_summary_keys = {
+        "samsung_sales",
+        "samsung_claims",
+        "samsung_vs_sales",
+        "samsung_croma_sales",
+        "samsung_croma_dsdsg_sales",
+        "samsung_reliance_digital_sales",
+        "reliance_sales",
+        "godrej_sales",
+        "samsung_vs_claims",
+        "samsung_croma_claims",
+        "samsung_croma_dsdsg_claims",
+        "samsung_reliance_digital_claims",
+        "reliance_claims",
+        "godrej_claims",
+        "hitachi_sales",
+        "hitachi_claims",
+    }
+    required_row_keys = {
+        "samsung_vs_gross",
+        "samsung_vs_earned",
+        "samsung_vs_zopper",
+        "samsung_croma_gross",
+        "samsung_croma_earned",
+        "samsung_croma_zopper",
+        "samsung_croma_dsdsg_gross",
+        "samsung_croma_dsdsg_earned",
+        "samsung_croma_dsdsg_zopper",
+        "samsung_reliance_digital_gross",
+        "samsung_reliance_digital_earned",
+        "samsung_reliance_digital_zopper",
+        "reliance_gross",
+        "reliance_earned",
+        "reliance_zopper",
+        "godrej_gross",
+        "godrej_earned",
+        "godrej_zopper",
+        "hitachi_gross",
+        "hitachi_earned",
+        "hitachi_zopper",
+        "samsung_vs_claims",
+        "samsung_croma_claims",
+        "samsung_croma_dsdsg_claims",
+        "samsung_reliance_digital_claims",
+        "reliance_claims",
+        "godrej_claims",
+        "hitachi_claims",
+    }
+    empty_summary = {
+        "gross_premium": 0.0,
+        "earned_premium": 0.0,
+        "zopper_earned_premium": 0.0,
+        "units_sold": 0,
+    }
+    summaries = {key: dict(empty_summary) for key in required_summary_keys}
+    rows = {key: [] for key in required_row_keys}
+    return {
+        "summaries": summaries,
+        "rows": rows,
+        "date_bounds": {
+            "min_date": from_date,
+            "max_date": to_date,
+        },
+    }
 
 
 def _get_master_cache_updated_at(
@@ -3199,10 +3614,12 @@ def _latest_master_marker_updated_at(
         "samsung",
         "samsung_vs",
         "samsung_croma",
+        "samsung_croma_dsdsg",
         "samsung_reliance_digital",
         "samsung_vijay_sales",
         "reliance",
         "godrej",
+        "hitachi",
     ]
     query = (
         db.query(func.max(ManualUpdateMarker.updated_at))
@@ -3226,7 +3643,7 @@ def analytics_master_dashboard(
 ):
     started = time.perf_counter()
     from_date, to_date = _sanitize_range(from_date, to_date)
-    cache_source = "master_dashboard_v7"
+    cache_source = "master_dashboard_v11"
 
     cached = get_precomputed_summary(
         db=db,
@@ -3256,43 +3673,66 @@ def analytics_master_dashboard(
         to_date=to_date,
     )
 
-    if _is_valid_master_payload(cached) and cache_is_fresh and not cache_has_godrej_sales_month_mismatch:
-        logger.info(
-            "TIMING analytics.master_dashboard mode=precomputed duration_ms=%.2f",
-            (time.perf_counter() - started) * 1000,
-        )
-        return cached
-    if cache_has_godrej_sales_month_mismatch:
-        logger.warning(
-            "Stale master dashboard cache detected; recomputing live source=%s from=%s to=%s",
-            cache_source,
-            from_date,
-            to_date,
-        )
-
-    payload = _build_master_dashboard_payload(
-        db=db,
-        job_id=job_id,
-        from_date=from_date,
-        to_date=to_date,
-    )
-    try:
-        upsert_precomputed_summary(
-            db=db,
-            source=cache_source,
-            dataset_type="overview",
+    if _is_valid_master_payload(cached):
+        if cache_is_fresh and not cache_has_godrej_sales_month_mismatch:
+            logger.info(
+                "TIMING analytics.master_dashboard mode=precomputed duration_ms=%.2f",
+                (time.perf_counter() - started) * 1000,
+            )
+            return cached
+        if cache_has_godrej_sales_month_mismatch:
+            logger.warning(
+                "Stale master dashboard cache detected; serving stale and rebuilding source=%s from=%s to=%s",
+                cache_source,
+                from_date,
+                to_date,
+            )
+        else:
+            logger.info(
+                "Master dashboard cache stale; serving cached payload and rebuilding in background.",
+            )
+        _schedule_master_dashboard_rebuild(
             job_id=job_id,
             from_date=from_date,
             to_date=to_date,
-            summary=payload,
+            cache_source=cache_source,
         )
-        db.commit()
+        return cached
+
+    payload_is_fallback = False
+    try:
+        payload = _build_master_dashboard_payload(
+            db=db,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+        )
     except Exception:
-        db.rollback()
         logger.exception(
-            "Failed to upsert master dashboard precomputed payload job_id=%s",
+            "Failed to build master dashboard payload job_id=%s",
             job_id,
         )
+        payload = _empty_master_payload(from_date=from_date, to_date=to_date)
+        payload_is_fallback = True
+
+    if not payload_is_fallback:
+        try:
+            upsert_precomputed_summary(
+                db=db,
+                source=cache_source,
+                dataset_type="overview",
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+                summary=payload,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to upsert master dashboard precomputed payload job_id=%s",
+                job_id,
+            )
 
     logger.info(
         "TIMING analytics.master_dashboard mode=live duration_ms=%.2f",
@@ -3314,9 +3754,16 @@ def analytics_summary(
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
     normalized_dataset = (dataset_type or "").strip().lower()
+    job_id = _resolve_job_id_fallback(
+        db=db,
+        resolved_source=resolved_source,
+        dataset_key=normalized_dataset,
+        job_id=job_id,
+        context="summary",
+    )
     force_live_summary = (
         (resolved_source.startswith("samsung") and normalized_dataset == "sales")
-        or (resolved_source == "godrej" and normalized_dataset == "sales")
+        or (resolved_source == "hitachi" and normalized_dataset == "sales")
     )
 
     if resolved_source == "samsung" and not force_live_summary:
@@ -3480,6 +3927,13 @@ def analytics_last_updated(
     from_date, to_date = _sanitize_range(from_date, to_date)
     resolved_source, _ = _normalize_source(source)
     dataset_key = (dataset_type or "").strip().lower()
+    job_id = _resolve_job_id_fallback(
+        db=db,
+        resolved_source=resolved_source,
+        dataset_key=dataset_key,
+        job_id=job_id,
+        context="last_updated",
+    )
     job_key = (job_id or "").strip()
 
     source_variants = (
@@ -3570,6 +4024,13 @@ def analytics_date_bounds(
 ):
     resolved_source, _ = _normalize_source(source)
     dataset_key = (dataset_type or "").strip().lower()
+    job_id = _resolve_job_id_fallback(
+        db=db,
+        resolved_source=resolved_source,
+        dataset_key=dataset_key,
+        job_id=job_id,
+        context="date_bounds",
+    )
 
     if resolved_source == "samsung":
         bounds = [
@@ -3651,6 +4112,8 @@ def analytics_data_coverage(
                 | (DataRow.source.ilike("goodrej%"))
                 | (DataRow.source.ilike("goddrej%"))
             )
+        elif resolved_source == "hitachi":
+            q = q.filter(DataRow.source.ilike("hitachi%"))
         else:
             q = q.filter(DataRow.source == resolved_source)
     if dataset_type:

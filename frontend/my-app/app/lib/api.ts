@@ -82,6 +82,21 @@ export type AdminUser = {
   is_active: boolean
 }
 
+export type LiveUser = {
+  email: string
+  role: string
+  is_active: boolean
+  last_seen_at: string
+  expires_at: string
+  ttl_seconds: number
+}
+
+export type LiveUsersResponse = {
+  ttl_seconds: number
+  count: number
+  users: LiveUser[]
+}
+
 export type AdminFileItem = {
   source: string
   dataset_type: string
@@ -89,6 +104,15 @@ export type AdminFileItem = {
   tag: string
   rows: number
   latest_row_id: number | null
+  action?: string | null
+  file_name?: string | null
+  uploaded_by?: string | null
+  uploaded_at?: string | null
+  rows_in?: number
+  rows_inserted?: number
+  rows_updated?: number
+  deleted_rows?: number
+  notes?: string | null
 }
 
 export type AdminReverseMapCandidate = {
@@ -177,11 +201,27 @@ export type AdminFilterApplyResponse = {
   source: string
   dataset_type: "sales" | "claims"
   job_id?: string
+  auto_generated_job_id?: boolean
+  uploaded_by?: string
+  uploaded_at?: string
   deleted_rows: number
   rows_inserted: number
   rows_updated?: number
   revision_id?: number | null
   summary?: string
+}
+
+export type AdminFileMutationResponse = {
+  deleted_rows: number
+  rows_inserted: number
+  source: string
+  dataset_type: string
+  job_id?: string
+  auto_generated_job_id?: boolean
+  uploaded_by?: string
+  uploaded_at?: string
+  normalization?: Record<string, unknown>
+  data_quality?: Record<string, unknown>
 }
 
 type AdminFileListResponse = {
@@ -227,10 +267,30 @@ export type ChatbotPayload = {
   ui_context?: Record<string, unknown>
 }
 
+export type ChatbotChartType = "bar" | "line" | "pie" | "composed"
+
+export type ChatbotChartSeries = {
+  key: string
+  label: string
+  format?: string
+  render_as?: "bar" | "line"
+}
+
+export type ChatbotChart = {
+  title: string
+  subtitle?: string
+  chart_type: ChatbotChartType
+  x_key: string
+  series: ChatbotChartSeries[]
+  rows: Array<Record<string, unknown>>
+  download_name?: string
+}
+
 export type ChatbotResponse = {
   response: string
   model?: string
   message?: string
+  chart?: ChatbotChart
 }
 
 export type ChatbotFileTransformResult = {
@@ -392,6 +452,11 @@ const API_FALLBACKS = Array.from(
   ].map(v => normalizeApiBase(v)).filter(Boolean))
 )
 const API_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000)
+const ANALYTICS_REQUEST_TIMEOUT_MS = Number(
+  process.env.NEXT_PUBLIC_ANALYTICS_TIMEOUT_MS
+  || process.env.NEXT_PUBLIC_API_TIMEOUT_MS
+  || 60000
+)
 const ADMIN_UPLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_ADMIN_UPLOAD_TIMEOUT_MS || 180000)
 const CHATBOT_REQUEST_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_CHATBOT_TIMEOUT_MS || 120000)
 const DECK_DOWNLOAD_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_DECK_DOWNLOAD_TIMEOUT_MS || 240000)
@@ -401,6 +466,35 @@ let preferredApiBase = API_FALLBACKS[0] || ""
 const orderedApiBases = () => {
   const ordered = [preferredApiBase, ...API_FALLBACKS].filter(Boolean)
   return Array.from(new Set(ordered))
+}
+
+const MASTER_CACHE = new Map<string, { data: MasterDashboardResponse; timestamp: number }>()
+const MASTER_CACHE_TTL_MS = 30000 // 30 seconds
+
+export const clearMasterDashboardCache = () => {
+  MASTER_CACHE.clear()
+}
+
+export const prefetchMasterDashboard = async (params: FetchMasterDashboardParams) => {
+  const query = new URLSearchParams(
+    Object.entries(withSafeDateRange(params)).reduce((acc, [k, v]) => {
+      if (v !== undefined && v !== null && String(v).trim() !== "") acc[k] = String(v)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+  const key = `master-${query}`
+  const now = Date.now()
+  const cached = MASTER_CACHE.get(key)
+  if (cached && (now - cached.timestamp) < MASTER_CACHE_TTL_MS) return
+  
+  try {
+    const data = await fetchJsonWithFallback("/analytics/master-dashboard", query, {
+      timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    })
+    MASTER_CACHE.set(key, { data, timestamp: now })
+  } catch (err) {
+    console.error("Master prefetch failed:", err)
+  }
 }
 
 const normalizeToken = (value: string | null) => {
@@ -559,7 +653,9 @@ export async function fetchSummary(params: FetchSummaryParams) {
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/summary", query)
+  return fetchJsonWithFallback("/analytics/summary", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+  })
 }
 
 export async function fetchLastUpdated(params: FetchLastUpdatedParams) {
@@ -571,7 +667,9 @@ export async function fetchLastUpdated(params: FetchLastUpdatedParams) {
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/last-updated", query)
+  return fetchJsonWithFallback("/analytics/last-updated", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+  })
 }
 
 export async function fetchByDimensionRows(params: FetchByDimensionParams): Promise<Array<Record<string, unknown>>> {
@@ -583,7 +681,9 @@ export async function fetchByDimensionRows(params: FetchByDimensionParams): Prom
     }, {} as Record<string, string>)
   ).toString()
 
-  const response = await fetchJsonWithFallback("/analytics/by-dimension", query)
+  const response = await fetchJsonWithFallback("/analytics/by-dimension", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+  })
   return Array.isArray(response) ? (response as Array<Record<string, unknown>>) : []
 }
 
@@ -595,7 +695,9 @@ export async function fetchDateBounds(params: FetchDateBoundsParams) {
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/date-bounds", query)
+  return fetchJsonWithFallback("/analytics/date-bounds", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+  })
 }
 
 export async function fetchMasterDashboard(
@@ -609,7 +711,18 @@ export async function fetchMasterDashboard(
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/master-dashboard", query)
+  const key = `master-${query}`
+  const now = Date.now()
+  const cached = MASTER_CACHE.get(key)
+  if (cached && (now - cached.timestamp) < MASTER_CACHE_TTL_MS) {
+    return cached.data
+  }
+
+  const data = await fetchJsonWithFallback("/analytics/master-dashboard", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+  })
+  MASTER_CACHE.set(key, { data, timestamp: now })
+  return data
 }
 
 export async function login(payload: LoginPayload): Promise<LoginResponse> {
@@ -631,6 +744,10 @@ export async function fetchAdminUsers(params: { search?: string; limit?: number 
     }, {} as Record<string, string>)
   ).toString()
   return fetchJsonWithFallback("/auth/users", query, { method: "GET" })
+}
+
+export async function fetchLiveUsers(): Promise<LiveUsersResponse> {
+  return fetchJsonWithFallback("/auth/live-users", "", { method: "GET" })
 }
 
 export async function createAdminUser(payload: {
@@ -672,7 +789,9 @@ export async function fetchAdminFiles(params: {
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/admin/files", query)
+  return fetchJsonWithFallback("/admin/files", query, {
+    timeoutMs: ADMIN_UPLOAD_TIMEOUT_MS,
+  })
 }
 
 export async function deleteAdminFile(params: {
@@ -695,7 +814,7 @@ export async function replaceAdminFile(payload: {
   source: string
   dataset_type: string
   job_id?: string
-}) {
+}): Promise<AdminFileMutationResponse> {
   const form = new FormData()
   form.append("file", payload.file)
   form.append("source", payload.source)
@@ -716,7 +835,7 @@ export async function updateAdminFile(payload: {
   source: string
   dataset_type: string
   job_id?: string
-}) {
+}): Promise<AdminFileMutationResponse> {
   const form = new FormData()
   form.append("file", payload.file)
   form.append("source", payload.source)
@@ -810,7 +929,7 @@ export async function filterAndDownloadAdminFile(payload: {
   output_format?: "csv" | "xlsx"
   apply_to_db?: boolean
   job_id?: string
-}): Promise<{ blob: Blob; filename: string; summary: string; revision_id?: number }> {
+}): Promise<{ blob: Blob; filename: string; summary: string; revision_id?: number; job_id?: string; auto_generated_job_id?: boolean; uploaded_by?: string; uploaded_at?: string }> {
   const form = new FormData()
   form.append("file", payload.file)
   form.append("source", payload.source)
@@ -832,12 +951,20 @@ export async function filterAndDownloadAdminFile(payload: {
   const fallbackName = `filtered_${payload.source}_${payload.dataset_type}.${payload.output_format || "csv"}`
   const revisionRaw = res.headers.get("x-filter-revision-id")
   const revisionId = revisionRaw ? Number(revisionRaw) : undefined
+  const jobId = res.headers.get("x-filter-job-id") || undefined
+  const autoGeneratedJobId = (res.headers.get("x-filter-job-auto-generated") || "").trim().toLowerCase() === "true"
+  const uploadedBy = res.headers.get("x-filter-uploaded-by") || undefined
+  const uploadedAt = res.headers.get("x-filter-uploaded-at") || undefined
 
   return {
     blob,
     filename: fileMatch?.[1] || fallbackName,
     summary: res.headers.get("x-filter-summary") || "File filtered successfully.",
     revision_id: Number.isFinite(revisionId) ? revisionId : undefined,
+    job_id: jobId,
+    auto_generated_job_id: autoGeneratedJobId,
+    uploaded_by: uploadedBy,
+    uploaded_at: uploadedAt,
   }
 }
 

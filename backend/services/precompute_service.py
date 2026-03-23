@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import pandas as pd
+
 from sqlalchemy.orm import Session
 
 from models.data_rows import DataRow
@@ -46,7 +48,7 @@ BASE_DIMENSIONS = [
     "device_plan_category",
 ]
 
-GODREJ_DIMENSIONS = [
+APPLIANCE_DIMENSIONS = [
     "channel",
     "product_category",
 ]
@@ -77,8 +79,15 @@ def _affected_sources(source: str) -> list[str]:
 
 def _dimensions_for_source(source: str) -> list[str]:
     dimensions = list(BASE_DIMENSIONS)
-    if source == "godrej":
-        dimensions.extend(GODREJ_DIMENSIONS)
+    if source in SAMSUNG_PARTNER_SOURCES:
+        # Deck generation drills into model_code for Samsung partner views;
+        # precompute it so large partner uploads stay responsive.
+        dimensions.append("model_code")
+    if source in {"godrej", "hitachi"}:
+        dimensions.extend(APPLIANCE_DIMENSIONS)
+    if source == "reliance":
+        # Reliance ResQ dashboard uses ARTICLE_BRAND sidecards; precompute to avoid live slowness.
+        dimensions.append("article_brand")
     return _dedupe_preserve(dimensions)
 
 
@@ -109,6 +118,21 @@ def _ranges_for_source(
     max_date = bounds.get("max_date") if isinstance(bounds, dict) else None
     if min_date and max_date:
         ranges.append((str(min_date), str(max_date)))
+        try:
+            min_ts = pd.to_datetime(min_date, errors="coerce")
+            max_ts = pd.to_datetime(max_date, errors="coerce")
+            today = pd.Timestamp.now().normalize()
+            if min_ts is not pd.NaT and max_ts is not pd.NaT:
+                if max_ts > today and min_ts <= today:
+                    ranges.append((str(min_date), today.date().isoformat()))
+        except Exception:
+            logger.exception(
+                "Failed to add capped precompute range source=%s dataset=%s min=%s max=%s",
+                source,
+                dataset_type,
+                min_date,
+                max_date,
+            )
     return ranges
 
 
@@ -256,62 +280,71 @@ def rebuild_precomputed_analytics(
             )
 
             for dimension in dimensions:
+                bucket_values: list[str | None] = [None]
+                if dimension in {"month", "date"}:
+                    bucket_values = ["month"]
+
                 for metric in metrics:
-                    try:
-                        rows = compute_by_dimension_rows(
+                    for bucket in bucket_values:
+                        try:
+                            rows = compute_by_dimension_rows(
+                                db=db,
+                                job_id=job_id,
+                                source=src,
+                                dataset_type=normalized_dataset,
+                                dimension=dimension,
+                                metric=metric,
+                                bucket=bucket,
+                                from_date=from_date,
+                                to_date=to_date,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed precompute graph source=%s dataset=%s dimension=%s metric=%s bucket=%s from=%s to=%s",
+                                src,
+                                normalized_dataset,
+                                dimension,
+                                metric,
+                                bucket,
+                                from_date,
+                                to_date,
+                            )
+                            rows = []
+
+                        upsert_precomputed_graph(
                             db=db,
-                            job_id=job_id,
                             source=src,
                             dataset_type=normalized_dataset,
+                            job_id=job_id,
                             dimension=dimension,
                             metric=metric,
+                            bucket=bucket,
                             from_date=from_date,
                             to_date=to_date,
+                            rows=rows,
                         )
-                    except Exception:
-                        logger.exception(
-                            "Failed precompute graph source=%s dataset=%s dimension=%s metric=%s from=%s to=%s",
-                            src,
-                            normalized_dataset,
-                            dimension,
-                            metric,
-                            from_date,
-                            to_date,
+
+                        compare_mode = src == "samsung"
+                        insights = _derive_rule_based_insights(
+                            rows=rows,
+                            dimension=dimension,
+                            metric=metric,
+                            compare_mode=compare_mode,
                         )
-                        rows = []
-
-                    upsert_precomputed_graph(
-                        db=db,
-                        source=src,
-                        dataset_type=normalized_dataset,
-                        job_id=job_id,
-                        dimension=dimension,
-                        metric=metric,
-                        from_date=from_date,
-                        to_date=to_date,
-                        rows=rows,
-                    )
-
-                    compare_mode = src == "samsung"
-                    insights = _derive_rule_based_insights(
-                        rows=rows,
-                        dimension=dimension,
-                        metric=metric,
-                        compare_mode=compare_mode,
-                    )
-                    upsert_precomputed_insights(
-                        db=db,
-                        source=src,
-                        dataset_type=normalized_dataset,
-                        job_id=job_id,
-                        dimension=dimension,
-                        metric=metric,
-                        from_date=from_date,
-                        to_date=to_date,
-                        compare_mode=compare_mode,
-                        insights=insights,
-                        model="rule-based-precomputed",
-                    )
+                        upsert_precomputed_insights(
+                            db=db,
+                            source=src,
+                            dataset_type=normalized_dataset,
+                            job_id=job_id,
+                            dimension=dimension,
+                            metric=metric,
+                            bucket=bucket,
+                            from_date=from_date,
+                            to_date=to_date,
+                            compare_mode=compare_mode,
+                            insights=insights,
+                            model="rule-based-precomputed",
+                        )
         # Persist each source chunk independently to reduce long transaction pressure.
         db.commit()
 

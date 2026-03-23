@@ -13,7 +13,7 @@ from authentication.schemas import (
 )
 from authentication.security import verify_password, create_access_token, hash_password
 from authentication.local_users import use_local_auth, verify_local_user
-from authentication.deps import get_current_user, require_admin
+from authentication.deps import get_current_user, require_admin, list_live_users
 from authentication.repository import (
     get_user_by_identifier,
     create_user as create_user_record,
@@ -58,6 +58,11 @@ def me(current_user: Any = Depends(get_current_user)):
         "role": current_user.role,
         "is_active": current_user.is_active,
     }
+
+
+@router.get("/live-users")
+def live_users(_: Any = Depends(require_admin)):
+    return list_live_users()
 
 
 @router.post("/users", response_model=UserResponse)

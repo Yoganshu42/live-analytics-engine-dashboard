@@ -11,7 +11,7 @@ if ([string]::IsNullOrWhiteSpace($ServerIP)) {
     $ServerIP = $env:LIVE_DASHBOARD_SERVER_IP
 }
 if ([string]::IsNullOrWhiteSpace($ServerIP)) {
-    $ServerIP = "65.2.116.200"
+    $ServerIP = "13.235.56.166"
 }
 
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
@@ -75,9 +75,11 @@ Invoke-Ssh -CommandText "echo connected" -FailureMessage "Cannot connect to ${se
 # Step 1: Upload only source code (no node_modules, no .venv)
 Write-Host "`n[1/4] Uploading source code..." -ForegroundColor Yellow
 
+# Remove previous source trees so deleted local files do not survive on the server.
+Invoke-Ssh -CommandText "rm -rf $remotePath/backend $remotePath/frontend && mkdir -p $remotePath/backend $remotePath/frontend/my-app" -FailureMessage "Failed to prepare clean remote source directories."
+
 # Create minimal backend package
 Write-Host "  Backend..." -ForegroundColor Gray
-Invoke-Ssh -CommandText "mkdir -p $remotePath/backend" -FailureMessage "Failed to create remote backend directory."
 Invoke-Scp -Recursive `
     -SourcePaths @("backend/*.py", "backend/requirements.txt", "backend/Dockerfile") `
     -Destination "${remoteUser}@${serverIP}:${remotePath}/backend/" `
@@ -89,7 +91,6 @@ Invoke-Scp -Recursive `
 
 # Create minimal frontend package  
 Write-Host "  Frontend..." -ForegroundColor Gray
-Invoke-Ssh -CommandText "mkdir -p $remotePath/frontend/my-app" -FailureMessage "Failed to create remote frontend directory."
 Invoke-Scp `
     -SourcePaths @("frontend/my-app/package*.json", "frontend/my-app/Dockerfile", "frontend/my-app/*.config.*", "frontend/my-app/tsconfig.json", "frontend/my-app/next-env.d.ts") `
     -Destination "${remoteUser}@${serverIP}:${remotePath}/frontend/my-app/" `

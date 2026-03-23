@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react"
 
 type Props = {
   reducedMotion?: boolean
+  quality?: "low" | "high"
 }
 
 type Particle = {
@@ -24,7 +25,7 @@ const PARTICLE_COLORS = [
   "rgba(255,255,255,0.38)",
 ]
 
-export default function HomeParticleField({ reducedMotion = false }: Props) {
+export default function HomeParticleField({ reducedMotion = false, quality = "high" }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
   useEffect(() => {
@@ -84,13 +85,15 @@ export default function HomeParticleField({ reducedMotion = false }: Props) {
         const renderX = particle.x + driftX + distanceX * pointerInfluence * 0.025
         const renderY = particle.y + driftY + distanceY * pointerInfluence * 0.02
 
+        const maxConnectionDistance = quality === "low" ? 120 : 160
+
         for (let nextIndex = index + 1; nextIndex < particles.length; nextIndex += 1) {
           const nextParticle = particles[nextIndex]
           const pairDistance = Math.hypot(particle.x - nextParticle.x, particle.y - nextParticle.y)
-          if (pairDistance > 160) continue
+          if (pairDistance > maxConnectionDistance) continue
 
           context.beginPath()
-          context.strokeStyle = `rgba(95, 146, 255, ${0.085 * (1 - pairDistance / 160)})`
+          context.strokeStyle = `rgba(95, 146, 255, ${0.085 * (1 - pairDistance / maxConnectionDistance)})`
           context.lineWidth = 1
           context.moveTo(renderX, renderY)
           context.lineTo(nextParticle.x, nextParticle.y)
@@ -129,7 +132,9 @@ export default function HomeParticleField({ reducedMotion = false }: Props) {
     }
 
     const buildParticles = () => {
-      const particleCount = Math.max(18, Math.min(32, Math.round((width * height) / 62000)))
+      const baseCount = quality === "low" ? 8 : 14
+      const maxCount = quality === "low" ? 16 : 24
+      const particleCount = Math.max(baseCount, Math.min(maxCount, Math.round((width * height) / 72000)))
       particles = Array.from({ length: particleCount }, (_, index) => ({
         x: randomBetween(0, width),
         y: randomBetween(0, height),
@@ -189,7 +194,7 @@ export default function HomeParticleField({ reducedMotion = false }: Props) {
       window.removeEventListener("pointermove", handlePointerMove)
       window.removeEventListener("pointerleave", handlePointerLeave)
     }
-  }, [reducedMotion])
+  }, [quality, reducedMotion])
 
   return <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-hidden="true" />
 }

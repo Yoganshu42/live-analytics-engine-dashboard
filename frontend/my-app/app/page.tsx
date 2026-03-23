@@ -319,7 +319,7 @@ export default function DashboardPage() {
   const prefersReducedMotion = useReducedMotion()
   const homeViewportRef = useRef<HTMLDivElement | null>(null)
   const homeFitContentRef = useRef<HTMLDivElement | null>(null)
-  const { scrollYProgress: homeScrollProgress } = useScroll({ container: homeViewportRef })
+  const { scrollYProgress: homeScrollProgress } = useScroll()
   const homePointerX = useMotionValue(0.5)
   const homePointerY = useMotionValue(0.5)
   const homePointerXSpring = useSpring(homePointerX, { stiffness: 180, damping: 24, mass: 0.45 })
@@ -722,7 +722,8 @@ export default function DashboardPage() {
       samsung_croma: "Samsung Croma",
       samsung_reliance_digital: "Samsung Reliance Digital",
       reliance: "Reliance ResQ",
-      godrej: "Godrej"
+      godrej: "Godrej",
+      hitachi: "Hitachi",
     }
     return labels[value] || value.replace("_", " ")
   }
@@ -735,13 +736,13 @@ export default function DashboardPage() {
     className?: string
   }
 
-  const samsungProtectMaxLogo: PartnerHeaderLogo = {
-    src: "/WhatsApp Image 2026-02-04 at 11.14.29.jpeg",
-    alt: "Samsung Protect Max logo",
-    width: 88,
-    height: 28,
-    className: "h-5 w-auto object-contain",
-  }
+const samsungProtectMaxLogo: PartnerHeaderLogo = {
+  src: "/WhatsApp Image 2026-02-04 at 11.14.29.jpeg",
+  alt: "Samsung Croma logo",
+  width: 88,
+  height: 28,
+  className: "h-5 w-auto object-contain",
+}
 
   const partnerLogoConfig: Record<string, PartnerHeaderLogo[]> = {
     samsung: [samsungProtectMaxLogo],
@@ -793,6 +794,15 @@ export default function DashboardPage() {
         className: "h-5 w-auto object-contain",
       },
     ],
+    hitachi: [
+      {
+        src: "/hitachi_logo.png",
+        alt: "Hitachi logo",
+        width: 104,
+        height: 28,
+        className: "h-5 w-auto object-contain",
+      },
+    ],
   }
 
   const masterCardLogos: PartnerHeaderLogo[] = [
@@ -832,6 +842,13 @@ export default function DashboardPage() {
       height: 28,
       className: "h-5 w-auto object-contain",
     },
+    {
+      src: "/hitachi_logo.png",
+      alt: "Hitachi logo",
+      width: 104,
+      height: 28,
+      className: "h-5 w-auto object-contain",
+    },
   ]
 
   const activePartnerLogos = partnerLogoConfig[brand] || []
@@ -864,6 +881,14 @@ export default function DashboardPage() {
       logoSurfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(255,255,255,0.88))]",
       logoClass: "max-h-[92px] max-w-[88%] object-contain",
     },
+    {
+      label: "Hitachi",
+      value: "hitachi",
+      logo: "/hitachi_logo.png",
+      surfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.64),rgba(242,247,253,0.58),rgba(232,239,247,0.48))]",
+      logoSurfaceClass: "bg-[linear-gradient(180deg,rgba(255,255,255,0.97),rgba(255,255,255,0.9))]",
+      logoClass: "max-h-[82px] max-w-[84%] object-contain",
+    },
   ]
 
   const homeLayoutScale = useMemo(() => {
@@ -876,8 +901,11 @@ export default function DashboardPage() {
     const availableHeight = Math.max(homeViewportSize.height - headerHeight - verticalPadding, 320)
     const widthScale = availableWidth / HOME_DESKTOP_CONTENT_WIDTH
     const heightScale = availableHeight / Math.max(homeContentHeight, 1)
+    const fittedScale = Math.min(1, widthScale, heightScale)
+    const breathingRoomScale =
+      homeViewportSize.height < 900 || homeViewportSize.width < 1440 ? 0.92 : 0.96
 
-    return Math.min(1, widthScale, heightScale)
+    return Math.max(0.72, fittedScale * breathingRoomScale)
   }, [homeContentHeight, homeViewportSize.height, homeViewportSize.width, isMobileViewport, view])
 
   const homeScaledWrapperStyle = isMobileViewport || view !== "home"
@@ -898,6 +926,12 @@ export default function DashboardPage() {
         transform: `translateX(-50%) scale(${homeLayoutScale})`,
         transformOrigin: "top center",
       }
+
+  const homeVisualEffectsEnabled = view === "home" && !prefersReducedMotion && !isMobileViewport
+  const showHomeAmbientEffects = homeVisualEffectsEnabled && homeViewportSize.width >= 1200
+  const showHomePanels = homeVisualEffectsEnabled && homeViewportSize.width >= 1440
+  const homeParticleQuality: "low" | "high" =
+    homeVisualEffectsEnabled && homeViewportSize.width >= 1680 ? "high" : "low"
 
   const homeDisplayName = authName || "analytics@zopper.com"
   const homeProfileInitials = homeDisplayName
@@ -1048,7 +1082,7 @@ export default function DashboardPage() {
             transition={{ duration: 0.5 }}
             ref={homeViewportRef}
             onPointerMove={(event) => {
-              if (prefersReducedMotion) return
+              if (!homeVisualEffectsEnabled) return
               const rect = event.currentTarget.getBoundingClientRect()
               const nextX = Math.min(1, Math.max(0, (event.clientX - rect.left) / Math.max(rect.width, 1)))
               const nextY = Math.min(1, Math.max(0, (event.clientY - rect.top) / Math.max(rect.height, 1)))
@@ -1056,204 +1090,172 @@ export default function DashboardPage() {
               homePointerY.set(nextY)
             }}
             onPointerLeave={() => {
-              if (prefersReducedMotion) return
+              if (!homeVisualEffectsEnabled) return
               homePointerX.set(0.5)
               homePointerY.set(0.5)
             }}
-            className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden"
+            className={`relative flex-1 min-h-0 overflow-x-hidden ${isMobileViewport ? "overflow-y-auto" : "overflow-hidden"}`}
           >
             <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
               <div className="absolute inset-0 bg-[linear-gradient(180deg,#f4f7fb_0%,#edf3fb_20%,#e7f1fb_44%,#e8ecfa_72%,#f3f4fa_100%)]" />
               <div className="absolute inset-0 bg-[radial-gradient(circle_at_16%_16%,rgba(255,255,255,0.96),transparent_18%),radial-gradient(circle_at_78%_18%,rgba(229,235,255,0.72),transparent_24%),radial-gradient(circle_at_50%_44%,rgba(255,255,255,0.92),transparent_26%),radial-gradient(circle_at_18%_74%,rgba(227,242,255,0.7),transparent_24%),radial-gradient(circle_at_82%_70%,rgba(226,233,255,0.76),transparent_26%)]" />
               <motion.div
                 className="absolute inset-0 opacity-95"
-                style={prefersReducedMotion ? undefined : { background: homeCursorGlow }}
+                style={homeVisualEffectsEnabled ? { background: homeCursorGlow } : undefined}
               />
               <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(255,255,255,0.3)_0%,rgba(255,255,255,0)_26%,rgba(255,255,255,0.18)_58%,rgba(255,255,255,0.46)_100%)]" />
 
-              <motion.div
-                className="absolute inset-[-8%]"
-                style={prefersReducedMotion ? undefined : { x: homeGlowX, y: homeGlowY }}
-              >
-                {NEURAL_GLOW_FIELDS.map((field, index) => (
-                  <motion.span
-                    key={`neural-glow-${index}`}
-                    className="absolute rounded-full"
-                    style={{
-                      left: field.left,
-                      top: field.top,
-                      width: field.size,
-                      height: field.size,
-                      background: field.color,
-                      filter: `blur(${field.blur}px)`,
-                    }}
-                    initial={{ opacity: 0.18, scale: 0.96 }}
-                    animate={
-                      prefersReducedMotion
-                        ? { opacity: 0.24, scale: 1 }
-                        : {
-                            opacity: [0.16, 0.34, 0.2],
-                            scale: [0.96, 1.05, 0.98],
-                            x: [0, field.dx, field.dx * 0.45],
-                            y: [0, field.dy, field.dy * 0.4],
-                          }
-                    }
-                    transition={
-                      prefersReducedMotion
-                        ? { duration: 0 }
-                        : {
-                            duration: field.duration,
-                            repeat: Infinity,
-                            repeatType: "mirror",
-                            ease: "easeInOut",
-                            delay: field.delay,
-                          }
-                    }
-                  />
-                ))}
-              </motion.div>
-
-              <div className="absolute inset-0 overflow-hidden opacity-[0.72]">
-                {HOME_WAVES.map((wave, index) => (
-                  <motion.svg
-                    key={`home-wave-${index}`}
-                    viewBox="0 0 1720 420"
-                    fill="none"
-                    aria-hidden="true"
-                    className="absolute left-1/2 h-[330px] w-[170%] -translate-x-1/2"
-                    style={{ top: wave.top }}
-                    animate={
-                      prefersReducedMotion
-                        ? undefined
-                        : {
-                            x: [-14, 18, -10],
-                            opacity: [wave.opacity * 0.94, wave.opacity, wave.opacity * 0.9],
-                          }
-                    }
-                    transition={
-                      prefersReducedMotion
-                        ? undefined
-                        : {
-                            duration: wave.duration,
-                            repeat: Infinity,
-                            repeatType: "mirror",
-                            ease: "easeInOut",
-                            delay: wave.delay,
-                          }
-                    }
+              {showHomeAmbientEffects && (
+                <>
+                  <motion.div
+                    className="absolute inset-[-8%]"
+                    style={{ x: homeGlowX, y: homeGlowY }}
                   >
-                    <path
-                      d={wave.path}
-                      stroke={wave.stroke}
-                      strokeWidth={wave.strokeWidth}
-                      strokeLinecap="round"
-                    />
-                  </motion.svg>
-                ))}
-              </div>
+                    {NEURAL_GLOW_FIELDS.map((field, index) => (
+                      <motion.span
+                        key={`neural-glow-${index}`}
+                        className="absolute rounded-full"
+                        style={{
+                          left: field.left,
+                          top: field.top,
+                          width: field.size,
+                          height: field.size,
+                          background: field.color,
+                          filter: `blur(${field.blur}px)`,
+                        }}
+                        initial={{ opacity: 0.18, scale: 0.96 }}
+                        animate={{
+                          opacity: [0.16, 0.34, 0.2],
+                          scale: [0.96, 1.05, 0.98],
+                          x: [0, field.dx, field.dx * 0.45],
+                          y: [0, field.dy, field.dy * 0.4],
+                        }}
+                        transition={{
+                          duration: field.duration,
+                          repeat: Infinity,
+                          repeatType: "mirror",
+                          ease: "easeInOut",
+                          delay: field.delay,
+                        }}
+                      />
+                    ))}
+                  </motion.div>
+
+                  <div className="absolute inset-0 overflow-hidden opacity-[0.72]">
+                    {HOME_WAVES.map((wave, index) => (
+                      <motion.svg
+                        key={`home-wave-${index}`}
+                        viewBox="0 0 1720 420"
+                        fill="none"
+                        aria-hidden="true"
+                        className="absolute left-1/2 h-[330px] w-[170%] -translate-x-1/2"
+                        style={{ top: wave.top }}
+                        animate={{
+                          x: [-14, 18, -10],
+                          opacity: [wave.opacity * 0.94, wave.opacity, wave.opacity * 0.9],
+                        }}
+                        transition={{
+                          duration: wave.duration,
+                          repeat: Infinity,
+                          repeatType: "mirror",
+                          ease: "easeInOut",
+                          delay: wave.delay,
+                        }}
+                      >
+                        <path
+                          d={wave.path}
+                          stroke={wave.stroke}
+                          strokeWidth={wave.strokeWidth}
+                          strokeLinecap="round"
+                        />
+                      </motion.svg>
+                    ))}
+                  </div>
+                </>
+              )}
 
               <div className="absolute inset-0 opacity-75">
-                <HomeParticleField reducedMotion={Boolean(prefersReducedMotion)} />
+                <HomeParticleField reducedMotion={Boolean(prefersReducedMotion)} quality={homeParticleQuality} />
               </div>
 
               <div className="absolute inset-0 bg-[radial-gradient(rgba(255,255,255,0.78)_0.95px,transparent_0.95px)] bg-[size:30px_30px] opacity-[0.18] [mask-image:radial-gradient(circle_at_center,black_28%,transparent_84%)]" />
               <div className="absolute inset-x-0 bottom-0 h-[30%] bg-[linear-gradient(180deg,rgba(243,245,250,0),rgba(243,245,250,0.62)_76%,rgba(243,245,250,0.96)_100%)]" />
 
-              <motion.div
-                className="absolute inset-[-4%]"
-                style={prefersReducedMotion ? undefined : { x: homeNetworkX, y: homeNetworkY }}
-              >
-                {ANALYTICAL_PANELS.map((panel, index) => (
-                  <motion.div
-                    key={`analytical-panel-${index}`}
-                    className="absolute hidden overflow-hidden rounded-[36px] border border-white/82 bg-white/34 p-4 shadow-[0_28px_80px_rgba(141,165,205,0.18)] backdrop-blur-[18px] xl:block"
-                    style={{
-                      left: panel.left,
-                      top: panel.top,
-                      width: panel.width,
-                      height: panel.height,
-                      rotate: panel.rotate,
-                    }}
-                    initial={{ opacity: 0.22, y: 0 }}
-                    animate={
-                      prefersReducedMotion
-                        ? { opacity: 0.32 }
-                        : {
-                            opacity: [0.22, 0.42, 0.28],
-                            y: [0, -8, 0],
-                          }
-                    }
-                    transition={
-                      prefersReducedMotion
-                        ? { duration: 0 }
-                        : {
-                            duration: 8.8,
-                            repeat: Infinity,
-                            repeatType: "mirror",
-                            ease: "easeInOut",
-                            delay: panel.delay,
-                          }
-                    }
-                  >
-                    <div className="mb-3 flex items-center justify-between">
-                      <span className="text-[10px] font-black uppercase tracking-[0.28em] text-[#9aa7bc]">
-                        {panel.label}
-                      </span>
-                      <span className="rounded-full border border-white/75 bg-white/52 px-2 py-1 text-[9px] font-bold uppercase tracking-[0.18em] text-[#a4afc1]">
-                        Live
-                      </span>
-                    </div>
-                    <div className="absolute inset-x-4 top-11 h-px bg-white/55" />
-                    <div className="mt-6 flex h-[56px] items-end gap-2.5">
-                      {panel.bars.map((bar, barIndex) => (
-                        <motion.span
-                          key={`${panel.label}-bar-${barIndex}`}
-                          className="block w-3 rounded-full"
-                          style={{
-                            height: bar,
-                            background: barIndex === panel.bars.length - 1 ? panel.accent : panel.secondary,
-                          }}
-                          animate={
-                            prefersReducedMotion
-                              ? undefined
-                              : {
-                                  opacity: [0.78, 1, 0.82],
-                                  y: [0, -2, 0],
-                                }
-                          }
-                          transition={
-                            prefersReducedMotion
-                              ? undefined
-                              : {
-                                  duration: 2.8,
-                                  repeat: Infinity,
-                                  repeatType: "mirror",
-                                  ease: "easeInOut",
-                                  delay: panel.delay + barIndex * 0.08,
-                                }
-                          }
-                        />
-                      ))}
-                    </div>
-                    <svg
-                      className="absolute inset-x-4 bottom-4 h-[40px] w-[calc(100%-2rem)]"
-                      viewBox="0 0 210 92"
-                      fill="none"
-                      aria-hidden="true"
+              {showHomePanels && (
+                <motion.div
+                  className="absolute inset-[-4%]"
+                  style={{ x: homeNetworkX, y: homeNetworkY }}
+                >
+                  {ANALYTICAL_PANELS.map((panel, index) => (
+                    <motion.div
+                      key={`analytical-panel-${index}`}
+                      className="absolute hidden overflow-hidden rounded-[36px] border border-white/82 bg-white/34 p-4 shadow-[0_28px_80px_rgba(141,165,205,0.18)] backdrop-blur-[18px] xl:block"
+                      style={{
+                        left: panel.left,
+                        top: panel.top,
+                        width: panel.width,
+                        height: panel.height,
+                        rotate: panel.rotate,
+                      }}
+                      initial={{ opacity: 0.22, y: 0 }}
+                      animate={{ opacity: [0.22, 0.42, 0.28], y: [0, -8, 0] }}
+                      transition={{
+                        duration: 8.8,
+                        repeat: Infinity,
+                        repeatType: "mirror",
+                        ease: "easeInOut",
+                        delay: panel.delay,
+                      }}
                     >
-                      <path d={panel.trendPath} stroke={panel.accent} strokeWidth="4" strokeLinecap="round" />
-                      <path d={panel.trendPath} stroke="rgba(255,255,255,0.72)" strokeWidth="1.5" strokeLinecap="round" />
-                    </svg>
-                  </motion.div>
-                ))}
-              </motion.div>
+                      <div className="mb-3 flex items-center justify-between">
+                        <span className="text-[10px] font-black uppercase tracking-[0.28em] text-[#9aa7bc]">
+                          {panel.label}
+                        </span>
+                        <span className="rounded-full border border-white/75 bg-white/52 px-2 py-1 text-[9px] font-bold uppercase tracking-[0.18em] text-[#a4afc1]">
+                          Live
+                        </span>
+                      </div>
+                      <div className="absolute inset-x-4 top-11 h-px bg-white/55" />
+                      <div className="mt-6 flex h-[56px] items-end gap-2.5">
+                        {panel.bars.map((bar, barIndex) => (
+                          <motion.span
+                            key={`${panel.label}-bar-${barIndex}`}
+                            className="block w-3 rounded-full"
+                            style={{
+                              height: bar,
+                              background: barIndex === panel.bars.length - 1 ? panel.accent : panel.secondary,
+                            }}
+                            animate={{ opacity: [0.78, 1, 0.82], y: [0, -2, 0] }}
+                            transition={{
+                              duration: 2.8,
+                              repeat: Infinity,
+                              repeatType: "mirror",
+                              ease: "easeInOut",
+                              delay: panel.delay + barIndex * 0.08,
+                            }}
+                          />
+                        ))}
+                      </div>
+                      <svg
+                        className="absolute inset-x-4 bottom-4 h-[40px] w-[calc(100%-2rem)]"
+                        viewBox="0 0 210 92"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <path d={panel.trendPath} stroke={panel.accent} strokeWidth="4" strokeLinecap="round" />
+                        <path d={panel.trendPath} stroke="rgba(255,255,255,0.72)" strokeWidth="1.5" strokeLinecap="round" />
+                      </svg>
+                    </motion.div>
+                  ))}
+                </motion.div>
+              )}
             </div>
 
-            <div className="relative z-20 mx-auto flex w-full max-w-[1340px] justify-center px-4 pb-10 pt-5 sm:px-6 sm:pb-12 sm:pt-6 lg:px-8">
+            <div className="relative z-20 mx-auto flex w-full max-w-[1460px] justify-center px-3 pb-6 pt-3 sm:px-5 sm:pb-8 sm:pt-4 lg:px-6">
               <div className={isMobileViewport ? "mx-auto w-full max-w-[1240px]" : "relative mx-auto"} style={homeScaledWrapperStyle}>
                 <div
                   ref={homeFitContentRef}
-                  className={`flex flex-col gap-5 ${isMobileViewport ? "mx-auto w-full max-w-[1240px]" : ""}`}
+                  className={`flex flex-col gap-4 ${isMobileViewport ? "mx-auto w-full max-w-[1240px]" : ""}`}
                   style={homeScaledContentStyle}
                 >
                   <motion.div
@@ -1268,11 +1270,11 @@ export default function DashboardPage() {
 
                     <motion.div variants={staggerContainer} initial="initial" animate="animate" className="relative">
                       <motion.h2 variants={fadeIn} className="space-y-4 text-center">
-                        <span className="block text-[clamp(2.25rem,4vw,3.85rem)] font-black tracking-[-0.06em] text-[#4a5975] drop-shadow-[0_1px_0_rgba(255,255,255,0.7)]">
+                        <span className="block text-[clamp(1.95rem,3.6vw,3.15rem)] font-black tracking-[-0.06em] text-[#4a5975] drop-shadow-[0_1px_0_rgba(255,255,255,0.7)]">
                           Welcome to
                         </span>
                         <motion.span
-                          className="block bg-[linear-gradient(92deg,#1894f3_10%,#2a7eea_34%,#5a7de5_64%,#9b63cf_92%)] bg-[length:180%_100%] bg-clip-text font-serif text-[clamp(3.7rem,6vw,6.45rem)] font-black italic leading-[0.92] tracking-[-0.05em] text-transparent md:whitespace-nowrap"
+                          className="block bg-[linear-gradient(92deg,#1894f3_10%,#2a7eea_34%,#5a7de5_64%,#9b63cf_92%)] bg-[length:180%_100%] bg-clip-text font-serif text-[clamp(3.1rem,5.2vw,5.45rem)] font-black italic leading-[0.92] tracking-[-0.05em] text-transparent md:whitespace-nowrap"
                           style={{
                             backgroundPosition: "0% 50%",
                             WebkitTextStroke: "0.35px rgba(255,255,255,0.28)",
@@ -1285,7 +1287,7 @@ export default function DashboardPage() {
                         </motion.span>
                       </motion.h2>
 
-                      <motion.p variants={fadeIn} className="mx-auto mt-6 max-w-[760px] text-center text-[1.02rem] font-medium leading-[1.72] text-[#53627d] sm:text-[1.14rem]">
+                      <motion.p variants={fadeIn} className="mx-auto mt-4 max-w-[700px] text-center text-[0.95rem] font-medium leading-[1.6] text-[#53627d] sm:text-[1.02rem]">
                         Navigate through partner ecosystems with precision.
                         <br />
                         Real-time performance metrics at your fingertips.
@@ -1297,28 +1299,28 @@ export default function DashboardPage() {
                     variants={staggerContainer}
                     initial="initial"
                     animate="animate"
-                    className="w-full space-y-5 [perspective:1800px]"
+                    className="w-full space-y-4 [perspective:1800px]"
                     style={prefersReducedMotion ? undefined : { y: homeCardsY, rotateX: homeCardsRotateX }}
                   >
                     <motion.div
                       variants={cardHover}
                       whileHover="hover"
                       onClick={() => handleViewChange("master")}
-                      className="group relative mx-auto w-full max-w-[1010px] cursor-pointer overflow-hidden rounded-[46px] border border-white/78 bg-[linear-gradient(180deg,rgba(255,255,255,0.72),rgba(240,246,255,0.66),rgba(231,238,249,0.58))] px-8 py-9 text-center shadow-[0_28px_84px_rgba(118,139,176,0.14)] backdrop-blur-[18px] sm:px-10"
+                      className="group relative mx-auto w-full max-w-[940px] cursor-pointer overflow-hidden rounded-[38px] border border-white/78 bg-[linear-gradient(180deg,rgba(255,255,255,0.72),rgba(240,246,255,0.66),rgba(231,238,249,0.58))] px-7 py-6 text-center shadow-[0_28px_84px_rgba(118,139,176,0.14)] backdrop-blur-[18px] sm:px-9"
                     >
                       <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_4%,rgba(255,255,255,0.94),transparent_48%),radial-gradient(circle_at_50%_100%,rgba(144,195,255,0.16),transparent_56%)]" />
-                      <div className="absolute inset-[1px] rounded-[46px] border border-white/52" />
-                      <div className="relative space-y-4 text-center">
-                        <h3 className="text-[clamp(2.1rem,4vw,3.8rem)] font-black tracking-[-0.06em] text-[#1c2944]">
+                      <div className="absolute inset-[1px] rounded-[38px] border border-white/52" />
+                      <div className="relative space-y-3 text-center">
+                        <h3 className="text-[clamp(1.85rem,3.3vw,3.05rem)] font-black tracking-[-0.06em] text-[#1c2944]">
                           Master Dashboard
                         </h3>
                         <p className="mx-auto max-w-5xl text-[10px] font-black uppercase tracking-[0.26em] text-[#30486a] sm:text-[11px]">
-                          Unified view across Samsung, Croma, Vijay Sales, Reliance ResQ and Godrej
+                          Unified view across Samsung, Croma, Vijay Sales, Reliance ResQ, Godrej and Hitachi
                         </p>
                       </div>
                     </motion.div>
 
-                    <div className="grid gap-5 md:grid-cols-3">
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                       {brandConfigs.map((cfg) => (
                         <motion.div
                           key={cfg.value}
@@ -1327,11 +1329,11 @@ export default function DashboardPage() {
                           onClick={() => {
                             applyBrandChange(cfg.value)
                           }}
-                          className={`group relative min-h-[308px] cursor-pointer overflow-hidden rounded-[38px] border border-white/80 px-7 pb-8 pt-7 text-center shadow-[0_24px_74px_rgba(118,139,176,0.12)] backdrop-blur-[18px] ${cfg.surfaceClass}`}
+                          className={`group relative min-h-[248px] cursor-pointer overflow-hidden rounded-[32px] border border-white/80 px-5 pb-5 pt-5 text-center shadow-[0_24px_74px_rgba(118,139,176,0.12)] backdrop-blur-[18px] ${cfg.surfaceClass}`}
                         >
-                          <div className="absolute inset-[1px] rounded-[38px] border border-white/46" />
+                          <div className="absolute inset-[1px] rounded-[32px] border border-white/46" />
                           <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_0%,rgba(255,255,255,0.9),transparent_42%),radial-gradient(circle_at_50%_100%,rgba(163,200,243,0.12),transparent_64%)]" />
-                          <div className={`relative mb-8 flex h-[132px] items-center justify-center overflow-hidden rounded-[28px] border border-white/86 shadow-[0_18px_48px_rgba(147,168,203,0.14)] ${cfg.logoSurfaceClass}`}>
+                          <div className={`relative mb-5 flex h-[106px] items-center justify-center overflow-hidden rounded-[24px] border border-white/86 shadow-[0_18px_48px_rgba(147,168,203,0.14)] ${cfg.logoSurfaceClass}`}>
                             <motion.div whileHover={{ scale: 1.02, y: -1 }} className="flex h-full w-full items-center justify-center">
                               <Image
                                 src={cfg.logo}
@@ -1342,7 +1344,7 @@ export default function DashboardPage() {
                               />
                             </motion.div>
                           </div>
-                          <p className="relative text-[1.05rem] font-medium tracking-[-0.02em] text-[#243755] sm:text-[1.18rem]">
+                          <p className="relative text-[0.98rem] font-medium tracking-[-0.02em] text-[#243755] sm:text-[1.08rem]">
                             {cfg.label}
                           </p>
                         </motion.div>

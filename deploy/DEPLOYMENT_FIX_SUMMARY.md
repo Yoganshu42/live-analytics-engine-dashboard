@@ -102,17 +102,17 @@ cd deploy
 ### If deployment fails:
 1. **Check logs on server**:
    ```powershell
-   ssh -i deploy/ssh_key.pem ubuntu@43.205.134.36 "cd /home/ubuntu/live-dashboard && docker-compose logs"
+   ssh -i deploy/ssh_key.pem ubuntu@13.235.56.166 "cd /home/ubuntu/live-dashboard && docker-compose logs"
    ```
 
 2. **Check disk space**:
    ```powershell
-   ssh -i deploy/ssh_key.pem ubuntu@43.205.134.36 "df -h"
+   ssh -i deploy/ssh_key.pem ubuntu@13.235.56.166 "df -h"
    ```
 
 3. **Clean Docker cache**:
    ```powershell
-   ssh -i deploy/ssh_key.pem ubuntu@43.205.134.36 "docker system prune -af"
+   ssh -i deploy/ssh_key.pem ubuntu@13.235.56.166 "docker system prune -af"
    ```
 
 ### If still slow:
@@ -143,8 +143,8 @@ Ensure `NEXT_PUBLIC_API_BASE` is set correctly in docker-compose
 ## Next Steps
 
 1. ✅ Wait for current deployment to complete (8-12 minutes)
-2. ✅ Verify backend health: `http://43.205.134.36:8000/health`
-3. ✅ Verify frontend: `http://43.205.134.36:3000`
+2. ✅ Verify backend health: `http://13.235.56.166:8000/health`
+3. ✅ Verify frontend: `http://13.235.56.166:3000`
 4. ✅ Check for any application errors in logs
 5. ✅ Fix any database connection issues if they appear
 

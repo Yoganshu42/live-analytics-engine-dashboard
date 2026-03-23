@@ -33,24 +33,29 @@ PARTNER_DISPLAY = {
     **SAMSUNG_PARTNER_LABELS,
     "reliance": "Reliance ResQ",
     "godrej": "Godrej",
+    "hitachi": "Hitachi",
 }
 
 PARTNER_LOGO = {
     "samsung_vs": "vs_logo.jpg",
     "samsung_croma": "croma_logo.jpg",
+    "samsung_croma_dsdsg": "croma_logo.jpg",
     "samsung_reliance_digital": "reliance_digital_logo.png",
     "reliance": "resq.png",
     "godrej": "Group 1244833444.png",
+    "hitachi": "hitachi_logo.png",
 }
 
-DEFAULT_PARTNERS = [*SAMSUNG_PARTNER_SOURCES, "reliance", "godrej"]
+DEFAULT_PARTNERS = [*SAMSUNG_PARTNER_SOURCES, "reliance", "godrej", "hitachi"]
 
 DIMENSION_CANDIDATES = {
     "samsung_vs": ["month", "state", "plan_category", "device_plan_category", "model_code"],
     "samsung_croma": ["month", "state", "plan_category", "device_plan_category", "model_code"],
+    "samsung_croma_dsdsg": ["month", "state", "plan_category", "device_plan_category", "model_code"],
     "samsung_reliance_digital": ["month", "state", "plan_category", "device_plan_category", "model_code"],
     "reliance": ["month", "state", "plan_category", "article_brand"],
     "godrej": ["month", "state", "channel", "product_category"],
+    "hitachi": ["month", "state", "channel", "product_category"],
 }
 
 WEEK_DATE_COLUMNS = ["Date", "Start_Date", "Start Date", "Plan Start Date", "Month"]
@@ -107,6 +112,18 @@ def resolve_partners(raw_partners: list[str] | None) -> list[str]:
         "vijay sales": ["samsung_vs"],
         "samsung_croma": ["samsung_croma"],
         "croma": ["samsung_croma"],
+        "samsung protect max": ["samsung_croma"],
+        "samsung protect max croma": ["samsung_croma"],
+        "protect max": ["samsung_croma"],
+        "protect max croma": ["samsung_croma"],
+        "croma protect max": ["samsung_croma"],
+        "samsung_croma_dsdsg": ["samsung_croma_dsdsg"],
+        "croma ds dsg": ["samsung_croma_dsdsg"],
+        "croma ds/dsg": ["samsung_croma_dsdsg"],
+        "dsdsg": ["samsung_croma_dsdsg"],
+        "ds dsg": ["samsung_croma_dsdsg"],
+        "ds/dsg": ["samsung_croma_dsdsg"],
+        "ds-dsg": ["samsung_croma_dsdsg"],
         "samsung_reliance_digital": ["samsung_reliance_digital"],
         "samsung reliance digital": ["samsung_reliance_digital"],
         "reliance digital": ["samsung_reliance_digital"],
@@ -116,6 +133,7 @@ def resolve_partners(raw_partners: list[str] | None) -> list[str]:
         "godrej": ["godrej"],
         "goodrej": ["godrej"],
         "goddrej": ["godrej"],
+        "hitachi": ["hitachi"],
     }
 
     ordered: list[str] = []
@@ -2339,8 +2357,11 @@ def _to_points(rows: list[dict[str, Any]], dimension: str, metric: str) -> list[
         if not isinstance(row, dict):
             continue
         safe_map = {_safe_key(str(k)): k for k in row.keys()}
+        dim_candidates = [dim_key]
+        if dim_key == "model_code":
+            dim_candidates.extend(["product_category", "product_description", "plan_product", "model"])
         dim_col = (
-            safe_map.get(dim_key)
+            next((safe_map.get(candidate) for candidate in dim_candidates if safe_map.get(candidate)), None)
             or safe_map.get("week")
             or safe_map.get("month")
             or safe_map.get("state")

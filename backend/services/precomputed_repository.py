@@ -4,6 +4,9 @@ import copy
 import os
 import threading
 import time
+import math
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func
@@ -22,6 +25,42 @@ _precomputed_cache_lock = threading.Lock()
 _graph_cache: dict[tuple[str, ...], tuple[float, list[dict[str, Any]]]] = {}
 _summary_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
 _insights_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return float(value)
+    if hasattr(value, "item"):
+        try:
+            return _json_safe_value(value.item())
+        except Exception:
+            pass
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def _clean_json_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _clean_json_payload(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_json_payload(v) for v in value]
+    return _json_safe_value(value)
 
 
 def _is_postgres_session(db: Session) -> bool:
@@ -329,6 +368,7 @@ def upsert_precomputed_graph(
         PrecomputedGraph.to_date == to_key,
     )
     payload = rows if isinstance(rows, list) else []
+    payload = _clean_json_payload(payload)
     if _is_postgres_session(db):
         stmt = (
             pg_insert(PrecomputedGraph)
@@ -459,6 +499,7 @@ def upsert_precomputed_summary(
         PrecomputedSummary.to_date == to_key,
     )
     payload = summary if isinstance(summary, dict) else {}
+    payload = _clean_json_payload(payload)
     if _is_postgres_session(db):
         stmt = (
             pg_insert(PrecomputedSummary)
