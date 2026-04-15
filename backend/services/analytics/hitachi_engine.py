@@ -7,6 +7,10 @@ from services.analytics.goodrej_engine import (
     GodrejAnalyticsEngine,
     invalidate_godrej_load_cache,
 )
+from services.hitachi_plan_mapping import (
+    canonicalize_hitachi_claim_plan_category,
+    canonicalize_hitachi_sales_plan_category,
+)
 
 
 def invalidate_hitachi_load_cache(
@@ -116,15 +120,113 @@ class HitachiAnalyticsEngine(GodrejAnalyticsEngine):
             claim_amount = claim_amount.where(~fallback_mask, dealer_price)
         return claim_amount
 
+    def _normalize_sales_plan_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        work = df.copy()
+        plan_raw = self._coalesce_text_series(
+            work,
+            [
+                "Plan Category",
+                "Plan_Category",
+                "display_plan_name",
+                "Warranty Type",
+            ],
+            default="",
+        )
+        canonical_plan = plan_raw.map(canonicalize_hitachi_sales_plan_category)
+        mask = canonical_plan.ne("")
+        if mask.any():
+            work.loc[mask, "Plan Category"] = canonical_plan[mask]
+            work.loc[mask, "Plan_Category"] = canonical_plan[mask]
+
+            device_raw = self._coalesce_text_series(
+                work,
+                [
+                    "Device Plan Category",
+                    "Device_Plan_Category",
+                ],
+                default="",
+            )
+            device_replace_mask = device_raw.eq("") | device_raw.astype(str).str.strip().eq(plan_raw.astype(str).str.strip())
+            device_replace_mask &= mask
+            if device_replace_mask.any():
+                work.loc[device_replace_mask, "Device Plan Category"] = canonical_plan[device_replace_mask]
+                work.loc[device_replace_mask, "Device_Plan_Category"] = canonical_plan[device_replace_mask]
+        return work
+
+    def _normalize_claim_plan_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        work = df.copy()
+        plan_name = self._coalesce_text_series(
+            work,
+            [
+                "Care+ Plan Name",
+                "Care + Plan Name",
+                "Care Plus Plan Name",
+                "Plan Category",
+                "Plan_Category",
+            ],
+            default="",
+        )
+        plan_description = self._coalesce_text_series(
+            work,
+            [
+                "Care+ Plan Description",
+                "Care + Plan Description",
+                "Care Plus Plan Description",
+                "Plan Description",
+            ],
+            default="",
+        )
+        product_category = self._coalesce_text_series(
+            work,
+            [
+                "Product Category",
+                "Product_Category",
+                "Prodcut Category",
+                "Category",
+            ],
+            default="",
+        )
+        model_description = self._coalesce_text_series(
+            work,
+            [
+                "Model Description",
+                "Item Description",
+                "Model No",
+            ],
+            default="",
+        )
+        canonical_plan = pd.Series(
+            [
+                canonicalize_hitachi_claim_plan_category(
+                    plan_name=plan_name.loc[idx],
+                    plan_description=plan_description.loc[idx],
+                    product_category=product_category.loc[idx],
+                    model_description=model_description.loc[idx],
+                )
+                for idx in work.index
+            ],
+            index=work.index,
+            dtype="object",
+        )
+        mask = canonical_plan.ne("")
+        if mask.any():
+            work.loc[mask, "Plan Category"] = canonical_plan[mask]
+            work.loc[mask, "Plan_Category"] = canonical_plan[mask]
+        return work
+
     def compute_premiums(self, df: pd.DataFrame) -> pd.DataFrame:
         required = {
             "Warranty Start Date",
             "Customer Premium",
         }
         if not required.issubset(df.columns):
-            return df
+            return self._normalize_sales_plan_fields(df)
 
-        df = df.copy()
+        df = self._normalize_sales_plan_fields(df)
 
         try:
             df["Warranty Start Date"] = pd.to_datetime(df["Warranty Start Date"], format="mixed", errors="coerce")
@@ -178,6 +280,10 @@ class HitachiAnalyticsEngine(GodrejAnalyticsEngine):
 
         return df
 
+    def _normalize_claims(self, df: pd.DataFrame) -> pd.DataFrame:
+        normalized = super()._normalize_claims(df)
+        return self._normalize_claim_plan_fields(normalized)
+
     def _apply_date_filter(
         self,
         df: pd.DataFrame,
@@ -220,7 +326,7 @@ class HitachiAnalyticsEngine(GodrejAnalyticsEngine):
                 )
 
             normalized = {_normalize_key(str(column)): str(column) for column in df.columns}
-            for candidate in ("Care+ Plan Name", "Care+ Plan", "Plan Category", "Plan_Category"):
+            for candidate in ("Plan Category", "Plan_Category", "Care+ Plan Name", "Care+ Plan"):
                 matched = normalized.get(_normalize_key(candidate))
                 if matched:
                     return df, matched

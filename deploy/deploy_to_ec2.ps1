@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$serverIP = "13.235.56.166"
+$serverIP = "13.202.80.63"
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
 $remoteUser = "ubuntu"
 $remotePath = "/home/ubuntu/live-dashboard"
@@ -43,6 +43,6 @@ curl -f http://localhost:8000/health || echo 'Backend health check failed!'
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "Deployment Complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host "`nFrontend: http://${serverIP}:3000" -ForegroundColor Cyan
-Write-Host "Backend API: http://${serverIP}:8000" -ForegroundColor Cyan
-Write-Host "Backend Docs: http://${serverIP}:8000/docs" -ForegroundColor Cyan
+Write-Host "`nFrontend: http://${serverIP}/" -ForegroundColor Cyan
+Write-Host "Backend API: http://${serverIP}/api" -ForegroundColor Cyan
+Write-Host "Backend Docs: http://${serverIP}/docs" -ForegroundColor Cyan

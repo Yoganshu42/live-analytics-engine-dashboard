@@ -298,9 +298,6 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
 
     setIsSending(true)
     try {
-      const compactText = text.replace(/\s+/g, " ").trim()
-      const maxTokens = Math.max(1400, Math.min(4096, Math.ceil(compactText.length * 6)))
-
       const useJobFilter =
         typeof window !== "undefined" && localStorage.getItem("use_job_filter") === "1"
       const jobId = normalizeJobId(
@@ -318,18 +315,18 @@ export default function RightSideChatbot({ variant = "floating" }: Props) {
       const datasetType = normalizeDatasetType(
         typeof window !== "undefined" ? localStorage.getItem("dashboard_mode") || "" : ""
       )
+      const shouldUseGlobalScope = !source
 
       const result = await sendChatbotMessage({
         message: text,
         history,
         temperature: 0.14,
-        max_tokens: maxTokens,
         source: source || undefined,
         dataset_type: datasetType,
         job_id: jobId || undefined,
         from_date: fromDate || undefined,
         to_date: toDate || undefined,
-        global_scope: true,
+        global_scope: shouldUseGlobalScope,
         ui_context: buildUiContextSnapshot(),
       })
       const reply = (result.response || "").trim() || "No response generated."

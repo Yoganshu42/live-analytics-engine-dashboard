@@ -14,6 +14,11 @@ from services.date_parsing import (
     parse_flexible_datetime,
     resolve_samsung_plan_window,
 )
+from services.hitachi_plan_mapping import (
+    canonicalize_hitachi_claim_plan_category,
+    canonicalize_hitachi_sales_plan_category,
+)
+from services.reliance_branding import canonicalize_reliance_brand_columns
 
 SAMSUNG_REFERENCE_PLAN_PRICES: dict[tuple[str, str], int] = {
     ("Luxury Fold", "ADLD"): 5299,
@@ -610,6 +615,39 @@ def _looks_like_samsung_plan_label(value: Any) -> bool:
     )
 
 
+def _is_day_month_swapped(anchor: Any, candidate: Any) -> bool:
+    try:
+        if pd.isna(anchor) or pd.isna(candidate):
+            return False
+    except Exception:
+        return False
+
+    anchor_ts = pd.Timestamp(anchor)
+    candidate_ts = pd.Timestamp(candidate)
+    return (
+        anchor_ts != candidate_ts
+        and anchor_ts.year == candidate_ts.year
+        and int(anchor_ts.month) == int(candidate_ts.day)
+        and int(anchor_ts.day) == int(candidate_ts.month)
+    )
+
+
+def _derive_plan_end_from_tenure(start_value: Any, tenure_months: Any) -> pd.Timestamp:
+    try:
+        if pd.isna(start_value):
+            return pd.NaT
+    except Exception:
+        return pd.NaT
+
+    try:
+        months = int(round(float(tenure_months or 0)))
+    except Exception:
+        months = 0
+    if months <= 0:
+        return pd.NaT
+    return pd.Timestamp(start_value) + pd.DateOffset(months=months) - pd.Timedelta(days=1)
+
+
 def _infer_samsung_device_category_from_reference_price(plan_category: Any, transfer_price: Any) -> str:
     canonical_plan = _canonical_samsung_plan_category(plan_category)
     if not canonical_plan:
@@ -943,6 +981,18 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
         ),
         default="",
     )
+    transaction_dt = transaction_raw.map(parse_flexible_datetime)
+    tenure_raw = _coalesce_numeric(
+        df,
+        (
+            "Plan Tenure",
+            "Plan Tenure Months",
+            "Article Warranty Month",
+            "Article Warrenty Month",
+            "Manufacturer Warranty",
+        ),
+        default=0.0,
+    )
     resolved_windows = [
         resolve_samsung_plan_window(
             plan_type=plan_value,
@@ -959,9 +1009,34 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
     ]
     resolved_start = pd.Series([start for start, _end in resolved_windows], index=df.index, dtype="datetime64[ns]")
     resolved_end = pd.Series([end for _start, end in resolved_windows], index=df.index, dtype="datetime64[ns]")
+    swapped_start_mask = pd.Series(
+        [
+            _is_day_month_swapped(transaction_value, start_value)
+            for transaction_value, start_value in zip(transaction_dt.tolist(), resolved_start.tolist())
+        ],
+        index=df.index,
+        dtype="bool",
+    )
+    if swapped_start_mask.any():
+        resolved_start = resolved_start.where(~swapped_start_mask, transaction_dt)
+        expected_end = pd.Series(
+            [
+                _derive_plan_end_from_tenure(start_value, tenure_value)
+                for start_value, tenure_value in zip(resolved_start.tolist(), tenure_raw.tolist())
+            ],
+            index=df.index,
+            dtype="datetime64[ns]",
+        )
+        swapped_end_mask = swapped_start_mask & expected_end.notna() & (
+            resolved_end.isna() | ((resolved_end - expected_end).abs() > pd.Timedelta(days=7))
+        )
+        if swapped_end_mask.any():
+            resolved_end = resolved_end.where(~swapped_end_mask, expected_end)
+    else:
+        swapped_end_mask = pd.Series(False, index=df.index, dtype="bool")
 
     if resolved_start.notna().any():
-        for start_col in ("Start_Date", "Plan Start Date", "Warranty Start Date", "Warranty_Start_Date", "Start Date"):
+        for start_col in ("Start_Date", "Plan Start Date", "Warranty Start Date", "Warranty_Start_Date", "Start Date", "Date"):
             raw_text = (
                 df[start_col].astype(str).fillna("")
                 if start_col in df.columns
@@ -973,7 +1048,12 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
                 if start_col in df.columns
                 else pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
             )
-            merged = existing.where(existing.notna() & ~composite_mask, resolved_start)
+            override_mask = resolved_start.notna() & (
+                existing.isna()
+                | composite_mask
+                | swapped_start_mask
+            )
+            merged = existing.where(~override_mask, resolved_start)
             if start_col not in df.columns or composite_mask.any() or not merged.equals(existing):
                 df[start_col] = merged
                 touched += 1
@@ -991,9 +1071,48 @@ def _normalize_samsung_sales(df: pd.DataFrame) -> int:
                 if end_col in df.columns
                 else pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
             )
-            merged = existing.where(existing.notna() & ~composite_mask, resolved_end)
+            override_mask = resolved_end.notna() & (
+                existing.isna()
+                | composite_mask
+                | swapped_end_mask
+            )
+            merged = existing.where(~override_mask, resolved_end)
             if end_col not in df.columns or composite_mask.any() or not merged.equals(existing):
                 df[end_col] = merged
+                touched += 1
+
+    resolved_month = resolved_start.dt.to_period("M").dt.to_timestamp()
+    if resolved_month.notna().any():
+        existing_month = (
+            df["Month"].map(parse_flexible_datetime)
+            if "Month" in df.columns
+            else pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+        )
+        month_override_mask = resolved_month.notna() & (
+            existing_month.isna()
+            | swapped_start_mask
+            | existing_month.ne(resolved_month)
+        )
+        merged_month = existing_month.where(~month_override_mask, resolved_month)
+        if "Month" not in df.columns or not merged_month.equals(existing_month):
+            df["Month"] = merged_month
+            touched += 1
+
+        resolved_month_text = resolved_month.dt.strftime("%b-%y").fillna("")
+        for month_col in ("Month Name", "Month_Name"):
+            existing_text = (
+                df[month_col].astype("string").fillna("")
+                if month_col in df.columns
+                else pd.Series("", index=df.index, dtype="string")
+            )
+            month_text_override_mask = resolved_month_text.ne("") & (
+                existing_text.str.strip().eq("")
+                | swapped_start_mask
+                | existing_text.str.strip().ne(resolved_month_text)
+            )
+            merged_text = existing_text.where(~month_text_override_mask, resolved_month_text)
+            if month_col not in df.columns or not merged_text.equals(existing_text):
+                df[month_col] = merged_text
                 touched += 1
 
     plan_price = raw_plan_selling_price
@@ -1240,6 +1359,108 @@ def _normalize_godrej_sales(df: pd.DataFrame, *, source: str = "godrej") -> int:
     return touched
 
 
+def _normalize_hitachi_sales(df: pd.DataFrame) -> int:
+    touched = 0
+    plan_raw = _coalesce_text(
+        df,
+        (
+            "Plan Category",
+            "Plan_Category",
+            "display_plan_name",
+            "Warranty Type",
+            "Plan Type",
+            "Pack Type",
+        ),
+        default="",
+    )
+    canonical_plan = plan_raw.map(canonicalize_hitachi_sales_plan_category)
+    plan_mask = canonical_plan.ne("")
+    if plan_mask.any():
+        df.loc[plan_mask, "Plan Category"] = canonical_plan[plan_mask]
+        df.loc[plan_mask, "Plan_Category"] = canonical_plan[plan_mask]
+        touched += 1
+
+        device_raw = _coalesce_text(
+            df,
+            (
+                "Device Plan Category",
+                "Device_Plan_Category",
+            ),
+            default="",
+        )
+        device_replace_mask = device_raw.eq("") | device_raw.astype(str).str.strip().eq(plan_raw.astype(str).str.strip())
+        device_replace_mask &= plan_mask
+        if device_replace_mask.any():
+            df.loc[device_replace_mask, "Device Plan Category"] = canonical_plan[device_replace_mask]
+            df.loc[device_replace_mask, "Device_Plan_Category"] = canonical_plan[device_replace_mask]
+            touched += 1
+    return touched
+
+
+def _normalize_hitachi_claims(df: pd.DataFrame) -> int:
+    touched = 0
+    plan_name = _coalesce_text(
+        df,
+        (
+            "Care+ Plan Name",
+            "Care + Plan Name",
+            "Care Plus Plan Name",
+            "Plan Category",
+            "Plan_Category",
+        ),
+        default="",
+    )
+    plan_description = _coalesce_text(
+        df,
+        (
+            "Care+ Plan Description",
+            "Care + Plan Description",
+            "Care Plus Plan Description",
+            "Plan Description",
+        ),
+        default="",
+    )
+    product_category = _coalesce_text(
+        df,
+        (
+            "Product Category",
+            "Product_Category",
+            "Prodcut Category",
+            "Category",
+        ),
+        default="",
+    )
+    model_description = _coalesce_text(
+        df,
+        (
+            "Model Description",
+            "Item Description",
+            "Model No",
+        ),
+        default="",
+    )
+
+    canonical_plan = pd.Series(
+        [
+            canonicalize_hitachi_claim_plan_category(
+                plan_name=plan_name.loc[idx],
+                plan_description=plan_description.loc[idx],
+                product_category=product_category.loc[idx],
+                model_description=model_description.loc[idx],
+            )
+            for idx in df.index
+        ],
+        index=df.index,
+        dtype="object",
+    )
+    plan_mask = canonical_plan.ne("")
+    if plan_mask.any():
+        df.loc[plan_mask, "Plan Category"] = canonical_plan[plan_mask]
+        df.loc[plan_mask, "Plan_Category"] = canonical_plan[plan_mask]
+        touched += 1
+    return touched
+
+
 def _ensure_deck_compat_columns(df: pd.DataFrame, *, source: str, dataset_type: str) -> int:
     touched = 0
     if df is None or df.empty:
@@ -1426,6 +1647,22 @@ def _ensure_deck_compat_columns(df: pd.DataFrame, *, source: str, dataset_type: 
             _upsert_numeric_column("Amount", premium)
             _upsert_numeric_column("Gross Premium", premium)
 
+        if source == "reliance":
+            sale_dt = _coalesce_datetime(
+                (
+                    "Transaction Date",
+                    "Transaction_Date",
+                    "Purchase Date",
+                    "PURCHASE_DATE",
+                    "Purchase_Date",
+                    "Invoice Date",
+                    "Invoice_Date_",
+                    "Data Processing Date",
+                    "Data_Processing_Date",
+                )
+            )
+            _upsert_datetime_column("Purchase Date", sale_dt)
+
     if dataset_type == "claims":
         claim_value = _coalesce_numeric(
             df,
@@ -1552,7 +1789,13 @@ def normalize_partner_dataframe(
         touched += _normalize_reliance_sales(work)
     elif dataset_key == "sales" and source_key in {"godrej", "hitachi"}:
         touched += _normalize_godrej_sales(work, source=source_key)
+        if source_key == "hitachi":
+            touched += _normalize_hitachi_sales(work)
+    elif dataset_key == "claims" and source_key == "hitachi":
+        touched += _normalize_hitachi_claims(work)
     touched += _ensure_deck_compat_columns(work, source=source_key, dataset_type=dataset_key)
+    if source_key == "reliance":
+        touched += canonicalize_reliance_brand_columns(work)
 
     metadata = {
         "source": source_key,

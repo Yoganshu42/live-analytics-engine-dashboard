@@ -1,6 +1,7 @@
 # services/analytics/reliance_engine.py
 
 import logging
+import os
 import threading
 import time
 import pandas as pd
@@ -10,14 +11,17 @@ from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
 from services.analytics_repository import get_dataframe
+from services.dataframe_optimization import BoundedTTLCache, compact_dataframe_mapping
+from services.reliance_branding import canonicalize_reliance_brand_columns
 
 logger = logging.getLogger(__name__)
 RELIANCE_LOAD_CACHE_TTL_SECONDS = 300
+RELIANCE_LOAD_CACHE_MAX_ITEMS = max(1, int(os.getenv("RELIANCE_LOAD_CACHE_MAX_ITEMS", "3")))
 _reliance_load_cache_lock = threading.Lock()
-_reliance_load_cache: dict[
+_reliance_load_cache: BoundedTTLCache[
     tuple[str, str, str, str, str],
-    tuple[float, dict[str, pd.DataFrame]],
-] = {}
+    dict[str, pd.DataFrame],
+] = BoundedTTLCache(max_items=RELIANCE_LOAD_CACHE_MAX_ITEMS)
 _reliance_load_inflight: dict[
     tuple[str, str, str, str, str],
     threading.Event,
@@ -126,14 +130,13 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         self.valuation_date = self._resolve_valuation_date(self.report_end)
 
     def _shared_load_cache_key(self) -> tuple[str, str, str, str, str]:
-        from_key = self.report_start.date().isoformat() if self.report_start is not None else ""
-        to_key = self.report_end.date().isoformat() if self.report_end is not None else ""
+        valuation_key = self.valuation_date.date().isoformat() if self.valuation_date is not None else ""
         return (
             (self.source or "").strip().lower(),
             (self.dataset_type or "").strip().lower(),
             (self.job_id or "").strip(),
-            from_key,
-            to_key,
+            valuation_key,
+            "",
         )
 
     def run_analytics(self, df: pd.DataFrame, valuation_date: pd.Timestamp | None = None) -> dict:
@@ -352,8 +355,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         return frame[mask]
 
     def _apply_reliance_gross_units_window(self, frame: pd.DataFrame, date_series: pd.Series) -> pd.DataFrame:
-        # Reliance sales KPIs should align to the selected warranty start timeline.
+        # Reliance sales gross premium / quantity KPIs should follow the actual
+        # sale date timeline so freshly uploaded sales land in the dashboard
+        # month they were sold, even when coverage starts later.
         return self._apply_report_range(frame, date_series)
+
+    def _apply_sales_metric_report_window(self, frame: pd.DataFrame, metric: str) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        date_metric = "gross_premium" if metric in {"gross_premium", "quantity"} else "earned_premium"
+        return self._apply_report_range(frame, self._prepared_sales_metric_date_series(frame, date_metric))
 
     @staticmethod
     def _normalize_date_key(value: str) -> str:
@@ -424,6 +435,75 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             series = series.fillna(self._sales_metric_date_series(frame, "earned_premium"))
         return series
 
+    def _prepared_sales_metric_date_series(self, frame: pd.DataFrame, metric: str) -> pd.Series:
+        if frame.empty:
+            return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+
+        preferred_columns = (
+            ["Purchase Date", "Transaction Date", "Transaction_Date", "Date"]
+            if metric in {"gross_premium", "quantity"}
+            else ["Warranty Start Date", "Plan Start Date", "Purchase Date", "Date"]
+        )
+        resolved = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+        for col in preferred_columns:
+            if col not in frame.columns:
+                continue
+            parsed = pd.to_datetime(frame[col], errors="coerce")
+            if not parsed.notna().any():
+                continue
+            resolved = resolved.where(resolved.notna(), parsed)
+            if resolved.notna().all():
+                return resolved
+        fallback = self._sales_metric_date_series(frame, metric)
+        if fallback is not None:
+            fallback = pd.to_datetime(fallback, errors="coerce")
+            resolved = resolved.where(resolved.notna(), fallback)
+        return resolved
+
+    def _prepared_sales_metric_end_series(self, frame: pd.DataFrame) -> pd.Series:
+        if frame.empty:
+            return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+
+        for col in ["Warranty End Date", "Plan End Date", "End Date", "End_Date"]:
+            if col not in frame.columns:
+                continue
+            parsed = pd.to_datetime(frame[col], errors="coerce")
+            if not parsed.notna().any():
+                continue
+            if parsed.isna().any():
+                parsed = parsed.where(parsed.notna(), self._prepared_sales_metric_date_series(frame, "earned_premium"))
+            return parsed
+        return self._sales_metric_end_series(frame)
+
+    def _filter_claims_frame_by_report_range(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        if self.report_start is None and self.report_end is None:
+            return frame
+
+        if "Day of Call_Date" in frame.columns:
+            claim_dates = pd.to_datetime(frame["Day of Call_Date"], errors="coerce")
+            if claim_dates.notna().any():
+                mask = claim_dates.notna()
+                if self.report_start is not None:
+                    mask &= claim_dates >= self.report_start
+                if self.report_end is not None:
+                    mask &= claim_dates <= self.report_end
+                return frame[mask]
+
+        if "Month" in frame.columns:
+            month_series = pd.to_datetime(frame["Month"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+            mask = month_series.notna()
+            if self.report_start is not None:
+                start_month = pd.Timestamp(self.report_start).to_period("M").to_timestamp()
+                mask &= month_series >= start_month
+            if self.report_end is not None:
+                end_month = pd.Timestamp(self.report_end).to_period("M").to_timestamp()
+                mask &= month_series <= end_month
+            return frame[mask]
+
+        return frame
+
     def _apply_sales_overlap_range(
         self,
         frame: pd.DataFrame,
@@ -459,12 +539,17 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             return self._coalesce_parsed_dates(
                 frame,
                 [
+                    "Transaction Date",
+                    "Transaction_Date",
+                    "Data Processing Date",
+                    "Data_Processing_Date",
                     "Purchase Date",
                     "PURCHASE_DATE",
                     "Purchase_Date",
                     "Invoice Date",
                     "Invoice_Date",
                     "Bill Created Date",
+                    "Date",
                     "Plan Start Date",
                     "Start Date",
                     "Start_Date",
@@ -492,6 +577,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 "Invoice Date",
                 "Invoice_Date",
                 "Bill Created Date",
+                "Date",
                 "Month",
                 "Month Name",
                 "Month_Name",
@@ -635,20 +721,20 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         shared_key = self._shared_load_cache_key()
         now = time.time()
         with _reliance_load_cache_lock:
-            shared_cached = _reliance_load_cache.get(shared_key)
-            if shared_cached is not None:
-                expires_at, cached_value = shared_cached
-                if expires_at >= now:
-                    cloned = self._clone_loaded_data(cached_value)
-                    self._loaded_data_cache = cloned
-                    return cloned
-                _reliance_load_cache.pop(shared_key, None)
+            cached_value = _reliance_load_cache.get(shared_key, now=now)
+            if cached_value is not None:
+                cloned = self._clone_loaded_data(cached_value)
+                self._loaded_data_cache = cloned
+                return cloned
 
             result = self._load_data_uncached()
             cloned = self._clone_loaded_data(result)
-            _reliance_load_cache[shared_key] = (
-                time.time() + RELIANCE_LOAD_CACHE_TTL_SECONDS,
+            cache_now = time.time()
+            _reliance_load_cache.set(
+                shared_key,
                 cloned,
+                expires_at=cache_now + RELIANCE_LOAD_CACHE_TTL_SECONDS,
+                now=cache_now,
             )
             self._loaded_data_cache = self._clone_loaded_data(cloned)
             return self._loaded_data_cache
@@ -662,12 +748,14 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             job_id=self.job_id,
             source="reliance",
             dataset_type="sales",
+            cache_result=False,
         )
         claims_df = get_dataframe(
             db=self.db,
             job_id=self.job_id,
             source="reliance",
             dataset_type="claims",
+            cache_result=False,
         )
 
         if sales_df is None:
@@ -760,7 +848,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             if "Plan Selling Price " in sales_df.columns and "Plan Selling Price" not in sales_df.columns:
                 sales_df = sales_df.rename(columns={"Plan Selling Price ": "Plan Selling Price"})
 
-            article_brand_col = _pick_column(
+            article_brand_col = _pick_best_text_column(
                 sales_df,
                 [
                     "ARTICLE_BRAND",
@@ -803,13 +891,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 .str.strip()
                 .replace({"": "Unknown", "nan": "Unknown", "none": "Unknown", "None": "Unknown"})
             )
-            sales_df["Brand"] = sales_df["Brand"].replace(
-                {
-                    "Idea": "Lenovo",
-                    "Pad": "Redmi",
-                    "GooglePixel": "Google",
-                }
-            )
+            canonicalize_reliance_brand_columns(sales_df)
 
             state_col = _pick_column(
                 sales_df,
@@ -821,6 +903,10 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             sales_df["Purchase Date"] = self._coalesce_parsed_dates(
                 sales_df,
                 [
+                    "Transaction Date",
+                    "Transaction_Date",
+                    "Data Processing Date",
+                    "Data_Processing_Date",
                     "PURCHASE_DATE",
                     "Purchase Date",
                     "Purchase_Date",
@@ -1034,23 +1120,9 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 claims_df["Month"] = self._month_key(claims_df["Day of Call_Date"])
 
             if "Month" in claims_df.columns:
-                claims_filter_start = self.report_start
-                claims_filter_end = self.report_end
-                if claims_filter_start is not None:
-                    claims_filter_start = pd.Timestamp(claims_filter_start).to_period("M").to_timestamp()
-                if claims_filter_end is not None:
-                    claims_filter_end = pd.Timestamp(claims_filter_end).to_period("M").to_timestamp(how="end")
                 claims_df = claims_df[claims_df["Month"].notna()]
-                if claims_filter_start is not None:
-                    claims_df = claims_df[claims_df["Month"] >= claims_filter_start]
-                if claims_filter_end is not None:
-                    claims_df = claims_df[claims_df["Month"] <= claims_filter_end]
             elif "Day of Call_Date" in claims_df.columns:
                 claims_df = claims_df[claims_df["Day of Call_Date"].notna()]
-                if self.report_start is not None:
-                    claims_df = claims_df[claims_df["Day of Call_Date"] >= self.report_start]
-                if self.report_end is not None:
-                    claims_df = claims_df[claims_df["Day of Call_Date"] <= self.report_end]
             else:
                 # No recognizable claims date column; keep rows rather than fail hard.
                 claims_df = claims_df.copy()
@@ -1080,6 +1152,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 claims_df[brand_col] = claims_df[brand_col].replace({"OPPO": "Oppo"})
                 if brand_col != "Product Brand(Group)":
                     claims_df["Product Brand(Group)"] = claims_df[brand_col]
+            canonicalize_reliance_brand_columns(claims_df)
 
             cost_col = _pick_column(
                 claims_df,
@@ -1188,7 +1261,9 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 * sales_df["Exposure Days"]
                 / sales_df["Coverage Days"]
             ).fillna(0)
-        self._loaded_data_cache = {"sales": sales_df, "claims": claims_df, "sales_ew": sales_ew_df}
+        self._loaded_data_cache = compact_dataframe_mapping(
+            {"sales": sales_df, "claims": claims_df, "sales_ew": sales_ew_df}
+        )
         logger.info(
             "TIMING reliance.load_data source=%s dataset=%s sales_rows=%s claims_rows=%s duration_ms=%.2f",
             self.source,
@@ -1218,6 +1293,11 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         )
         if df.empty and not include_ew_sales:
             return []
+
+        if self.dataset_type == "claims":
+            df = self._filter_claims_frame_by_report_range(df)
+            if df.empty:
+                return []
 
         df = df.copy() if not df.empty else pd.DataFrame()
 
@@ -1259,26 +1339,17 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             return []
 
         if self.dataset_type == "sales":
-            date_metric = "gross_premium" if metric in {"gross_premium", "quantity"} else "earned_premium"
             if not df.empty:
-                sales_dates = self._sales_metric_date_series(df, date_metric)
-                if metric in {"gross_premium", "quantity"}:
-                    df = self._apply_reliance_gross_units_window(df, sales_dates)
-                else:
-                    df = self._apply_sales_overlap_range(df, sales_dates, self._sales_metric_end_series(df))
+                df = self._apply_sales_metric_report_window(df, metric)
             if df.empty and not include_ew_sales:
                 return []
 
             if include_ew_sales:
-                ew_date_metric = "gross_premium" if metric in {"gross_premium", "quantity"} else "earned_premium"
-                ew_dates = self._sales_metric_date_series(ew_df, ew_date_metric)
-                if metric in {"gross_premium", "quantity"}:
-                    ew_df = self._apply_reliance_gross_units_window(ew_df, ew_dates)
-                else:
-                    ew_df = self._apply_sales_overlap_range(ew_df, ew_dates, self._sales_metric_end_series(ew_df))
+                ew_df = self._apply_sales_metric_report_window(ew_df, metric)
 
         dim_map = {
             "month": "Month",
+            "date": "Date",
             "state": "State",
             "brand": "Brand"
             if self.dataset_type == "sales"
@@ -1315,9 +1386,20 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                         return normalized[key]
                 return None
 
+            if dimension == "date" and self.dataset_type == "sales":
+                local_df = local_df.copy()
+                local_df["Date"] = pd.to_datetime(
+                    self._prepared_sales_metric_date_series(local_df, metric),
+                    errors="coerce",
+                ).dt.normalize()
+                local_df = local_df[local_df["Date"].notna()]
+                if local_df.empty:
+                    return None, None
+                return local_df, "Date"
+
             if dimension == "month" and self.dataset_type == "sales":
                 local_df = local_df.copy()
-                local_df["Month"] = self._month_key(self._sales_metric_date_series(local_df, metric))
+                local_df["Month"] = self._month_key(self._prepared_sales_metric_date_series(local_df, metric))
                 local_df = local_df[local_df["Month"].notna()]
                 if local_df.empty:
                     return None, None
@@ -1364,7 +1446,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     ])
 
                 if dim_col not in local_df.columns:
-                    if dimension == "month":
+                    if dimension in {"month", "date"}:
                         date_col = _pick_column(
                             [
                                 "Month",
@@ -1378,11 +1460,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                             ]
                         )
                         if date_col in local_df.columns:
-                            if _normalize_key(date_col) in {"month", "monthyear", "monthname"}:
+                            if dimension == "month" and _normalize_key(date_col) in {"month", "monthyear", "monthname"}:
                                 local_df["Month"] = self._parse_month_series(local_df[date_col])
-                            else:
+                            elif dimension == "month":
                                 local_df["Month"] = self._month_key(local_df[date_col])
-                            dim_col = "Month"
+                            else:
+                                local_df["Date"] = pd.to_datetime(
+                                    self._parse_date_with_month_fallback(local_df[date_col]),
+                                    errors="coerce",
+                                ).dt.normalize()
+                            dim_col = "Month" if dimension == "month" else "Date"
                         else:
                             return None, None
                     else:
@@ -1396,6 +1483,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                     local_df["Month"] = self._month_key(local_df["Month"])
                     local_df = local_df[local_df["Month"].notna()]
                     dim_col = "Month"
+            elif dimension == "date":
+                if dim_col != "Date":
+                    local_df["Date"] = pd.to_datetime(
+                        self._parse_date_with_month_fallback(local_df[dim_col]),
+                        errors="coerce",
+                    ).dt.normalize()
+                if "Date" in local_df.columns:
+                    local_df["Date"] = pd.to_datetime(local_df["Date"], errors="coerce").dt.normalize()
+                    local_df = local_df[local_df["Date"].notna()]
+                    dim_col = "Date"
 
             return local_df, dim_col
 
@@ -1465,6 +1562,10 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
             return []
         if dimension == "month" and "month" in out.columns:
             out = self._finalize_month_dimension_output(out)
+        elif dimension == "date" and "date" in out.columns:
+            out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            out = out[pd.Series(out["date"]).notna()].copy()
+            out = out.sort_values("date")
         result = out.fillna(0).to_dict(orient="records")
         logger.info(
             "TIMING reliance.compute_by_dimension source=%s dataset=%s dimension=%s metric=%s out_rows=%s duration_ms=%.2f",
@@ -1490,44 +1591,16 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         if sales.empty or claims.empty:
             return []
 
-        sales_dates = self._sales_metric_date_series(sales, "earned_premium")
+        sales_dates = self._prepared_sales_metric_date_series(sales, "earned_premium")
         sales = self._apply_report_range(sales, sales_dates)
         if sales.empty:
             return []
 
         # Keep claims scope aligned with report range to avoid numerator/denominator
         # month drift when explicit date filters are used.
-        claims_date_series = pd.Series(pd.NaT, index=claims.index, dtype="datetime64[ns]")
-        month_like_cols = {"month", "monthyear", "monthname"}
-        for col in [
-            "Day of Call_Date",
-            "Call_Registered_Date",
-            "Call_Initiated_Date",
-            "Call_Date",
-            "Call Date",
-            "Month_Year",
-            "Month-Year",
-            "Month",
-        ]:
-            if col not in claims.columns:
-                continue
-            key = (
-                col.lower()
-                .replace("_", "")
-                .replace(" ", "")
-                .replace("-", "")
-                .replace("/", "")
-                .replace("(", "")
-                .replace(")", "")
-                .strip()
-            )
-            parsed = self._parse_month_series(claims[col]) if key in month_like_cols else self._parse_date_with_month_fallback(claims[col])
-            if parsed.notna().sum() > claims_date_series.notna().sum():
-                claims_date_series = parsed
-        if claims_date_series.notna().any():
-            claims = self._apply_report_range(claims, claims_date_series)
-            if claims.empty:
-                return []
+        claims = self._filter_claims_frame_by_report_range(claims)
+        if claims.empty:
+            return []
 
         if dimension == "month":
             def _normalize_key(value: str) -> str:
@@ -1904,7 +1977,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         data = self.load_data()
 
         if self.dataset_type == "claims":
-            df = data["claims"]
+            df = self._filter_claims_frame_by_report_range(data["claims"])
             if df.empty:
                 return {
                     "gross_premium": 0,
@@ -1938,10 +2011,7 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
         ew_df = data.get("sales_ew")
         ew_gross_df = pd.DataFrame()
         if ew_df is not None and not ew_df.empty:
-            ew_gross_df = self._apply_reliance_gross_units_window(
-                ew_df,
-                self._sales_metric_date_series(ew_df, "gross_premium"),
-            )
+            ew_gross_df = self._apply_sales_metric_report_window(ew_df, "gross_premium")
 
         if df.empty and ew_gross_df.empty:
             return {
@@ -1951,15 +2021,8 @@ class RelianceAnalyticsEngine(BaseAnalyticsEngine):
                 "units_sold": 0,
             }
 
-        gross_df = self._apply_reliance_gross_units_window(
-            df,
-            self._sales_metric_date_series(df, "gross_premium"),
-        )
-        earned_df = self._apply_sales_overlap_range(
-            df,
-            self._sales_metric_date_series(df, "earned_premium"),
-            self._sales_metric_end_series(df),
-        )
+        gross_df = self._apply_sales_metric_report_window(df, "gross_premium")
+        earned_df = self._apply_sales_metric_report_window(df, "earned_premium")
 
         gross_base = (
             self._clean_number(gross_df["Gross Premium"]).sum()

@@ -9,7 +9,7 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
-import { fetchByDimensionRows, fetchLastUpdated, fetchSummary } from "@/app/lib/api"
+import { fetchLastUpdated, fetchSummary } from "@/app/lib/api"
 
 type Props = {
   source: string
@@ -90,70 +90,6 @@ const formatDate = (value: string | null) => {
   }).format(date)
 }
 
-const toSafeKey = (value: string) => (
-  value
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, "_")
-    .replace(/[()%'.]/g, "")
-)
-
-const toTimeSortValue = (value: unknown) => {
-  const raw = String(value ?? "").trim()
-  if (!raw) return Number.NaN
-
-  const shortMatch = raw.match(/^([A-Za-z]{3})[-/\s](\d{2}|\d{4})$/)
-  if (shortMatch) {
-    const monthMap: Record<string, number> = {
-      jan: 1,
-      feb: 2,
-      mar: 3,
-      apr: 4,
-      may: 5,
-      jun: 6,
-      jul: 7,
-      aug: 8,
-      sep: 9,
-      oct: 10,
-      nov: 11,
-      dec: 12,
-    }
-    const month = monthMap[shortMatch[1].toLowerCase()]
-    if (month) {
-      const rawYear = Number(shortMatch[2])
-      const year = shortMatch[2].length === 2 ? 2000 + rawYear : rawYear
-      return new Date(`${year}-${String(month).padStart(2, "0")}-01`).getTime()
-    }
-  }
-
-  return new Date(raw).getTime()
-}
-
-const pickLatestTrendDate = (
-  rows: Array<Record<string, unknown>>,
-  dimensionKey: string
-): string | null => {
-  if (!rows.length) return null
-  const normalizedDimension = toSafeKey(dimensionKey)
-
-  let latestTs = Number.NEGATIVE_INFINITY
-  let latestRaw: string | null = null
-
-  rows.forEach((row) => {
-    const resolvedKey = Object.keys(row).find((key) => toSafeKey(key) === normalizedDimension)
-    if (!resolvedKey) return
-    const rawValue = row[resolvedKey]
-    const ts = toTimeSortValue(rawValue)
-    if (!Number.isFinite(ts)) return
-    if (ts > latestTs) {
-      latestTs = ts
-      latestRaw = String(rawValue)
-    }
-  })
-
-  return latestRaw
-}
-
 export default function KpiCardsRow({
   source,
   datasetType,
@@ -167,10 +103,12 @@ export default function KpiCardsRow({
   const [claimsSummary, setClaimsSummary] = useState<Summary | null>(null)
   const [lastUpdated, setLastUpdated] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [claimsLoading, setClaimsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     let mounted = true
+    const controller = new AbortController()
     const cacheKey = JSON.stringify({
       source,
       datasetType,
@@ -202,15 +140,6 @@ export default function KpiCardsRow({
       from_date: fromDate,
       to_date: toDate,
     }
-    const trendBaseParams = {
-      job_id: jobId,
-      source,
-      dataset_type: datasetType,
-      metric: "quantity",
-      from_date: fromDate,
-      to_date: toDate,
-    }
-
     const load = async () => {
       const cached = kpiCache.get(cacheKey)
       if (cached && cached.expiresAt > Date.now()) {
@@ -218,6 +147,7 @@ export default function KpiCardsRow({
         setSummary(cached.value.summary)
         setClaimsSummary(cached.value.claimsSummary)
         setLastUpdated(cached.value.lastUpdated)
+        setClaimsLoading(false)
         setLoading(false)
         setError(null)
         return
@@ -225,56 +155,34 @@ export default function KpiCardsRow({
 
       if (mounted) {
         setLoading(true)
+        setClaimsLoading(datasetType === "sales")
+        setClaimsSummary(null)
+        setLastUpdated(null)
         setError(null)
       }
 
       try {
-        const [summaryResult, freshnessResult, claimsResult] = await Promise.allSettled([
-          fetchSummary(summaryParams),
-          fetchLastUpdated(freshnessParams),
+        const freshnessPromise = fetchLastUpdated(freshnessParams, { signal: controller.signal }).catch(() => null)
+        const claimsPromise =
           datasetType === "sales"
-            ? fetchSummary(claimsSummaryParams).catch(() => null)
-            : Promise.resolve(null),
-        ])
+            ? fetchSummary(claimsSummaryParams, { signal: controller.signal }).catch(() => null)
+            : Promise.resolve(null)
+
+        const summaryRes = await fetchSummary(summaryParams, { signal: controller.signal })
         if (!mounted) return
 
-        const summaryRes =
-          summaryResult.status === "fulfilled"
-            ? (summaryResult.value as Summary | null)
-            : null
-        const freshnessRes =
-          freshnessResult.status === "fulfilled"
-            ? (freshnessResult.value as LastUpdated | null)
-            : null
-        const claimsRes =
-          claimsResult.status === "fulfilled"
-            ? (claimsResult.value as Summary | null)
-            : null
+        setSummary(summaryRes || null)
+        setLoading(false)
 
-        if (!summaryRes && summaryResult.status === "rejected") {
-          throw summaryResult.reason
-        }
-
-        const freshnessDate = freshnessRes?.data_upto ?? null
-        let resolvedLastUpdated = freshnessDate
-
-        if (!resolvedLastUpdated) {
-          const [monthRows, dateRows] = await Promise.all([
-            fetchByDimensionRows({
-              ...trendBaseParams,
-              dimension: "month",
-            }).catch(() => []),
-            fetchByDimensionRows({
-              ...trendBaseParams,
-              dimension: "date",
-            }).catch(() => []),
-          ])
-          if (!mounted) return
-          resolvedLastUpdated =
-            pickLatestTrendDate(monthRows, "month")
-            || pickLatestTrendDate(dateRows, "date")
-            || freshnessDate
-        }
+        const [resolvedLastUpdated, claimsRes] = await Promise.all([
+          freshnessPromise.then((freshnessRes) => (
+            (freshnessRes as LastUpdated | null)?.data_upto
+            ?? toDate
+            ?? null
+          )),
+          claimsPromise,
+        ])
+        if (!mounted) return
 
         const nextValue: KpiCacheValue = {
           summary: summaryRes || null,
@@ -287,10 +195,16 @@ export default function KpiCardsRow({
           value: nextValue,
         })
 
-        setSummary(nextValue.summary)
         setLastUpdated(nextValue.lastUpdated)
         setClaimsSummary(nextValue.claimsSummary)
+        setClaimsLoading(false)
       } catch (err: unknown) {
+        const isAbort =
+          controller.signal.aborted
+          || (err instanceof Error && err.name === "AbortError")
+        if (isAbort) {
+          return
+        }
         const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase()
         const isAuthError = msg.includes("not authenticated") || msg.includes("invalid token")
         if (!isAuthError) {
@@ -300,10 +214,16 @@ export default function KpiCardsRow({
           setSummary(null)
           setClaimsSummary(null)
           setLastUpdated(null)
+          setClaimsLoading(false)
           setError("No data")
         }
       } finally {
-        if (mounted) setLoading(false)
+        if (mounted) {
+          setLoading(false)
+          if (datasetType !== "sales") {
+            setClaimsLoading(false)
+          }
+        }
       }
     }
 
@@ -311,6 +231,7 @@ export default function KpiCardsRow({
 
     return () => {
       mounted = false
+      controller.abort()
     }
   }, [jobId, source, datasetType, fromDate, toDate, refreshTick])
 
@@ -404,8 +325,21 @@ export default function KpiCardsRow({
     <div className={gridClassName}>
       {cards.map((card) => {
         const Icon = card.icon
-        const value = loading ? "--" : error ? "N/A" : card.value
-        const caption = loading ? "Loading..." : error ? "Unable to fetch data" : card.caption
+        const isClaimsCountCard = card.key === "sales-claims-count"
+        const value = loading
+          ? "--"
+          : error
+            ? "N/A"
+            : isClaimsCountCard && claimsLoading
+              ? "--"
+              : card.value
+        const caption = loading
+          ? "Loading..."
+          : error
+            ? "Unable to fetch data"
+            : isClaimsCountCard && claimsLoading
+              ? "Loading claim count..."
+              : card.caption
 
         return (
           <div

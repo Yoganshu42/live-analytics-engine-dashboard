@@ -3,7 +3,6 @@ from __future__ import annotations
 SAMSUNG_PARTNER_SOURCES: tuple[str, ...] = (
     "samsung_vs",
     "samsung_croma",
-    "samsung_croma_dsdsg",
     "samsung_reliance_digital",
 )
 
@@ -16,7 +15,6 @@ SAMSUNG_SOURCE_VARIANTS: tuple[str, ...] = (
 SAMSUNG_PARTNER_LABELS: dict[str, str] = {
     "samsung_vs": "Samsung Vijay Sales",
     "samsung_croma": "Samsung Croma",
-    "samsung_croma_dsdsg": "Croma DS/DSG",
     "samsung_reliance_digital": "Samsung Reliance Digital",
 }
 
@@ -34,15 +32,6 @@ _SAMSUNG_SOURCE_ALIASES: dict[str, str] = {
     "protect max": "samsung_croma",
     "protect max croma": "samsung_croma",
     "croma protect max": "samsung_croma",
-    "samsung_croma_dsdsg": "samsung_croma_dsdsg",
-    "samsung croma dsdsg": "samsung_croma_dsdsg",
-    "samsung croma ds dsg": "samsung_croma_dsdsg",
-    "croma ds dsg": "samsung_croma_dsdsg",
-    "croma ds/dsg": "samsung_croma_dsdsg",
-    "dsdsg": "samsung_croma_dsdsg",
-    "ds dsg": "samsung_croma_dsdsg",
-    "ds/dsg": "samsung_croma_dsdsg",
-    "ds-dsg": "samsung_croma_dsdsg",
     "samsung_reliance_digital": "samsung_reliance_digital",
     "samsung reliance digital": "samsung_reliance_digital",
     "samsungreliancedigital": "samsung_reliance_digital",

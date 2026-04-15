@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from io import BytesIO
 from datetime import datetime, date, timedelta
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 
 import pandas as pd
@@ -26,7 +26,7 @@ from fastapi import (
     Request,
     Response,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, func
 from sqlalchemy.orm import Session
@@ -56,6 +56,13 @@ from services.ai_mapper import suggest_reverse_mapping
 from services.analytics_engine import filter_by_date_range
 from services.admin_upload_service import backfill_missing_job_ids
 from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
+from services.forecast_service import (
+    aggregate_financial_year,
+    combine_monthly_history,
+    forecast_monthly_points,
+    load_monthly_history,
+)
+from services.maintenance_service import refresh_master_overview_cache, run_daily_refresh_if_due
 from services.partner_filter_service import (
     dataframe_to_payload_rows,
     normalize_partner_dataframe,
@@ -73,6 +80,8 @@ from services.samsung_partner_config import (
 # --------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+_daily_refresh_scheduler_lock = threading.Lock()
+_daily_refresh_scheduler_started = False
 
 def _json_safe(value: Any):
     if value is None:
@@ -92,6 +101,47 @@ def _json_safe(value: Any):
 
 def _clean_json_row(row: dict) -> dict:
     return {k: _json_safe(v) for k, v in row.items()}
+
+
+def _start_daily_refresh_scheduler() -> None:
+    global _daily_refresh_scheduler_started
+    with _daily_refresh_scheduler_lock:
+        if _daily_refresh_scheduler_started:
+            return
+        _daily_refresh_scheduler_started = True
+
+    initial_delay_seconds = max(int(os.getenv("AUTO_DAILY_REFRESH_STARTUP_DELAY_SECONDS", "15")), 0)
+    check_interval_seconds = max(int(os.getenv("AUTO_DAILY_REFRESH_CHECK_INTERVAL_SECONDS", "900")), 60)
+
+    def _worker() -> None:
+        if initial_delay_seconds:
+            time.sleep(initial_delay_seconds)
+        while True:
+            maintenance_db = SessionLocal()
+            try:
+                result = run_daily_refresh_if_due(db=maintenance_db)
+                status = str(result.get("status") or "").strip().lower()
+                if status == "success":
+                    logger.info(
+                        "Auto daily refresh completed run_day=%s",
+                        result.get("run_day"),
+                    )
+                elif status == "failed":
+                    logger.error(
+                        "Auto daily refresh failed error=%s",
+                        result.get("error"),
+                    )
+            except Exception:
+                logger.exception("Unexpected auto daily refresh scheduler error")
+            finally:
+                maintenance_db.close()
+            time.sleep(check_interval_seconds)
+
+    threading.Thread(
+        target=_worker,
+        name="auto-daily-refresh",
+        daemon=True,
+    ).start()
 
 
 def _refresh_jobs(job_id: str | None) -> list[str | None]:
@@ -278,6 +328,17 @@ def _refresh_after_data_change(
                 refresh_job,
             )
 
+    try:
+        refresh_master_overview_cache(db=db)
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to refresh master overview after %s source=%s dataset=%s",
+            action,
+            src,
+            ds,
+        )
+
 
 # --------------------------------------------------
 # APP
@@ -285,6 +346,7 @@ def _refresh_after_data_change(
 app = FastAPI(
     title="Live Dashboard API",
     version="1.0.0",
+    default_response_class=ORJSONResponse,
     swagger_ui_parameters={
         "persistAuthorization": True,
         "displayRequestDuration": True,
@@ -522,11 +584,17 @@ def _init_db():
     prewarm_enabled = prewarm_raw.lower() not in {"0", "false", "no", "off"}
     chatbot_enabled = os.getenv("ENABLE_CHATBOT", "1").strip().lower() not in {"0", "false", "no", "off"}
     insights_enabled = os.getenv("ENABLE_GRAPH_INSIGHTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+    auto_daily_refresh_enabled = os.getenv("AUTO_DAILY_REFRESH", "1").strip().lower() not in {"0", "false", "no", "off"}
     if prewarm_enabled and (chatbot_enabled or insights_enabled):
         try:
             threading.Thread(target=_prewarm_llm_model, name="llm-prewarm", daemon=True).start()
         except Exception:
             logger.exception("Failed to schedule LLM prewarm")
+    if auto_daily_refresh_enabled:
+        try:
+            _start_daily_refresh_scheduler()
+        except Exception:
+            logger.exception("Failed to schedule auto daily refresh")
 
 # --------------------------------------------------
 #  CORS  FIXED (DEV SAFE)
@@ -567,7 +635,7 @@ def preflight(path: str, request: Request):
 # --------------------------------------------------
 # ROUTERS
 # --------------------------------------------------
-from routers.analytics import compute_by_dimension_rows, router as analytics_router
+from routers.analytics import analytics_summary, compute_by_dimension_rows, router as analytics_router
 from routers.admin_files import router as admin_files_router
 from routers.deck_export import router as deck_export_router
 from services.analytics.goodrej_engine import invalidate_godrej_load_cache
@@ -2251,7 +2319,6 @@ class ChatbotPayload(BaseModel):
 DEFAULT_LLM_MODEL = (
     os.getenv("SARVAM_MODEL", "").strip()
     or os.getenv("CHATBOT_MODEL", "").strip()
-    or os.getenv("CHATCARDS_MODEL", "").strip()
     or "sarvam-m"
 )
 DEFAULT_CHATBOT_SYSTEM_PROMPT = (
@@ -2265,8 +2332,10 @@ DEFAULT_CHATBOT_SYSTEM_PROMPT = (
     "Apply source-specific taxonomy and mappings; use Samsung-specific model mapping or Samsung plan abbreviations only when the selected source is Samsung. "
     "Write in a clear executive tone with concise, evidence-backed reasoning. "
     "Lead with the direct answer, then support it with key metrics, trend direction, and business impact. "
+    "Answer the exact metric the user asked for; do not switch to premium, revenue, or another metric unless the user asks for that explicitly. "
+    "If the user asks for quantity, count, plans sold, or volume and a dedicated quantity field is unavailable, use row count as the operational proxy when the dataset grain supports that and state the assumption briefly. "
     "Vary phrasing and structure across turns; avoid repeating identical templates or sentence openings. "
-    "For forecasting questions, derive next-month directional estimates only from historical monthly values in context. "
+    "For forecasting questions, derive directional month or financial-year estimates only from historical monthly values in context. "
     "Never expose chain-of-thought, internal reasoning, or <think> tags. "
     "Do not re-introduce yourself unless the user explicitly asks who you are."
 )
@@ -2295,10 +2364,71 @@ try:
 except ValueError:
     CHATBOT_CACHE_MAX_ITEMS = 256
 
+try:
+    CHATBOT_SCOPE_CACHE_TTL_SECONDS = max(5, int(os.getenv("CHATBOT_SCOPE_CACHE_TTL_SECONDS", "60")))
+except ValueError:
+    CHATBOT_SCOPE_CACHE_TTL_SECONDS = 60
+
+try:
+    CHATBOT_LLM_FAILURE_TTL_SECONDS = max(15, int(os.getenv("CHATBOT_LLM_FAILURE_TTL_SECONDS", "180")))
+except ValueError:
+    CHATBOT_LLM_FAILURE_TTL_SECONDS = 180
+
 GRAPH_INSIGHTS_TTL_SECONDS = int(os.getenv("GRAPH_INSIGHTS_TTL_SECONDS", "300"))
 _graph_insights_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _chatbot_response_cache: dict[str, tuple[float, dict[str, str]]] = {}
+_chatbot_scope_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _chatbot_cache_lock = threading.Lock()
+_chatbot_scope_cache_lock = threading.Lock()
+_chatbot_llm_state_lock = threading.Lock()
+_chatbot_llm_unavailable_until = 0.0
+_chatbot_llm_last_error = ""
+
+
+def _chatbot_scope_cache_key(*, job_id: str | None) -> str:
+    return _normalize_chatbot_job_id(job_id) or "__all__"
+
+
+def _chatbot_scope_cache_get(*, job_id: str | None) -> list[dict[str, Any]] | None:
+    cache_key = _chatbot_scope_cache_key(job_id=job_id)
+    now = time.time()
+    with _chatbot_scope_cache_lock:
+        cached = _chatbot_scope_cache.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, payload = cached
+        if expires_at <= now:
+            _chatbot_scope_cache.pop(cache_key, None)
+            return None
+        return payload
+
+
+def _chatbot_scope_cache_set(*, job_id: str | None, scopes: list[dict[str, Any]]) -> None:
+    cache_key = _chatbot_scope_cache_key(job_id=job_id)
+    with _chatbot_scope_cache_lock:
+        _chatbot_scope_cache[cache_key] = (time.time() + CHATBOT_SCOPE_CACHE_TTL_SECONDS, scopes)
+
+
+def _chatbot_mark_llm_unavailable(*, detail: str, ttl_seconds: int | None = None) -> None:
+    cooldown = max(15, int(ttl_seconds or CHATBOT_LLM_FAILURE_TTL_SECONDS))
+    with _chatbot_llm_state_lock:
+        global _chatbot_llm_unavailable_until, _chatbot_llm_last_error
+        _chatbot_llm_unavailable_until = time.time() + cooldown
+        _chatbot_llm_last_error = detail.strip()
+
+
+def _chatbot_mark_llm_available() -> None:
+    with _chatbot_llm_state_lock:
+        global _chatbot_llm_unavailable_until, _chatbot_llm_last_error
+        _chatbot_llm_unavailable_until = 0.0
+        _chatbot_llm_last_error = ""
+
+
+def _chatbot_llm_unavailable_state() -> tuple[bool, str]:
+    with _chatbot_llm_state_lock:
+        if _chatbot_llm_unavailable_until > time.time():
+            return True, _chatbot_llm_last_error
+        return False, ""
 
 
 def _graph_insights_cache_key(payload: GraphInsightPayload) -> str:
@@ -2324,31 +2454,27 @@ def _read_chatcards_system_prompt() -> str:
         "Generate crisp, decision-ready insights from chart data. Use precise business "
         "language, quantify impact, and avoid filler. Return exactly 3 to 5 bullet points."
     )
-    env_path = os.getenv("CHATCARDS_MODELFILE_PATH", "").strip()
+    env_path = os.getenv("CHATCARDS_SYSTEM_PROMPT_PATH", "").strip()
     candidates = []
     if env_path:
         candidates.append(Path(env_path))
     base_dir = Path(__file__).resolve().parent
     candidates.extend(
         [
-            base_dir / "chatcards" / "Modelfile",            # backend-local (works in Docker image)
-            base_dir.parent / "chatcards" / "Modelfile",     # repo-root sibling (works in local dev)
+            base_dir / "chatcards" / "system_prompt.txt",            # backend-local (works in Docker image)
+            base_dir.parent / "chatcards" / "system_prompt.txt",     # repo-root sibling (works in local dev)
         ]
     )
 
-    for modelfile_path in candidates:
-        if not modelfile_path.exists():
+    for prompt_path in candidates:
+        if not prompt_path.exists():
             continue
         try:
-            content = modelfile_path.read_text(encoding="utf-8")
+            content = prompt_path.read_text(encoding="utf-8").strip()
         except Exception:
             continue
-        match = re.search(r'SYSTEM\s+"""(.*?)"""', content, flags=re.DOTALL | re.IGNORECASE)
-        if not match:
-            continue
-        system = match.group(1).strip()
-        if system:
-            return system
+        if content:
+            return content
     return fallback
 
 
@@ -2407,7 +2533,6 @@ _CHATBOT_SOURCE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
     ("hitachi", ("hitachi",)),
     ("samsung_vs", ("samsung vijay sales", "samsung_vs", "samsung vs", "vijay sales", "vijay")),
     ("samsung_croma", ("samsung croma", "samsung_croma", "croma sales", "croma", "samsung protect max", "samsung protect max croma", "protect max", "protect max croma", "croma protect max")),
-    ("samsung_croma_dsdsg", ("samsung croma dsdsg", "samsung_croma_dsdsg", "croma ds dsg", "croma ds/dsg", "dsdsg", "ds dsg", "ds/dsg", "ds-dsg")),
     ("samsung", ("samsung",)),
 ]
 
@@ -2418,7 +2543,6 @@ _CHATBOT_SOURCE_LABELS: dict[str, str] = {
     "samsung": "Samsung",
     "samsung_vs": "Samsung Vijay Sales",
     "samsung_croma": "Samsung Croma",
-    "samsung_croma_dsdsg": "Croma DS/DSG",
     "samsung_reliance_digital": "Samsung Reliance Digital",
 }
 
@@ -2827,6 +2951,10 @@ def _chatbot_available_scopes(
     db: Session,
     job_id: str | None,
 ) -> list[dict[str, Any]]:
+    cached = _chatbot_scope_cache_get(job_id=job_id)
+    if cached is not None:
+        return cached
+
     try:
         query = db.query(
             DataRow.source,
@@ -2864,6 +2992,7 @@ def _chatbot_available_scopes(
             str(item.get("dataset_type", "")),
         )
     )
+    _chatbot_scope_cache_set(job_id=job_id, scopes=scopes)
     return scopes
 
 
@@ -3055,23 +3184,25 @@ def _resolve_summary_for_scope(
     from_date: str | None,
     to_date: str | None,
 ) -> dict[str, Any]:
-    summary = get_precomputed_summary(
-        db=db,
-        source=source,
-        dataset_type=dataset_type,
-        job_id=job_id,
-        from_date=from_date,
-        to_date=to_date,
-    )
-    if summary is None and (from_date or to_date):
-        summary = get_precomputed_summary(
-            db=db,
+    try:
+        summary = analytics_summary(
+            job_id=job_id,
             source=source,
             dataset_type=dataset_type,
-            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+            db=db,
         )
-    if isinstance(summary, dict) and summary:
-        return summary
+        if isinstance(summary, dict) and summary:
+            return summary
+    except Exception:
+        logger.exception(
+            "Failed to resolve chatbot summary via analytics.summary source=%s dataset=%s from=%s to=%s",
+            source,
+            dataset_type,
+            from_date,
+            to_date,
+        )
     return _build_live_summary_for_scope(
         db=db,
         source=source,
@@ -3906,6 +4037,135 @@ def _metric_series_from_frame(
     return None
 
 
+_CHATBOT_QUANTITY_FIELD_CANDIDATES = [
+    "quantity",
+    "units_sold",
+    "units sold",
+    "units",
+    "count",
+    "claims_count",
+    "claim count",
+    "no_of_claims",
+    "no. of claims",
+    "number of claims",
+    "no_of_policies",
+    "policy count",
+]
+
+
+def _message_requests_row_count_proxy(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+
+    explicit_proxy_tokens = (
+        "count the rows",
+        "count rows",
+        "row count",
+        "rows month on month",
+        "row-wise count",
+        "plan count",
+        "quantity of plans",
+        "number of plans",
+        "how many plans",
+        "plan volume",
+        "monthly activations",
+    )
+    if any(token in low for token in explicit_proxy_tokens):
+        return True
+
+    if any(token in low for token in ("calculate it yourself", "calculate yourself")) and any(
+        token in low for token in ("row", "rows", "count", "quantity", "plan", "volume")
+    ):
+        return True
+
+    if any(token in low for token in ("don't use quantity", "do not use quantity", "quantity column")) and any(
+        token in low for token in ("row", "rows", "count", "calculate")
+    ):
+        return True
+
+    return False
+
+
+def _chatbot_month_column(frame: pd.DataFrame) -> str | None:
+    candidates = [
+        *_CHATBOT_COLUMN_GROUP_ALIASES.get("month", ()),
+        "sale date",
+        "sales date",
+        "activation date",
+        "booking date",
+        "created at",
+        "created_on",
+        "created date",
+        "invoice date",
+        "policy issued date",
+    ]
+    column_name = _pick_frame_column(frame, candidates)
+    if column_name:
+        return column_name
+
+    for raw_col in frame.columns:
+        safe_col = _to_safe_key(str(raw_col))
+        if "month" in safe_col or "date" in safe_col:
+            return str(raw_col)
+    return None
+
+
+def _quantity_series_from_frame(
+    frame: pd.DataFrame,
+    *,
+    force_row_count: bool = False,
+) -> tuple[pd.Series | None, str]:
+    if frame is None or frame.empty:
+        return None, "none"
+
+    if not force_row_count:
+        column_name = _pick_frame_column(frame, _CHATBOT_QUANTITY_FIELD_CANDIDATES)
+        if column_name:
+            numeric = pd.to_numeric(frame[column_name], errors="coerce")
+            if numeric.notna().any() and float(numeric.abs().sum()) > 0:
+                return numeric.fillna(0.0), "quantity_column"
+
+    return pd.Series(1.0, index=frame.index, dtype="float64"), "row_count"
+
+
+def _extract_monthly_metric_series_from_frame(
+    frame: pd.DataFrame,
+    *,
+    metric: str,
+    dataset_type: str,
+    force_row_count: bool = False,
+) -> tuple[list[tuple[date, float]], str]:
+    if frame is None or frame.empty:
+        return [], "none"
+
+    month_column = _chatbot_month_column(frame)
+    if not month_column:
+        return [], "none"
+
+    metric_key = (metric or "").strip().lower()
+    proxy_mode = "metric"
+    if metric_key in {"quantity", "count"}:
+        series, proxy_mode = _quantity_series_from_frame(frame, force_row_count=force_row_count)
+    else:
+        series = _metric_series_from_frame(frame, metric, dataset_type)
+
+    if series is None:
+        return [], proxy_mode
+
+    monthly: dict[date, float] = {}
+    for raw_month, raw_value in zip(frame[month_column], series):
+        month_start = _parse_month_start(raw_month)
+        if month_start is None:
+            continue
+        numeric = _to_number(raw_value)
+        if numeric is None:
+            continue
+        monthly[month_start] = monthly.get(month_start, 0.0) + float(numeric)
+
+    return sorted(monthly.items(), key=lambda item: item[0]), proxy_mode
+
+
 def _aggregate_graph_metric_across_sources(
     *,
     db: Session,
@@ -4096,7 +4356,7 @@ def _build_chart_rows(
         metric_key = metric_spec.get("metric", "")
         if (
             dimension_key in _CHATBOT_ANALYTICS_DIMENSIONS
-            and metric_key in {"claims", "net_claims", "loss_ratio", "gross_premium", "earned_premium", "zopper_earned_premium", "quantity"}
+            and metric_key in {"claims", "net_claims", "loss_ratio", "gross_premium", "earned_premium", "zopper_earned_premium"}
             and metric_spec.get("aggregation") != "avg"
         ):
             metric_rows = _aggregate_graph_metric_across_sources(
@@ -4527,6 +4787,8 @@ def _build_chatbot_global_context(
         "allowed_labels": sorted({_source_display_name(str(scope.get("source", ""))) for scope in scopes}),
         "global_scope": True,
         "ui_context": payload.ui_context if isinstance(payload.ui_context, dict) else {},
+        "sales_summary": {},
+        "claims_summary": {},
     }
 
     context_lines = [
@@ -4641,6 +4903,7 @@ def _build_chatbot_global_context(
         context_lines.extend(dataset_profile_lines)
 
     if any(value > 0 for value in sales_totals.values()):
+        context_payload["sales_summary"] = dict(sales_totals)
         context_lines.append(
             "All-sources sales total: "
             f"Gross Premium={_format_metric_value('gross_premium', sales_totals['gross_premium'])}; "
@@ -4649,6 +4912,7 @@ def _build_chatbot_global_context(
             f"Units Sold={int(sales_totals['units_sold']):,}"
         )
     if any(value > 0 for value in claims_totals.values()):
+        context_payload["claims_summary"] = dict(claims_totals)
         context_lines.append(
             "All-sources claims total: "
             f"Total Claims Cost={_format_metric_value('claims', claims_totals['gross_premium'])}; "
@@ -4792,6 +5056,250 @@ def _format_rank_pairs(metric: str, pairs: list[tuple[str, float]]) -> str:
     return "; ".join(f"{label} ({_format_metric_value(metric, value)})" for label, value in pairs)
 
 
+def _chatbot_scope_label_for_answer(context_payload: dict[str, Any]) -> str:
+    if bool(context_payload.get("global_scope")):
+        return "all available partners"
+    return str(context_payload.get("source_label") or "the selected source")
+
+
+def _chatbot_range_label(context_payload: dict[str, Any]) -> str:
+    from_date = _normalize_chatbot_date(context_payload.get("from_date"))
+    to_date = _normalize_chatbot_date(context_payload.get("to_date"))
+    if from_date or to_date:
+        return f"{from_date or 'start'} to {to_date or 'latest'}"
+    return "all available data"
+
+
+def _chatbot_summary_for_context(context_payload: dict[str, Any]) -> dict[str, Any]:
+    dataset_type = str(context_payload.get("dataset_type") or "sales").strip().lower()
+    if bool(context_payload.get("global_scope")):
+        if dataset_type == "claims":
+            summary = context_payload.get("claims_summary") or {}
+        else:
+            summary = context_payload.get("sales_summary") or {}
+    else:
+        summary = context_payload.get("summary") or {}
+    return summary if isinstance(summary, dict) else {}
+
+
+def _chatbot_summary_metric_answer(
+    *,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    dataset_type = str(context_payload.get("dataset_type") or "sales").strip().lower()
+    summary = _chatbot_summary_for_context(context_payload)
+    if not summary:
+        return None
+
+    metric_specs = _resolve_chart_metric_specs(payload.message, dataset_type)
+    if not metric_specs:
+        return None
+
+    metric = str(metric_specs[0].get("metric") or "").strip().lower()
+    scope_label = _chatbot_scope_label_for_answer(context_payload)
+    range_label = _chatbot_range_label(context_payload)
+
+    value: float | None = None
+    label = str(metric_specs[0].get("label") or _pretty_label(metric) or "Metric").strip()
+    format_metric = metric
+
+    if dataset_type == "claims":
+        if metric in {"claims", "gross_premium"}:
+            value = float(summary.get("gross_premium", 0) or 0)
+            label = "Total Claims Cost"
+            format_metric = "claims"
+        elif metric in {"net_claims", "earned_premium"}:
+            value = float(summary.get("earned_premium", 0) or 0)
+            label = "Net Claims Cost Paid"
+            format_metric = "net_claims"
+        elif metric in {"quantity", "count", "units_sold"}:
+            value = float(summary.get("units_sold", 0) or 0)
+            label = "No. of Claims"
+            format_metric = "quantity"
+        else:
+            return None
+    else:
+        if metric == "gross_premium":
+            value = float(summary.get("gross_premium", 0) or 0)
+            label = "Gross Premium"
+            format_metric = "gross_premium"
+        elif metric == "earned_premium":
+            value = float(summary.get("earned_premium", 0) or 0)
+            label = "Earned Premium"
+            format_metric = "earned_premium"
+        elif metric == "zopper_earned_premium":
+            value = float(summary.get("zopper_earned_premium", 0) or 0)
+            label = "Zopper Earned Premium"
+            format_metric = "zopper_earned_premium"
+        elif metric in {"quantity", "count", "units_sold"}:
+            value = float(summary.get("units_sold", 0) or 0)
+            label = "Units Sold"
+            format_metric = "quantity"
+        else:
+            return None
+
+    if value is None:
+        return None
+
+    if format_metric == "quantity":
+        formatted_value = f"{int(round(value)):,}"
+    else:
+        formatted_value = _format_metric_value(format_metric, value)
+
+    supporting_bits: list[str] = []
+    if dataset_type == "sales":
+        if format_metric != "earned_premium":
+            supporting_bits.append(
+                f"Earned Premium is {_format_metric_value('earned_premium', float(summary.get('earned_premium', 0) or 0))}."
+            )
+        if format_metric != "zopper_earned_premium":
+            supporting_bits.append(
+                f"Zopper Earned Premium is {_format_metric_value('zopper_earned_premium', float(summary.get('zopper_earned_premium', 0) or 0))}."
+            )
+        if format_metric != "quantity":
+            supporting_bits.append(
+                f"Units Sold are {int(round(float(summary.get('units_sold', 0) or 0))):,}."
+            )
+    else:
+        if format_metric != "net_claims":
+            supporting_bits.append(
+                f"Net Claims Cost Paid is {_format_metric_value('net_claims', float(summary.get('earned_premium', 0) or 0))}."
+            )
+        if format_metric != "quantity":
+            supporting_bits.append(
+                f"No. of Claims are {int(round(float(summary.get('units_sold', 0) or 0))):,}."
+            )
+
+    return (
+        f"For {scope_label} {dataset_type} in {range_label}, {label} is {formatted_value}. "
+        + " ".join(supporting_bits[:3])
+    ).strip()
+
+
+def _chatbot_rankings_fallback_answer(
+    *,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    rankings = context_payload.get("rankings") or []
+    if not rankings:
+        return None
+
+    requested_dimensions = _chatbot_requested_dimensions_from_text(payload.message)
+    snapshot: dict[str, Any] | None = None
+    for dimension in requested_dimensions:
+        snapshot = next((row for row in rankings if row.get("dimension") == dimension), None)
+        if snapshot:
+            break
+    if snapshot is None:
+        snapshot = rankings[0] if rankings else None
+    if snapshot is None:
+        return None
+
+    top = snapshot.get("top", []) or []
+    bottom = snapshot.get("bottom", []) or []
+    if not top and not bottom:
+        return None
+
+    scope_label = _chatbot_scope_label_for_answer(context_payload)
+    range_label = _chatbot_range_label(context_payload)
+    metric = str(snapshot.get("metric") or "gross_premium")
+    dimension = str(snapshot.get("dimension") or "dimension")
+
+    lines = [
+        f"Fast dashboard fallback for {scope_label} in {range_label}: {_pretty_label(dimension)} by {_pretty_label(metric)}."
+    ]
+    if top:
+        lines.append(f"Top segments: {_format_rank_pairs(metric, top)}.")
+    if bottom:
+        lines.append(f"Lowest segments: {_format_rank_pairs(metric, bottom)}.")
+    return " ".join(lines)
+
+
+def _is_direct_summary_metric_query(message: str) -> bool:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if not low:
+        return False
+    if any(
+        token in low
+        for token in (
+            "trend",
+            "forecast",
+            "predict",
+            "graph",
+            "chart",
+            "breakdown",
+            "statewise",
+            "monthwise",
+            "citywise",
+            "compare",
+            "vs ",
+            " versus ",
+            "why",
+            "reason",
+            "underperform",
+            "recommend",
+        )
+    ):
+        return False
+
+    metric_tokens = (
+        "gross premium",
+        "earned premium",
+        "zopper earned",
+        "quantity",
+        "units sold",
+        "sales count",
+        "claims cost",
+        "net claim",
+        "claim count",
+        "no. of claims",
+        "number of claims",
+    )
+    lookup_tokens = (
+        "what is",
+        "what are",
+        "how much",
+        "how many",
+        "total",
+        "overall",
+        "current",
+        "summary",
+    )
+    return any(token in low for token in metric_tokens) and any(token in low for token in lookup_tokens)
+
+
+def _build_chatbot_service_fallback_response(
+    *,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+    error_detail: str = "",
+) -> dict[str, str]:
+    direct_answer = _chatbot_summary_metric_answer(payload=payload, context_payload=context_payload)
+    ranking_answer = _chatbot_rankings_fallback_answer(payload=payload, context_payload=context_payload)
+
+    response_text = direct_answer or ranking_answer
+    if not response_text:
+        response_text = (
+            f"I could not use the live language model right now, but I still have dashboard context for "
+            f"{_chatbot_scope_label_for_answer(context_payload)} in {_chatbot_range_label(context_payload)}. "
+            "Ask for a specific metric like gross premium, earned premium, quantity, claims cost, or a breakdown by state, month, plan, or channel."
+        )
+    elif error_detail:
+        response_text += " I answered from cached dashboard analytics because the live LLM service is currently unavailable."
+
+    return {
+        "response": _prepend_partner_scope_prompt(
+            response_text,
+            payload=payload,
+            context_payload=context_payload,
+        ),
+        "model": "rule-based-fallback",
+        "message": error_detail.strip() or "LLM unavailable; answered from dashboard analytics.",
+    }
+
+
 def _chatbot_graph_rows(
     *,
     db: Session,
@@ -4802,6 +5310,7 @@ def _chatbot_graph_rows(
     metric: str,
     from_date: str | None,
     to_date: str | None,
+    allow_live_fallback: bool = True,
 ) -> list[dict[str, Any]]:
     rows = get_precomputed_graph(
         db=db,
@@ -4823,7 +5332,7 @@ def _chatbot_graph_rows(
             metric=metric,
         )
 
-    should_try_live = not rows
+    should_try_live = allow_live_fallback and not rows
     if should_try_live:
         try:
             rows = compute_by_dimension_rows(
@@ -4859,7 +5368,12 @@ def _build_chatbot_dashboard_context(
     from_date, to_date = _normalize_chatbot_date_range(payload.from_date, payload.to_date)
     job_id = _normalize_chatbot_job_id(payload.job_id)
     message_requests_global_scope = _requests_global_scope(payload.message)
-    should_use_global_scope = bool(message_requests_global_scope or not source or source_origin == "payload")
+    explicit_global_scope = bool(payload.global_scope)
+    should_use_global_scope = bool(
+        message_requests_global_scope
+        or not source
+        or (explicit_global_scope and source_origin in {"none", "payload"})
+    )
 
     context_payload: dict[str, Any] = {
         "source": source,
@@ -4874,6 +5388,7 @@ def _build_chatbot_dashboard_context(
         "requested_dimensions": [],
         "global_scope": should_use_global_scope,
         "ui_context": payload.ui_context if isinstance(payload.ui_context, dict) else {},
+        "summary": {},
     }
 
     if should_use_global_scope:
@@ -4887,7 +5402,7 @@ def _build_chatbot_dashboard_context(
             source_origin=source_origin,
         )
 
-    summary = get_precomputed_summary(
+    context_payload["summary"] = _resolve_summary_for_scope(
         db=db,
         source=source,
         dataset_type=dataset_type,
@@ -4895,22 +5410,18 @@ def _build_chatbot_dashboard_context(
         from_date=from_date,
         to_date=to_date,
     )
-    if summary is None and (from_date or to_date):
-        summary = get_precomputed_summary(
-            db=db,
-            source=source,
-            dataset_type=dataset_type,
-            job_id=job_id,
-        )
-    if not isinstance(summary, dict):
-        summary = {}
+    summary = context_payload["summary"] if isinstance(context_payload["summary"], dict) else {}
 
     metric_candidates = _chatbot_metric_candidates(dataset_type)
     requested_dimensions = _chatbot_requested_dimensions(payload)
-    dimension_candidates = _prioritize_dimensions(
+    prioritized_dimensions = _prioritize_dimensions(
         _chatbot_dimension_candidates(source),
         requested_dimensions,
     )
+    if requested_dimensions:
+        dimension_candidates = prioritized_dimensions[: max(1, min(3, len(requested_dimensions) + 1))]
+    else:
+        dimension_candidates = prioritized_dimensions[:3]
     rankings: list[dict[str, Any]] = []
     allowed_labels: set[str] = set()
     context_payload["requested_dimensions"] = requested_dimensions
@@ -4929,6 +5440,7 @@ def _build_chatbot_dashboard_context(
                 metric=metric,
                 from_date=from_date,
                 to_date=to_date,
+                allow_live_fallback=False,
             )
             snapshot = _rank_dimension_rows(graph_rows, dimension=dimension, metric=metric)
             if snapshot:
@@ -6341,12 +6853,18 @@ def _forecast_metric_hint_present(message: str, dataset_type: str) -> bool:
         return any(
             token in low
             for token in (
+                "gross premium",
+                "claim amount",
+                "claims cost",
                 "loss ratio",
                 "net claim",
                 "claims",
                 "quantity",
                 "count",
                 "no. of claims",
+                "how many claims",
+                "row count",
+                "count the rows",
             )
         )
     return any(
@@ -6359,6 +6877,14 @@ def _forecast_metric_hint_present(message: str, dataset_type: str) -> bool:
             "units sold",
             "units",
             "count",
+            "plan count",
+            "quantity of plans",
+            "number of plans",
+            "how many plans",
+            "plan volume",
+            "row count",
+            "count the rows",
+            "activations",
             "premium",
             "sales",
         )
@@ -6390,9 +6916,18 @@ def _is_forecast_followup_query(payload: ChatbotPayload) -> bool:
         "for that",
         "same for",
         "same question",
+        "what will be",
+        "what will",
+        "how many",
+        "count the rows",
+        "count rows",
+        "row count",
+        "calculate it yourself",
+        "calculate yourself",
     )
     source_hint = _detect_source_from_text(message) is not None
-    likely_followup = source_hint or any(marker in low for marker in followup_markers)
+    metric_hint = _forecast_metric_hint_present(message, "sales") or _forecast_metric_hint_present(message, "claims")
+    likely_followup = source_hint or metric_hint or any(marker in low for marker in followup_markers)
     if not likely_followup:
         return False
 
@@ -6407,19 +6942,47 @@ def _is_forecast_followup_query(payload: ChatbotPayload) -> bool:
 def _forecast_metric_from_text(message: str, dataset_type: str) -> str:
     low = re.sub(r"\s+", " ", (message or "").strip().lower())
     if dataset_type == "claims":
+        if any(token in low for token in ("gross premium", "claim amount", "claims cost", "claims cost")):
+            return "gross_premium"
         if "loss ratio" in low:
             return "loss_ratio"
         if "net claim" in low:
             return "net_claims"
-        if "quantity" in low or "count" in low or "no. of claims" in low:
+        if any(
+            token in low
+            for token in (
+                "quantity",
+                "count",
+                "no. of claims",
+                "how many claims",
+                "row count",
+                "count the rows",
+            )
+        ):
             return "quantity"
-        return "claims"
+        return "gross_premium"
 
     if "zopper earned" in low:
         return "zopper_earned_premium"
     if "earned premium" in low:
         return "earned_premium"
-    if "quantity" in low or "units sold" in low or "units" in low or "count" in low:
+    if any(
+        token in low
+        for token in (
+            "quantity",
+            "units sold",
+            "units",
+            "count",
+            "plan count",
+            "quantity of plans",
+            "number of plans",
+            "how many plans",
+            "plan volume",
+            "row count",
+            "count the rows",
+            "activations",
+        )
+    ):
         return "quantity"
     if "gross premium" in low or "premium" in low:
         return "gross_premium"
@@ -6440,6 +7003,48 @@ def _resolve_forecast_metric(payload: ChatbotPayload, dataset_type: str) -> str:
             return _forecast_metric_from_text(turn.content, dataset_type)
 
     return _forecast_metric_from_text(message, dataset_type)
+
+
+def _resolve_forecast_horizon_and_grain(payload: ChatbotPayload) -> tuple[int, str]:
+    messages = [payload.message or ""]
+    for turn in reversed(payload.history[-CHATBOT_HISTORY_LIMIT:]):
+        if (turn.role or "").strip().lower() == "user":
+            messages.append(turn.content or "")
+
+    joined = " ".join(messages).lower()
+    grain = "financial_year" if any(token in joined for token in ("financial year", "fiscal year", "fy ")) else "month"
+
+    match = re.search(r"\bnext\s+(\d+)\s+(month|months|year|years)\b", joined)
+    if not match:
+        match = re.search(r"\b(\d+)\s+(month|months|year|years)\b", joined)
+
+    if match:
+        count = max(1, int(match.group(1)))
+        unit = match.group(2)
+        if "year" in unit:
+            return min(count * 12, 24), "financial_year"
+        return min(count, 24), grain
+
+    if "next month" in joined or "upcoming month" in joined:
+        return 1, "month"
+    if any(token in joined for token in ("next year", "upcoming year", "financial year", "fiscal year", "yearly", "annual")):
+        return 12, "financial_year"
+    return (12, grain) if grain == "financial_year" else (6, "month")
+
+
+def _forecast_metric_label(metric: str, dataset_type: str, message: str) -> str:
+    low = re.sub(r"\s+", " ", (message or "").strip().lower())
+    if metric == "quantity":
+        if dataset_type == "claims":
+            return "Claim Count"
+        if "activation" in low:
+            return "Activation Count"
+        if "plan" in low:
+            return "Plan Count"
+        return "Sales Count"
+    if dataset_type == "claims" and metric in {"gross_premium", "claims"}:
+        return "Claims Cost"
+    return _pretty_label(metric)
 
 
 def _parse_month_start(value: Any) -> date | None:
@@ -6611,19 +7216,60 @@ def _build_time_series_forecast_answer(
     dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
     metric = _resolve_forecast_metric(payload, dataset_type)
     global_scope = bool(context_payload.get("global_scope"))
+    force_row_count_proxy = _message_requests_row_count_proxy(payload.message)
 
     series: list[tuple[date, float]] = []
     scope_label = "selected dashboard scope"
+    proxy_mode = "metric"
 
-    if global_scope:
-        scopes = _chatbot_available_scopes(db=db, job_id=job_id)
-        relevant_sources = [
-            str(scope.get("source", ""))
-            for scope in scopes
-            if str(scope.get("dataset_type", "")).strip().lower() == dataset_type
-        ]
-        aggregated: dict[date, float] = {}
-        for source in relevant_sources:
+    sources = (
+        _chatbot_scope_sources(
+            db=db,
+            context_payload=context_payload,
+            dataset_type=dataset_type,
+        )
+        if global_scope
+        else [_normalize_source_key(str(context_payload.get("source") or _resolve_chatbot_source(payload) or "").strip())]
+    )
+    sources = [source for source in sources if source]
+    if not sources:
+        return None
+
+    if metric in {"quantity", "count"}:
+        frame = _load_chatbot_scope_frame(
+            db=db,
+            sources=sources,
+            dataset_type=dataset_type,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        series, proxy_mode = _extract_monthly_metric_series_from_frame(
+            frame,
+            metric=metric,
+            dataset_type=dataset_type,
+            force_row_count=force_row_count_proxy,
+        )
+
+    if not series:
+        if global_scope:
+            aggregated: dict[date, float] = {}
+            for source in sources:
+                rows = _chatbot_graph_rows(
+                    db=db,
+                    source=source,
+                    dataset_type=dataset_type,
+                    job_id=job_id,
+                    dimension="month",
+                    metric=metric,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                for month_start, value in _extract_monthly_totals(rows, metric):
+                    aggregated[month_start] = aggregated.get(month_start, 0.0) + float(value)
+            series = sorted(aggregated.items(), key=lambda item: item[0])
+        else:
+            source = sources[0]
             rows = _chatbot_graph_rows(
                 db=db,
                 source=source,
@@ -6634,25 +7280,12 @@ def _build_time_series_forecast_answer(
                 from_date=from_date,
                 to_date=to_date,
             )
-            for month_start, value in _extract_monthly_totals(rows, metric):
-                aggregated[month_start] = aggregated.get(month_start, 0.0) + float(value)
-        series = sorted(aggregated.items(), key=lambda item: item[0])
+            series = _extract_monthly_totals(rows, metric)
+
+    if global_scope:
         scope_label = f"all sources ({dataset_type})"
     else:
-        source = str(context_payload.get("source") or _resolve_chatbot_source(payload) or "").strip()
-        if not source:
-            return None
-        rows = _chatbot_graph_rows(
-            db=db,
-            source=source,
-            dataset_type=dataset_type,
-            job_id=job_id,
-            dimension="month",
-            metric=metric,
-            from_date=from_date,
-            to_date=to_date,
-        )
-        series = _extract_monthly_totals(rows, metric)
+        source = sources[0]
         scope_label = f"{context_payload.get('source_label') or _source_display_name(source)} {dataset_type}"
 
     if len(series) < 2:
@@ -6679,15 +7312,32 @@ def _build_time_series_forecast_answer(
     growth_pct = float(forecast["weighted_growth"]) * 100.0
     trend_word = "increase" if growth_pct >= 0 else "decline"
 
+    metric_label = _pretty_label(metric)
+    low_message = re.sub(r"\s+", " ", (payload.message or "").strip().lower())
+    if metric in {"quantity", "count"}:
+        if "plan" in low_message:
+            metric_label = "Plan Count"
+        elif "activation" in low_message:
+            metric_label = "Activation Count"
+        elif dataset_type == "claims":
+            metric_label = "Claim Count"
+        else:
+            metric_label = "Sales Volume"
+
     range_suffix = ""
     if from_date or to_date:
         range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
 
+    proxy_note = ""
+    if metric in {"quantity", "count"} and proxy_mode == "row_count":
+        proxy_note = " I used monthly row counts as the operational volume proxy in this scope."
+
     return _prepend_partner_scope_prompt(
         f"Directional forecast for {scope_label}{range_suffix}: "
-        f"{_pretty_label(metric)} is most likely around {_format_metric_value(metric, float(forecast['projected']))} in {next_label}, "
+        f"{metric_label} is most likely around {_format_metric_value(metric, float(forecast['projected']))} in {next_label}, "
         f"based on month-on-month trend from {history_start} to {last_label}. "
-        f"Latest observed value is {_format_metric_value(metric, last_value)} and recent momentum implies a {trend_word} of {abs(growth_pct):.1f}% MoM.",
+        f"Latest observed value is {_format_metric_value(metric, last_value)} and recent momentum implies a {trend_word} of {abs(growth_pct):.1f}% MoM."
+        f"{proxy_note}",
         payload=payload,
         context_payload=context_payload,
     )
@@ -6720,6 +7370,169 @@ def _format_metric_value(metric_key: str, value: float) -> str:
     if abs(value) >= 1e3:
         return f"Rs {value / 1e3:.1f} K"
     return f"Rs {value:,.2f}"
+
+
+def _build_time_series_forecast_answer(
+    *,
+    db: Session,
+    payload: ChatbotPayload,
+    context_payload: dict[str, Any],
+) -> str | None:
+    if not _is_forecast_followup_query(payload):
+        return None
+
+    from_date = context_payload.get("from_date")
+    to_date = context_payload.get("to_date")
+    job_id = context_payload.get("job_id")
+    dataset_type = str(context_payload.get("dataset_type") or _resolve_chatbot_dataset_type(payload) or "sales")
+    metric = _resolve_forecast_metric(payload, dataset_type)
+    global_scope = bool(context_payload.get("global_scope"))
+    force_row_count_proxy = _message_requests_row_count_proxy(payload.message)
+    horizon_months, grain = _resolve_forecast_horizon_and_grain(payload)
+
+    scope_label = "selected dashboard scope"
+    proxy_mode = "metric"
+
+    sources = (
+        _chatbot_scope_sources(
+            db=db,
+            context_payload=context_payload,
+            dataset_type=dataset_type,
+        )
+        if global_scope
+        else [_normalize_source_key(str(context_payload.get("source") or _resolve_chatbot_source(payload) or "").strip())]
+    )
+    sources = [source for source in sources if source]
+    if not sources:
+        return None
+
+    history: list[Any] = []
+    if metric in {"quantity", "count"} and force_row_count_proxy:
+        frame = _load_chatbot_scope_frame(
+            db=db,
+            sources=sources,
+            dataset_type=dataset_type,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        series, proxy_mode = _extract_monthly_metric_series_from_frame(
+            frame,
+            metric=metric,
+            dataset_type=dataset_type,
+            force_row_count=force_row_count_proxy,
+        )
+        history = [
+            type("ForecastTuple", (), {"period_start": month_start, "value": float(value)})()
+            for month_start, value in series
+        ]
+
+    if not history:
+        if global_scope:
+            history = combine_monthly_history(
+                [
+                    load_monthly_history(
+                        db=db,
+                        source=source,
+                        dataset_type=dataset_type,
+                        metric=metric,
+                        job_id=job_id,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
+                    for source in sources
+                ]
+            )
+        else:
+            history = load_monthly_history(
+                db=db,
+                source=sources[0],
+                dataset_type=dataset_type,
+                metric=metric,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+            )
+
+    if global_scope:
+        scope_label = f"all sources ({dataset_type})"
+    else:
+        source = sources[0]
+        scope_label = f"{context_payload.get('source_label') or _source_display_name(source)} {dataset_type}"
+
+    if len(history) < 2:
+        return _prepend_partner_scope_prompt(
+            "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast.",
+            payload=payload,
+            context_payload=context_payload,
+        )
+
+    forecast = forecast_monthly_points(history, horizon_months=horizon_months)
+    if not forecast:
+        return _prepend_partner_scope_prompt(
+            "I don’t have enough month-level history in the current dataset scope to produce a reliable forecast.",
+            payload=payload,
+            context_payload=context_payload,
+        )
+
+    history_points = aggregate_financial_year(history) if grain == "financial_year" else history
+    forecast_points = aggregate_financial_year(forecast) if grain == "financial_year" else forecast
+    if not forecast_points:
+        return _prepend_partner_scope_prompt(
+            "I couldn’t produce a forecast for the requested horizon from the available history.",
+            payload=payload,
+            context_payload=context_payload,
+        )
+
+    latest_observed = history_points[-1]
+    first_forecast = forecast_points[0]
+    final_forecast = forecast_points[-1]
+    latest_label = (
+        f"{latest_observed.period_start.year} - {latest_observed.period_start.year + 1}"
+        if grain == "financial_year" and latest_observed.period_start.month == 4
+        else latest_observed.period_start.strftime("%b %y")
+    )
+    first_label = (
+        f"{first_forecast.period_start.year} - {first_forecast.period_start.year + 1}"
+        if grain == "financial_year" and first_forecast.period_start.month == 4
+        else first_forecast.period_start.strftime("%b %y")
+    )
+    final_label = (
+        f"{final_forecast.period_start.year} - {final_forecast.period_start.year + 1}"
+        if grain == "financial_year" and final_forecast.period_start.month == 4
+        else final_forecast.period_start.strftime("%b %y")
+    )
+    history_window = min(6, len(history))
+    history_start = history[-history_window].period_start.strftime("%b %y")
+    history_end = history[-1].period_start.strftime("%b %y")
+    metric_label = _forecast_metric_label(metric, dataset_type, payload.message)
+
+    range_suffix = ""
+    if from_date or to_date:
+        range_suffix = f" ({from_date or 'start'} to {to_date or 'latest'})"
+
+    proxy_note = ""
+    if metric in {"quantity", "count"} and proxy_mode == "row_count":
+        proxy_note = " I used monthly row counts as the operational volume proxy in this scope."
+
+    forecast_sentence = (
+        f"Directional {grain.replace('_', ' ')} forecast for {scope_label}{range_suffix}: "
+        f"{metric_label} is projected at {_format_metric_value(metric, first_forecast.value)} in {first_label}"
+    )
+    if len(forecast_points) > 1 and final_label != first_label:
+        forecast_sentence += (
+            f", reaching around {_format_metric_value(metric, final_forecast.value)} by {final_label}"
+        )
+    forecast_sentence += "."
+
+    return _prepend_partner_scope_prompt(
+        f"{forecast_sentence} "
+        f"Latest observed value is {_format_metric_value(metric, latest_observed.value)} in {latest_label}, "
+        f"using historical trend from {history_start} to {history_end}."
+        f"{proxy_note}",
+        payload=payload,
+        context_payload=context_payload,
+    )
 
 
 def _dedupe_insights(lines: list[str], limit: int = 5) -> list[str]:
@@ -7051,6 +7864,8 @@ def _build_chatbot_prompt(payload: ChatbotPayload, dashboard_context: str) -> st
     lines.append("3) Keep the answer structured, professional, and decision-oriented.")
     lines.append("4) If recommending actions, provide up to 3 prioritized next steps.")
     lines.append("5) Avoid repeating the same phrasing from prior assistant turns; vary sentence openings and structure.")
+    lines.append("6) Stay on the asked metric. If quantity/count is requested, do not switch to premium unless the user asks.")
+    lines.append("7) If quantity/count is requested and no explicit quantity field is reliable, use row count as the proxy when supported by the dataset grain, and say that briefly.")
     lines.append(f"User: {message}")
     lines.append("Assistant:")
     return "\n".join(lines)
@@ -7064,11 +7879,8 @@ def _call_llm(
     temperature: float = 0.2,
     num_predict: int = 480,
     timeout_seconds: int | None = None,
-    keep_alive: str | None = None,
-    num_ctx: int | None = None,
-    num_thread: int | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
-    resolved_model = (model or "").strip() or _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
+    resolved_model = (model or "").strip() or _resolve_llm_model("CHATBOT_MODEL", "SARVAM_MODEL")
     sarvam_url = os.getenv("SARVAM_API_URL", "https://api.sarvam.ai/v1/chat/completions").strip() or "https://api.sarvam.ai/v1/chat/completions"
     sarvam_api_key = os.getenv("SARVAM_API_KEY", "").strip()
     if not sarvam_api_key:
@@ -7077,7 +7889,6 @@ def _call_llm(
     resolved_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else _env_int("SARVAM_TIMEOUT_SECONDS", 70)
     resolved_max_tokens = max(8, int(num_predict))
     resolved_temperature = max(0.0, min(1.5, float(temperature)))
-    _ = keep_alive, num_ctx, num_thread  # kept for backward-compatible call signatures
 
     body = {
         "model": resolved_model,
@@ -7100,30 +7911,45 @@ def _call_llm(
         method="POST",
     )
 
-    with urlopen(req, timeout=resolved_timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("Sarvam response missing choices.")
+    try:
+        with urlopen(req, timeout=resolved_timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise ValueError("Sarvam response missing choices.")
 
-        first_choice = choices[0] if isinstance(choices[0], dict) else {}
-        message_obj = first_choice.get("message")
-        if isinstance(message_obj, dict):
-            response_text = str(message_obj.get("content") or "").strip()
-        else:
-            response_text = str(first_choice.get("text") or "").strip()
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            message_obj = first_choice.get("message")
+            if isinstance(message_obj, dict):
+                response_text = str(message_obj.get("content") or "").strip()
+            else:
+                response_text = str(first_choice.get("text") or "").strip()
 
-        if not response_text:
-            raise ValueError("Empty LLM response.")
+            if not response_text:
+                raise ValueError("Empty LLM response.")
 
-        usage_obj = payload.get("usage")
-        completion_tokens = usage_obj.get("completion_tokens") if isinstance(usage_obj, dict) else None
-        response_meta = {
-            "done_reason": str(first_choice.get("finish_reason") or "").strip().lower(),
-            "eval_count": completion_tokens,
-            "provider": "sarvam",
-        }
-        return resolved_model, response_text, response_meta
+            usage_obj = payload.get("usage")
+            completion_tokens = usage_obj.get("completion_tokens") if isinstance(usage_obj, dict) else None
+            response_meta = {
+                "done_reason": str(first_choice.get("finish_reason") or "").strip().lower(),
+                "eval_count": completion_tokens,
+                "provider": "sarvam",
+            }
+            return resolved_model, response_text, response_meta
+    except HTTPError as exc:
+        detail = ""
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+            parsed = json.loads(body) if body else {}
+            if isinstance(parsed, dict):
+                error_obj = parsed.get("error")
+                if isinstance(error_obj, dict):
+                    detail = str(error_obj.get("message") or error_obj.get("code") or "").strip()
+        except Exception:
+            detail = ""
+        if exc.code in {401, 403}:
+            raise ValueError(detail or f"Sarvam authentication failed with HTTP {exc.code}.")
+        raise URLError(detail or f"Sarvam HTTP {exc.code}")
 
 
 def _looks_truncated_response(
@@ -7212,9 +8038,6 @@ def _repair_incomplete_response(
     temperature: float,
     max_num_predict_cap: int,
     retry_timeout_seconds: int,
-    keep_alive: str,
-    num_ctx: int,
-    num_thread: int,
 ) -> str:
     if not _looks_incomplete_response(response_text):
         return response_text
@@ -7231,9 +8054,6 @@ def _repair_incomplete_response(
             temperature=min(temperature, 0.12),
             num_predict=min(max_num_predict_cap, max(128, _env_int("CHATBOT_REPAIR_NUM_PREDICT", 640))),
             timeout_seconds=max(8, min(retry_timeout_seconds, 24)),
-            keep_alive=keep_alive,
-            num_ctx=num_ctx,
-            num_thread=num_thread if num_thread > 0 else None,
         )
         repaired_text = repaired_text.strip()
         if repaired_text and len(repaired_text) >= max(24, len(response_text.strip()) // 2):
@@ -7245,11 +8065,8 @@ def _repair_incomplete_response(
 
 
 def _prewarm_llm_model() -> None:
-    model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
+    model_name = _resolve_llm_model("CHATBOT_MODEL", "SARVAM_MODEL")
     prewarm_timeout = max(10, _env_int("CHATBOT_PREWARM_TIMEOUT_SECONDS", 45))
-    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip()
-    num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
-    num_thread = _env_int("CHATBOT_NUM_THREAD", 0)
     try:
         started_at = time.perf_counter()
         _call_llm(
@@ -7259,9 +8076,6 @@ def _prewarm_llm_model() -> None:
             temperature=0.0,
             num_predict=4,
             timeout_seconds=prewarm_timeout,
-            keep_alive=keep_alive,
-            num_ctx=num_ctx,
-            num_thread=num_thread if num_thread > 0 else None,
         )
         duration_ms = (time.perf_counter() - started_at) * 1000
         logger.info("LLM prewarm complete model=%s duration_ms=%.2f", model_name, duration_ms)
@@ -7499,6 +8313,34 @@ def chatbot_message(
             ),
             "model": "rule-based-dashboard",
         }
+    if _is_direct_summary_metric_query(payload.message):
+        direct_summary_answer = _chatbot_summary_metric_answer(
+            payload=payload,
+            context_payload=context_payload,
+        )
+        if direct_summary_answer:
+            return {
+                "response": _prepend_partner_scope_prompt(
+                    direct_summary_answer,
+                    payload=payload,
+                    context_payload=context_payload,
+                ),
+                "model": "rule-based-summary",
+            }
+    if _is_dimension_stats_query(payload.message):
+        fast_rankings_answer = _chatbot_rankings_fallback_answer(
+            payload=payload,
+            context_payload=context_payload,
+        )
+        if fast_rankings_answer:
+            return {
+                "response": _prepend_partner_scope_prompt(
+                    fast_rankings_answer,
+                    payload=payload,
+                    context_payload=context_payload,
+                ),
+                "model": "rule-based-rankings",
+            }
 
     prompt = _build_chatbot_prompt(payload, dashboard_context)
     base_system_prompt = (
@@ -7518,7 +8360,7 @@ def chatbot_message(
         "Never reveal hidden reasoning, chain-of-thought, or <think> blocks.",
         "Do not re-introduce AI Sahyogi unless the user explicitly asks.",
         "End with a complete final sentence and close any opened bracket.",
-        "For forecasting questions, estimate next-month values only from monthly history in context and mark it as directional.",
+        "For forecasting questions, estimate future month or financial-year values only from monthly history in context and mark it as directional.",
         "Avoid repetitive templates across turns; vary phrasing while keeping the answer concise and factual.",
         (
             "Honor partner scope from the user query: if a partner is named, answer only for that partner; "
@@ -7543,7 +8385,7 @@ def chatbot_message(
         "Hard constraints:\n"
         f"{hard_constraints_text}\n"
     )
-    model_name = _resolve_llm_model("CHATBOT_MODEL", "CHATCARDS_MODEL", "SARVAM_MODEL")
+    model_name = _resolve_llm_model("CHATBOT_MODEL", "SARVAM_MODEL")
     temperature = (
         payload.temperature
         if payload.temperature is not None
@@ -7558,9 +8400,6 @@ def chatbot_message(
         128, min(max_tokens, _env_int("CHATBOT_RETRY_NUM_PREDICT", 640))
     )
     max_num_predict_cap = max(max_tokens, _env_int("CHATBOT_MAX_NUM_PREDICT", 4096))
-    keep_alive = os.getenv("CHATBOT_KEEP_ALIVE", "").strip()
-    num_ctx = max(512, _env_int("CHATBOT_NUM_CTX", 1024))
-    num_thread = _env_int("CHATBOT_NUM_THREAD", 0)
     context_fingerprint = hashlib.sha256(dashboard_context.encode("utf-8")).hexdigest()
     cache_key = _chatbot_cache_key(
         payload,
@@ -7573,6 +8412,14 @@ def chatbot_message(
     cached = _chatbot_cache_get(cache_key)
     if cached is not None:
         return cached
+
+    llm_unavailable, llm_unavailable_reason = _chatbot_llm_unavailable_state()
+    if llm_unavailable:
+        return _build_chatbot_service_fallback_response(
+            payload=payload,
+            context_payload=context_payload,
+            error_detail=llm_unavailable_reason or "LLM service is temporarily unavailable.",
+        )
     started_at = time.perf_counter()
 
     try:
@@ -7583,9 +8430,6 @@ def chatbot_message(
             temperature=temperature,
             num_predict=max_tokens,
             timeout_seconds=timeout_seconds,
-            keep_alive=keep_alive,
-            num_ctx=num_ctx,
-            num_thread=num_thread if num_thread > 0 else None,
         )
         needs_expansion = (
             _looks_truncated_response(response_text, response_meta, max_tokens)
@@ -7605,9 +8449,6 @@ def chatbot_message(
                     temperature=temperature,
                     num_predict=expanded_tokens,
                     timeout_seconds=expansion_timeout,
-                    keep_alive=keep_alive,
-                    num_ctx=num_ctx,
-                    num_thread=num_thread if num_thread > 0 else None,
                 )
                 if expanded_text and len(expanded_text) >= len(response_text):
                     response_text = expanded_text
@@ -7619,9 +8460,6 @@ def chatbot_message(
                         temperature=temperature,
                         max_num_predict_cap=max_num_predict_cap,
                         retry_timeout_seconds=retry_timeout_seconds,
-                        keep_alive=keep_alive,
-                        num_ctx=num_ctx,
-                        num_thread=num_thread,
                     )
             except (URLError, TimeoutError, ValueError, OSError):
                 response_text = _repair_incomplete_response(
@@ -7630,9 +8468,6 @@ def chatbot_message(
                     temperature=temperature,
                     max_num_predict_cap=max_num_predict_cap,
                     retry_timeout_seconds=retry_timeout_seconds,
-                    keep_alive=keep_alive,
-                    num_ctx=num_ctx,
-                    num_thread=num_thread,
                 )
         else:
             response_text = _repair_incomplete_response(
@@ -7641,9 +8476,6 @@ def chatbot_message(
                 temperature=temperature,
                 max_num_predict_cap=max_num_predict_cap,
                 retry_timeout_seconds=retry_timeout_seconds,
-                keep_alive=keep_alive,
-                num_ctx=num_ctx,
-                num_thread=num_thread,
             )
     except (URLError, TimeoutError, ValueError, OSError) as exc:
         if _is_timeout_exception(exc):
@@ -7655,26 +8487,30 @@ def chatbot_message(
                     temperature=min(temperature, 0.12),
                     num_predict=retry_num_predict,
                     timeout_seconds=retry_timeout_seconds,
-                    keep_alive=keep_alive,
-                    num_ctx=num_ctx,
-                    num_thread=num_thread if num_thread > 0 else None,
                 )
             except (URLError, TimeoutError, ValueError, OSError) as retry_exc:
                 logger.warning("Chatbot generation failed after timeout retry: %s", retry_exc)
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Chatbot service unavailable. Ensure SARVAM_API_KEY is configured and SARVAM_MODEL is valid."
-                    ),
+                _chatbot_mark_llm_unavailable(
+                    detail=str(retry_exc) or "LLM timeout retry failed.",
+                    ttl_seconds=max(30, retry_timeout_seconds),
+                )
+                return _build_chatbot_service_fallback_response(
+                    payload=payload,
+                    context_payload=context_payload,
+                    error_detail=str(retry_exc) or "LLM timeout retry failed.",
                 )
         else:
             logger.warning("Chatbot generation failed: %s", exc)
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Chatbot service unavailable. Ensure SARVAM_API_KEY is configured and SARVAM_MODEL is valid."
-                ),
+            _chatbot_mark_llm_unavailable(
+                detail=str(exc) or "LLM request failed.",
             )
+            return _build_chatbot_service_fallback_response(
+                payload=payload,
+                context_payload=context_payload,
+                error_detail=str(exc) or "LLM request failed.",
+            )
+
+    _chatbot_mark_llm_available()
 
     if _looks_incomplete_response(response_text):
         response_text = _repair_incomplete_response(
@@ -7683,9 +8519,6 @@ def chatbot_message(
             temperature=temperature,
             max_num_predict_cap=max_num_predict_cap,
             retry_timeout_seconds=retry_timeout_seconds,
-            keep_alive=keep_alive,
-            num_ctx=num_ctx,
-            num_thread=num_thread,
         )
 
     response_text = _sanitize_chatbot_response_text(response_text)

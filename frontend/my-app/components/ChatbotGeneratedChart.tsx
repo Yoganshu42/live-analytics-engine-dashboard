@@ -23,6 +23,62 @@ import type { ChatbotChart } from "@/app/lib/api"
 
 const CHART_COLORS = ["#2563eb", "#f97316", "#10b981", "#8b5cf6", "#ef4444", "#14b8a6"]
 
+const hslToHex = (h: number, s: number, l: number) => {
+  const sat = s / 100
+  const light = l / 100
+  const c = (1 - Math.abs(2 * light - 1)) * sat
+  const hp = h / 60
+  const x = c * (1 - Math.abs((hp % 2) - 1))
+
+  let r = 0
+  let g = 0
+  let b = 0
+
+  if (hp >= 0 && hp < 1) {
+    r = c
+    g = x
+  } else if (hp >= 1 && hp < 2) {
+    r = x
+    g = c
+  } else if (hp >= 2 && hp < 3) {
+    g = c
+    b = x
+  } else if (hp >= 3 && hp < 4) {
+    g = x
+    b = c
+  } else if (hp >= 4 && hp < 5) {
+    r = x
+    b = c
+  } else {
+    r = c
+    b = x
+  }
+
+  const m = light - c / 2
+  const toHex = (value: number) =>
+    Math.round((value + m) * 255)
+      .toString(16)
+      .padStart(2, "0")
+
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`
+}
+
+const buildDistinctChartColors = (count: number, palette: string[]) => {
+  const colors: string[] = []
+  for (let index = 0; index < count; index += 1) {
+    if (index < palette.length) {
+      colors.push(palette[index])
+      continue
+    }
+
+    const hue = (index * 137.508) % 360
+    const saturation = 68 + (index % 3) * 6
+    const lightness = 46 + (index % 4) * 5
+    colors.push(hslToHex(hue, saturation, lightness))
+  }
+  return colors
+}
+
 const formatMetricValue = (format: string | undefined, rawValue: number) => {
   const value = Number.isFinite(rawValue) ? rawValue : 0
   const metric = (format || "").toLowerCase()
@@ -84,6 +140,7 @@ export default function ChatbotGeneratedChart({ chart }: Props) {
 
   const primarySeries = chart.series[0]
   const secondarySeries = chart.series[1]
+  const pieColors = buildDistinctChartColors(chart.rows.length, CHART_COLORS)
   const hasSecondaryAxis =
     chart.chart_type === "composed" &&
     Boolean(primarySeries && secondarySeries && primarySeries.format !== secondarySeries.format)
@@ -172,7 +229,7 @@ export default function ChatbotGeneratedChart({ chart }: Props) {
                   isAnimationActive={false}
                 >
                   {chart.rows.map((_, index) => (
-                    <Cell key={`pie-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                    <Cell key={`pie-${index}`} fill={pieColors[index]} />
                   ))}
                 </Pie>
               </PieChart>

@@ -1,5 +1,6 @@
 "use client"
 
+import dynamic from "next/dynamic"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ChevronDown, Maximize2 } from "lucide-react"
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion"
@@ -18,13 +19,18 @@ import {
   YAxis,
 } from "recharts"
 
-import GraphView, { fetchGraphRows } from "@/components/GraphView"
+import GraphView, { fetchGraphRows, seedGraphDataCache } from "@/components/GraphView"
 import DateRangePicker from "@/components/DateRangePicker"
 import type { GraphChartType, GraphDataSnapshot } from "@/components/GraphView"
 import {
+  fetchAnnualComparison,
+  fetchByDimensionBatch,
   fetchCategoryPercentage,
   fetchCityBreakdownByState,
   fetchGraphInsights,
+  fetchSummary,
+  type CategoryPercentageParams,
+  type FetchByDimensionBatchItem,
   type CategoryPercentageRow,
 } from "@/app/lib/api"
 import {
@@ -32,6 +38,7 @@ import {
   isSamsungPartnerSource,
   sumSamsungPartnerValues,
 } from "@/lib/samsungPartners"
+import { SALES_METRIC_ORDER } from "@/lib/salesMetricOrder"
 import { GRAPH_PRESETS } from "@/utils/graphPresets"
 
 const normalizedInsightsFlag = (
@@ -40,6 +47,20 @@ const normalizedInsightsFlag = (
 
 // Enable insights by default; allow explicit opt-out via env.
 const INSIGHTS_ENABLED = !["0", "false", "no", "off"].includes(normalizedInsightsFlag)
+
+const YearOnYearComparisonChart = dynamic(
+  () => import("@/components/YearOnYearComparisonChart"),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="smooth-surface content-auto relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm sm:p-5">
+        <div className="flex h-[340px] items-center justify-center text-sm text-slate-500">
+          Loading year-on-year comparison...
+        </div>
+      </div>
+    ),
+  }
+)
 
 type Props = {
   source: string
@@ -68,6 +89,7 @@ type FullscreenGraph = {
   sectionGroup?: string
   sectionMode?: SectionMainChartMode
   isComposite?: boolean
+  isYearOnYear?: boolean
 } | null
 
 type SamsungOverviewCard = {
@@ -196,6 +218,101 @@ type SectionMergedState = {
   rows: SectionMergedRow[]
 }
 
+type FocusCompareSummary = {
+  gross_premium?: number
+  earned_premium?: number
+  zopper_earned_premium?: number
+  units_sold?: number
+  claims?: number
+  net_claims?: number
+  loss_ratio?: number
+}
+
+type FullscreenCompareSummaryState = {
+  loading: boolean
+  error: string | null
+  sales: FocusCompareSummary | null
+  claims: FocusCompareSummary | null
+}
+
+type FullscreenCompareMatrixRow = {
+  label: string
+  grossPremiumValue: number
+  earnedPremiumValue: number
+  claimsValue: number
+  ratioValue: number
+  lossRatioValue: number
+}
+
+type FullscreenCompareMatrixState = {
+  loading: boolean
+  error: string | null
+  rows: FullscreenCompareMatrixRow[]
+  othersBreakdownRows: FullscreenCompareMatrixRow[]
+}
+
+const createEmptyFullscreenCompareSummaryState = (): FullscreenCompareSummaryState => ({
+  loading: false,
+  error: null,
+  sales: null,
+  claims: null,
+})
+
+const createEmptyFullscreenCompareMatrixState = (): FullscreenCompareMatrixState => ({
+  loading: false,
+  error: null,
+  rows: [],
+  othersBreakdownRows: [],
+})
+
+const normalizeFocusCompareSummary = (
+  summary: FocusCompareSummary | null | undefined,
+  datasetType: "sales" | "claims",
+  salesReference?: FocusCompareSummary | null
+): FocusCompareSummary | null => {
+  if (!summary) return null
+
+  if (datasetType === "sales") {
+    return {
+      gross_premium: asNumber(summary.gross_premium),
+      earned_premium: asNumber(summary.earned_premium),
+      zopper_earned_premium: asNumber(summary.zopper_earned_premium),
+      units_sold: asNumber(summary.units_sold),
+    }
+  }
+
+  const claims = asNumber(summary.claims ?? summary.gross_premium)
+  const netClaims = asNumber(summary.net_claims ?? summary.earned_premium ?? summary.gross_premium)
+  const quantity = asNumber(summary.units_sold)
+  const zopperBase = asNumber(salesReference?.zopper_earned_premium)
+  const lossRatio = summary.loss_ratio != null
+    ? asNumber(summary.loss_ratio)
+    : (zopperBase > 0 ? (claims / zopperBase) * 100 : 0)
+
+  return {
+    gross_premium: claims,
+    earned_premium: netClaims,
+    units_sold: quantity,
+    claims,
+    net_claims: netClaims,
+    loss_ratio: lossRatio,
+  }
+}
+
+const FULLSCREEN_COMPARE_MATRIX_OTHERS_GROSS_THRESHOLD = 80 * 100000
+const FULLSCREEN_COMPARE_MATRIX_LOSS_RATIO_CAP = 300
+
+const getFullscreenCompareMatrixMetricValue = (
+  row: Record<string, unknown>,
+  metric: string,
+  source: string
+) => {
+  if (source === "samsung" && SAMSUNG_PARTNERS.some((partner) => row[partner.key] != null)) {
+    return Math.max(0, sumSamsungPartnerValues(row))
+  }
+  return Math.max(0, getSourceMetricValue(row, metric, source))
+}
+
 const CITY_PIE_COLORS = [
   "#0ea5e9",
   "#22c55e",
@@ -228,6 +345,111 @@ const PIE_GRADIENTS: GradientTone[] = [
 const getPieGradient = (index: number) =>
   PIE_GRADIENTS[index % PIE_GRADIENTS.length]
 
+const hslToHex = (hue: number, saturation: number, lightness: number) => {
+  const h = ((hue % 360) + 360) % 360
+  const s = Math.max(0, Math.min(100, saturation)) / 100
+  const l = Math.max(0, Math.min(100, lightness)) / 100
+  const chroma = (1 - Math.abs((2 * l) - 1)) * s
+  const segment = h / 60
+  const second = chroma * (1 - Math.abs((segment % 2) - 1))
+  const match = l - (chroma / 2)
+
+  let red = 0
+  let green = 0
+  let blue = 0
+
+  if (segment >= 0 && segment < 1) {
+    red = chroma
+    green = second
+  } else if (segment < 2) {
+    red = second
+    green = chroma
+  } else if (segment < 3) {
+    green = chroma
+    blue = second
+  } else if (segment < 4) {
+    green = second
+    blue = chroma
+  } else if (segment < 5) {
+    red = second
+    blue = chroma
+  } else {
+    red = chroma
+    blue = second
+  }
+
+  const toHex = (value: number) =>
+    Math.round((value + match) * 255)
+      .toString(16)
+      .padStart(2, "0")
+
+  return `#${toHex(red)}${toHex(green)}${toHex(blue)}`
+}
+
+const buildDistinctSolidColors = (count: number, palette: string[], seedKey: string) => {
+  if (count <= 0) return [] as string[]
+
+  const colors: string[] = []
+  const used = new Set<string>()
+  const paletteSize = palette.length
+  const seedBase = toDomId(seedKey).split("").reduce((acc, char) => acc + char.charCodeAt(0), 0)
+  const paletteOffset = paletteSize ? seedBase % paletteSize : 0
+  let generatedIndex = 0
+
+  for (let index = 0; index < count; index += 1) {
+    let candidate = ""
+
+    if (index < paletteSize) {
+      candidate = palette[(paletteOffset + index) % paletteSize]
+    }
+
+    while (!candidate || used.has(candidate)) {
+      const hue = (seedBase + (generatedIndex * 137.508)) % 360
+      const saturation = 68 + ((generatedIndex % 3) * 6)
+      const lightness = 46 + ((generatedIndex % 4) * 5)
+      candidate = hslToHex(hue, saturation, lightness)
+      generatedIndex += 1
+    }
+
+    used.add(candidate)
+    colors.push(candidate)
+  }
+
+  return colors
+}
+
+const buildDistinctPieGradients = (count: number, seedKey: string) => {
+  if (count <= 0) return [] as GradientTone[]
+
+  const seedBase = toDomId(seedKey).split("").reduce((acc, char) => acc + char.charCodeAt(0), 0)
+  const gradients: GradientTone[] = []
+  const used = new Set<string>()
+  const presetOffset = PIE_GRADIENTS.length ? seedBase % PIE_GRADIENTS.length : 0
+  let generatedIndex = 0
+
+  for (let index = 0; index < count; index += 1) {
+    let gradient: GradientTone | null = null
+
+    if (index < PIE_GRADIENTS.length) {
+      gradient = PIE_GRADIENTS[(presetOffset + index) % PIE_GRADIENTS.length]
+    }
+
+    while (!gradient || used.has(`${gradient.from}:${gradient.to}`)) {
+      const hue = (seedBase + (generatedIndex * 137.508)) % 360
+      gradient = {
+        from: hslToHex(hue, 74, 64),
+        to: hslToHex(hue, 72, 42),
+      }
+      generatedIndex += 1
+    }
+
+    used.add(`${gradient.from}:${gradient.to}`)
+    gradients.push(gradient)
+  }
+
+  return gradients
+}
+
 const toDomId = (value: string) => {
   const normalized = value
     .toLowerCase()
@@ -246,14 +468,16 @@ const normalizeCategoryRows = (rows: CategoryPercentageRow[]) =>
     .filter((row) => row.label)
     .sort((a, b) => b.value - a.value)
 
-const toMixSlices = (rows: CategoryOption[], prefix: string): MixSlice[] =>
-  rows.map((row, index) => ({
+const toMixSlices = (rows: CategoryOption[], prefix: string): MixSlice[] => {
+  const gradients = buildDistinctPieGradients(rows.length, prefix)
+  return rows.map((row, index) => ({
     label: row.label,
     value: row.value,
     percentage: row.percentage,
-    gradient: getPieGradient(index),
+    gradient: gradients[index] || getPieGradient(index),
     gradientId: `${prefix}-${index}-${toDomId(row.label)}`,
   }))
+}
 
 const getPieSizing = (stateCount: number): PieSizing => {
   if (stateCount <= 1) return { height: 250, innerRadius: 58, outerRadius: 94 }
@@ -328,6 +552,13 @@ const asNumber = (value: unknown) => {
   return Number.isFinite(n) ? n : 0
 }
 
+const toSafeKey = (value: string) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[()%'.]/g, "")
+
 const formatMetricValue = (value: number, metric: string) => {
   const m = metric.toLowerCase()
   if (m.includes("loss_ratio")) return `${value.toFixed(2)}%`
@@ -358,11 +589,12 @@ const formatAxisCompact = (value: number, metric: string) => {
   return `${Math.round(value)}`
 }
 
-const normalizeMonthKey = (value: unknown) => {
+const normalizeMonthKey = (value: unknown, dimKey = "month") => {
   const raw = String(value ?? "").trim()
   if (!raw) return ""
 
   if (/^\d{4}-\d{2}(-\d{2})?$/.test(raw)) {
+    if (toSafeKey(dimKey).includes("date")) return raw.slice(0, 10)
     return raw.length === 7 ? `${raw}-01` : raw.slice(0, 10)
   }
 
@@ -394,22 +626,33 @@ const normalizeMonthKey = (value: unknown) => {
   if (!Number.isNaN(parsed.getTime())) {
     const year = parsed.getFullYear()
     const month = String(parsed.getMonth() + 1).padStart(2, "0")
+    if (toSafeKey(dimKey).includes("date")) {
+      const day = String(parsed.getDate()).padStart(2, "0")
+      return `${year}-${month}-${day}`
+    }
     return `${year}-${month}-01`
   }
   return raw
 }
 
-const monthSortValue = (value: string) => {
-  const normalized = normalizeMonthKey(value)
+const monthSortValue = (value: string, dimKey = "month") => {
+  const normalized = normalizeMonthKey(value, dimKey)
   const parsed = new Date(normalized).getTime()
   if (!Number.isNaN(parsed)) return parsed
   return Number.MAX_SAFE_INTEGER
 }
 
-const formatMonthLabel = (value: string) => {
-  const normalized = normalizeMonthKey(value)
+const formatMonthLabel = (value: string, dimKey = "month") => {
+  const normalized = normalizeMonthKey(value, dimKey)
   const parsed = new Date(normalized)
   if (Number.isNaN(parsed.getTime())) return value
+  if (toSafeKey(dimKey).includes("date")) {
+    return parsed.toLocaleDateString("en-US", {
+      day: "2-digit",
+      month: "short",
+      year: "2-digit",
+    })
+  }
   return parsed.toLocaleString("en-US", {
     month: "short",
     year: "2-digit",
@@ -423,29 +666,53 @@ const isTemporalDimensionKey = (value: string) => {
   return key.includes("month") || key.includes("date")
 }
 
-const toLogPlotKey = (metric: string) => `${metric}${LOG_PLOT_SUFFIX}`
+const DAILY_TEMPORAL_RANGE_MAX_DAYS = 62
+
+const getInclusiveRangeDays = (fromDate?: string, toDate?: string) => {
+  if (!fromDate || !toDate) return Number.POSITIVE_INFINITY
+  const from = new Date(fromDate)
+  const to = new Date(toDate)
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+    return Number.POSITIVE_INFINITY
+  }
+  const msPerDay = 24 * 60 * 60 * 1000
+  return Math.floor((to.getTime() - from.getTime()) / msPerDay) + 1
+}
+
+const shouldUseDailyTemporalSeries = (
+  datasetType: "sales" | "claims",
+  fromDate?: string,
+  toDate?: string
+) => (
+  datasetType === "sales"
+  && getInclusiveRangeDays(fromDate, toDate) <= DAILY_TEMPORAL_RANGE_MAX_DAYS
+)
+
+const resolveTemporalPreset = <T extends { dimension: string; bucket?: "day" | "week" | "month" }>(
+  preset: T,
+  datasetType: "sales" | "claims",
+  fromDate?: string,
+  toDate?: string
+): T => {
+  const dimKey = toSafeKey(preset.dimension)
+  if (
+    !shouldUseDailyTemporalSeries(datasetType, fromDate, toDate)
+    || !dimKey.includes("month")
+  ) {
+    return preset
+  }
+  return {
+    ...preset,
+    dimension: "date",
+    bucket: "day",
+  }
+}
 
 const toOriginalMetricKey = (dataKey: string) => (
   dataKey.endsWith(LOG_PLOT_SUFFIX)
     ? dataKey.slice(0, -LOG_PLOT_SUFFIX.length)
     : dataKey
 )
-
-const toLogSafeValue = (value: unknown) => {
-  const numeric = asNumber(value)
-  return numeric > 0 ? numeric : 1
-}
-
-const buildLogScaledRows = (
-  rows: SectionMergedRow[],
-  metrics: readonly string[]
-): SectionMergedRow[] => rows.map((row) => {
-  const next: SectionMergedRow = { ...row }
-  metrics.forEach((metric) => {
-    next[toLogPlotKey(metric)] = toLogSafeValue(row[metric])
-  })
-  return next
-})
 
 const buildInsightsRows = (snapshot: GraphDataSnapshot) => {
   const rows = snapshot.rows.slice(0, 80)
@@ -470,19 +737,21 @@ const buildInsightsRows = (snapshot: GraphDataSnapshot) => {
   }))
 }
 
-const SALES_METRICS = [
-  "earned_premium",
-  "gross_premium",
-  "zopper_earned_premium",
-  "quantity",
+const SALES_METRICS = [...SALES_METRIC_ORDER]
+
+const CLAIMS_SECTION_METRICS = [
+  "claims",
+  "net_claims",
 ]
 
-const CLAIMS_METRICS = [
-  "net_claims",
+const FULLSCREEN_COMPARE_CLAIMS_METRICS = [
   "claims",
+  "net_claims",
   "loss_ratio",
-  "quantity",
-]
+] as const
+
+const getSectionMetricPriority = (datasetType: "sales" | "claims") =>
+  datasetType === "sales" ? SALES_METRICS : CLAIMS_SECTION_METRICS
 
 const GROUP_TITLES: Record<string, string> = {
   time: "Time Trend Desk",
@@ -605,7 +874,6 @@ const METRIC_LINE_COLORS: Record<string, string> = {
 const SOURCE_FALLBACK_METRIC_KEYS: Record<string, string[]> = {
   samsung_vs: ["samsung_vs"],
   samsung_croma: ["samsung_croma"],
-  samsung_croma_dsdsg: ["samsung_croma_dsdsg"],
   samsung_reliance_digital: ["samsung_reliance_digital"],
   reliance: ["reliance", "reliance_resq"],
   godrej: ["godrej"],
@@ -626,7 +894,8 @@ const getMetricLabel = (metric: string) => {
 
 const getDimensionLabel = (dimension: string, source?: string) => {
   const d = dimension.toLowerCase()
-  if (d.includes("month") || d.includes("date")) return "Month"
+  if (d.includes("date")) return "Date"
+  if (d.includes("month")) return "Month"
   if (d.includes("state")) return source === "godrej" || source === "hitachi" ? "Region" : "State"
   if (d === "article_brand" || d === "brand") return "Brand Category"
   if (d.includes("channel")) return "Channel"
@@ -684,6 +953,40 @@ const isUnknownLikeLabel = (value: unknown) => {
   return label === "" || label === "unknown" || label === "nan" || label === "none"
 }
 
+const SECTION_DIMENSION_ALIASES: Record<string, string[]> = {
+  plan_category: ["device_plan_category"],
+  device_plan_category: ["plan_category"],
+}
+
+const normalizeSectionBatchRow = (
+  row: Record<string, unknown>,
+  dimension: string
+): SectionMergedRow | null => {
+  const normalized: SectionMergedRow = {}
+
+  Object.entries(row || {}).forEach(([key, value]) => {
+    const safeKey = toSafeKey(key)
+    if (!safeKey) return
+    normalized[safeKey] = typeof value === "number" ? value : String(value ?? "")
+  })
+
+  const dimKey = toSafeKey(dimension)
+  const dimensionValue = [
+    normalized[dimKey],
+    ...(SECTION_DIMENSION_ALIASES[dimKey] || []).map((alias) => normalized[alias]),
+  ].find((value) => String(value ?? "").trim() !== "")
+
+  if (dimensionValue == null) return null
+
+  const resolvedValue = isTemporalDimensionKey(dimKey)
+    ? normalizeMonthKey(dimensionValue, dimKey)
+    : String(dimensionValue).trim()
+
+  if (!resolvedValue) return null
+  normalized[dimKey] = resolvedValue
+  return normalized
+}
+
 const toFilterOptionLabels = (rows: CategoryPercentageRow[]) => {
   const seen = new Set<string>()
   const labels: string[] = []
@@ -696,6 +999,30 @@ const toFilterOptionLabels = (rows: CategoryPercentageRow[]) => {
     labels.push(label)
   }
   return labels
+}
+
+type RegionalAnalyticsFilterParams = Pick<
+  CategoryPercentageParams,
+  "filter_1_dimension" | "filter_1_values" | "filter_2_dimension" | "filter_2_values"
+>
+
+const toRegionalAnalyticsFilterParams = (
+  filters: Array<{ dimension: RegionalCategoryDimension; values: string[] }>,
+  excludeDimension?: RegionalCategoryDimension
+): RegionalAnalyticsFilterParams => {
+  const next: RegionalAnalyticsFilterParams = {}
+  filters
+    .filter((filter) => (
+      filter.values.length > 0
+      && (!excludeDimension || filter.dimension !== excludeDimension)
+    ))
+    .slice(0, 2)
+    .forEach((filter, index) => {
+      const slot = index + 1
+      next[`filter_${slot}_dimension` as "filter_1_dimension" | "filter_2_dimension"] = filter.dimension
+      next[`filter_${slot}_values` as "filter_1_values" | "filter_2_values"] = filter.values.join(",")
+    })
+  return next
 }
 
 const hexToRgb = (hex: string) => {
@@ -751,6 +1078,30 @@ const getSectionMainChartMode = (
   return "line"
 }
 
+const resolveFullscreenCompareSalesMetric = (metric: string) => {
+  const normalized = toSafeKey(metric)
+  if (
+    normalized === "quantity"
+    || SALES_METRICS.some((item) => item === normalized)
+  ) {
+    return normalized
+  }
+  return "gross_premium"
+}
+
+const resolveFullscreenCompareClaimsMetric = (metric: string) => {
+  const normalized = toSafeKey(metric)
+  if (
+    normalized === "quantity"
+    || FULLSCREEN_COMPARE_CLAIMS_METRICS.includes(
+      normalized as (typeof FULLSCREEN_COMPARE_CLAIMS_METRICS)[number]
+    )
+  ) {
+    return normalized
+  }
+  return "claims"
+}
+
 export default function MultiGraphView({
   source,
   datasetType,
@@ -770,7 +1121,7 @@ export default function MultiGraphView({
   const samsungOverviewCards = useMemo<SamsungOverviewCard[]>(
     () => {
       if (datasetType === "claims") {
-        return [
+        const cards: SamsungOverviewCard[] = [
           {
             id: "samsung-month-claims-cost",
             title: "Claims Cost Trend by Month",
@@ -801,9 +1152,10 @@ export default function MultiGraphView({
             size: "small",
           },
         ]
+        return cards.map((card) => resolveTemporalPreset(card, datasetType, fromDate, toDate))
       }
 
-      return [
+      const cards: SamsungOverviewCard[] = [
         {
           id: "samsung-month-gross-premium",
           title: "Gross Premium Trend by Month",
@@ -834,8 +1186,9 @@ export default function MultiGraphView({
           size: "small",
         },
       ]
+      return cards.map((card) => resolveTemporalPreset(card, datasetType, fromDate, toDate))
     },
-    [datasetType]
+    [datasetType, fromDate, toDate]
   )
   const isApplianceSource = source === "godrej" || source === "hitachi"
   const isHitachiSource = source === "hitachi"
@@ -852,13 +1205,14 @@ export default function MultiGraphView({
   )
   const activePresets = useMemo(
     () => (
-      isHitachiSource
+      (isHitachiSource
         ? (isApplianceClaims ? HITACHI_CLAIMS_PRESETS : HITACHI_SALES_PRESETS)
         : isApplianceSource
         ? (isApplianceClaims ? GODREJ_CLAIMS_PRESETS : GODREJ_SALES_PRESETS)
-        : Object.values(GRAPH_PRESETS)
+        : Object.values(GRAPH_PRESETS))
+        .map((preset) => resolveTemporalPreset({ ...preset }, datasetType, fromDate, toDate))
     ),
-    [isApplianceSource, isApplianceClaims, isHitachiSource]
+    [datasetType, fromDate, isApplianceSource, isApplianceClaims, isHitachiSource, toDate]
   )
   const sideCardMetric = datasetType === "sales" ? "quantity" : "claims"
   const partnerSideCards = useMemo<PartnerSideCard[]>(() => {
@@ -964,6 +1318,14 @@ export default function MultiGraphView({
   const [fullscreenFromDate, setFullscreenFromDate] = useState(fromDate || "")
   const [fullscreenToDate, setFullscreenToDate] = useState(toDate || "")
   const [openedGraphData, setOpenedGraphData] = useState<GraphDataSnapshot | null>(null)
+  const [isFullscreenCompareMode, setIsFullscreenCompareMode] = useState(false)
+  const [fullscreenCompareSummaries, setFullscreenCompareSummaries] = useState<FullscreenCompareSummaryState>(
+    () => createEmptyFullscreenCompareSummaryState()
+  )
+  const [fullscreenCompareMatrixState, setFullscreenCompareMatrixState] = useState<FullscreenCompareMatrixState>(
+    () => createEmptyFullscreenCompareMatrixState()
+  )
+  const [isFullscreenCompareMatrixOthersExpanded, setIsFullscreenCompareMatrixOthersExpanded] = useState(false)
   const [insights, setInsights] = useState<string[]>([])
   const [insightsModel, setInsightsModel] = useState<string>("")
   const [insightsLoading, setInsightsLoading] = useState(false)
@@ -983,78 +1345,36 @@ export default function MultiGraphView({
   const [regionalMapSecondaryOptions, setRegionalMapSecondaryOptions] = useState<string[]>([])
   const [regionalMapFiltersLoading, setRegionalMapFiltersLoading] = useState(false)
   const [isRegionFilterCardCollapsed, setIsRegionFilterCardCollapsed] = useState(false)
+  const [isPartnerGraphScrollEnabled, setIsPartnerGraphScrollEnabled] = useState(false)
   const [sectionMergedMap, setSectionMergedMap] = useState<Record<string, SectionMergedState>>({})
   const lastInsightsKeyRef = useRef("")
+  const clearRegionalMapFilters = () => {
+    setRegionalMapPrimaryValue("")
+    setRegionalMapSecondaryValue("")
+    setRegionalMapPrimaryOptions([])
+    setRegionalMapSecondaryOptions([])
+    setRegionalMapFiltersLoading(false)
+    setIsRegionFilterCardCollapsed(false)
+  }
+  const resetFullscreenCompareSummaries = () => {
+    setFullscreenCompareSummaries(createEmptyFullscreenCompareSummaryState())
+  }
+  const resetFullscreenCompareMatrix = () => {
+    setIsFullscreenCompareMatrixOthersExpanded(false)
+    setFullscreenCompareMatrixState(createEmptyFullscreenCompareMatrixState())
+  }
+  const isYearOnYearFullscreen = Boolean(fullscreen?.isYearOnYear)
   const isStateFullscreen = Boolean(fullscreen && fullscreen.dimension.toLowerCase().includes("state"))
+  const fullscreenCompareSalesMetric = useMemo(
+    () => resolveFullscreenCompareSalesMetric(fullscreen?.metric || ""),
+    [fullscreen?.metric]
+  )
+  const fullscreenCompareClaimsMetric = useMemo(
+    () => resolveFullscreenCompareClaimsMetric(fullscreen?.metric || ""),
+    [fullscreen?.metric]
+  )
   const geographyLabel = "Region"
   const geographyLabelPlural = "Regions"
-  const stateOptions = useMemo(() => {
-    if (!isStateFullscreen || !openedGraphData?.rows.length || !openedGraphData.dimensionKey) {
-      return []
-    }
-
-    const seen = new Set<string>()
-    const out: string[] = []
-    const dimKey = openedGraphData.dimensionKey
-    for (const row of openedGraphData.rows) {
-      const rawValue = row[dimKey]
-      const label = rawValue == null ? "" : String(rawValue).trim()
-      if (!label || seen.has(label)) continue
-      seen.add(label)
-      out.push(label)
-    }
-    return out
-  }, [isStateFullscreen, openedGraphData])
-  const activeSelectedState =
-    isStateFullscreen && stateOptions.includes(selectedState) ? selectedState : ""
-  const activeComparisonStates = useMemo(
-    () => selectedComparisonStates.filter((state) => stateOptions.includes(state)),
-    [selectedComparisonStates, stateOptions]
-  )
-  const activeCityKey = useMemo(() => {
-    if (!cityBreakdownRows.length) return ""
-    if (activeCityName && cityBreakdownRows.some((row) => row.city === activeCityName)) {
-      return activeCityName
-    }
-    return cityBreakdownRows[0]?.city || ""
-  }, [cityBreakdownRows, activeCityName])
-  const stateMetricMap = useMemo(() => {
-    const map = new Map<string, number>()
-    if (!isStateFullscreen || !openedGraphData?.rows.length || !openedGraphData.dimensionKey) {
-      return map
-    }
-
-    const dimKey = openedGraphData.dimensionKey
-    const measureKey = openedGraphData.measure
-    for (const row of openedGraphData.rows) {
-      const raw = row[dimKey]
-      const label = raw == null ? "" : String(raw).trim()
-      if (!label) continue
-
-      const value = openedGraphData.compareMode
-        ? sumSamsungPartnerValues(row as Record<string, unknown>)
-        : asNumber(row[measureKey])
-      map.set(label, (map.get(label) ?? 0) + Math.max(0, value))
-    }
-    return map
-  }, [isStateFullscreen, openedGraphData])
-  const comparisonMetricRows = useMemo(() => {
-    const rows: StateComparisonRow[] = activeComparisonStates.map((state) => ({
-      state,
-      value: asNumber(stateMetricMap.get(state)),
-    }))
-
-    rows.sort((a, b) => b.value - a.value)
-    return rows
-  }, [activeComparisonStates, stateMetricMap])
-  const stateComparisonLayout = useMemo(
-    () => getStateComparisonLayout(activeComparisonStates.length),
-    [activeComparisonStates.length]
-  )
-  const comparisonPieSizing = useMemo(
-    () => getPieSizing(activeComparisonStates.length),
-    [activeComparisonStates.length]
-  )
   useEffect(() => {
     if (typeof window === "undefined") return
     const onResize = () => setIsMobileViewport(window.innerWidth < 640)
@@ -1067,11 +1387,11 @@ export default function MultiGraphView({
     const metricKey = (fullscreen?.metric || "").trim().toLowerCase()
     return metricKey !== "loss_ratio"
   }, [fullscreen])
-  useEffect(() => {
-    if (!isStateFullscreen) {
-      setIsRegionFilterCardCollapsed(false)
-    }
-  }, [isStateFullscreen])
+  const regionalAnalysisMetric = useMemo(() => {
+    const metricKey = (fullscreen?.metric || "").trim().toLowerCase()
+    if (metricKey && metricKey !== "loss_ratio") return metricKey
+    return datasetType === "claims" ? "claims" : "gross_premium"
+  }, [datasetType, fullscreen?.metric])
   const regionalCategoryConfig = useMemo(() => {
     if (source === "reliance") {
       return {
@@ -1145,12 +1465,12 @@ export default function MultiGraphView({
     if (isHitachiSource) {
       return {
         primary: {
-          dimension: "product_category",
+          dimension: activeRegionalPrimaryDescriptor.dimension,
           label: "Product",
           allLabel: "All Products",
         } as RegionalMapFilterDescriptor,
         secondary: {
-          dimension: "channel",
+          dimension: activeRegionalSecondaryDescriptor.dimension,
           label: "Channel",
           allLabel: "All Channels",
         } as RegionalMapFilterDescriptor,
@@ -1159,12 +1479,12 @@ export default function MultiGraphView({
     if (isApplianceSource) {
       return {
         primary: {
-          dimension: "channel",
+          dimension: activeRegionalPrimaryDescriptor.dimension,
           label: "Channel",
           allLabel: "All Channels",
         } as RegionalMapFilterDescriptor,
         secondary: {
-          dimension: "product_category",
+          dimension: activeRegionalSecondaryDescriptor.dimension,
           label: "Product",
           allLabel: "All Products",
         } as RegionalMapFilterDescriptor,
@@ -1173,30 +1493,36 @@ export default function MultiGraphView({
     if (source === "reliance") {
       return {
         primary: {
-          dimension: "plan_category",
+          dimension: activeRegionalPrimaryDescriptor.dimension,
           label: "Plan Category",
           allLabel: "All Plan Categories",
         } as RegionalMapFilterDescriptor,
         secondary: {
-          dimension: "product_category",
-          label: "Product Category",
-          allLabel: "All Product Categories",
+          dimension: activeRegionalSecondaryDescriptor.dimension,
+          label: "Brand Category",
+          allLabel: "All Brand Categories",
         } as RegionalMapFilterDescriptor,
       }
     }
     return {
       primary: {
-        dimension: "plan_category",
+        dimension: activeRegionalPrimaryDescriptor.dimension,
         label: "Plan Category",
         allLabel: "All Plan Categories",
       } as RegionalMapFilterDescriptor,
       secondary: {
-        dimension: "device_plan_category",
+        dimension: activeRegionalSecondaryDescriptor.dimension,
         label: "Device Plan Category",
         allLabel: "All Device Plan Categories",
       } as RegionalMapFilterDescriptor,
     }
-  }, [isApplianceSource, isHitachiSource, source])
+  }, [
+    activeRegionalPrimaryDescriptor.dimension,
+    activeRegionalSecondaryDescriptor.dimension,
+    isApplianceSource,
+    isHitachiSource,
+    source,
+  ])
   const activeRegionalMapFilters = useMemo(() => {
     const filters: Array<{ dimension: RegionalCategoryDimension; values: string[] }> = []
     if (regionalMapPrimaryValue) {
@@ -1219,34 +1545,43 @@ export default function MultiGraphView({
     regionalMapFilterConfig.secondary.dimension,
   ])
   useEffect(() => {
-    if (!isStateFullscreen) {
-      setRegionalMapPrimaryValue("")
-      setRegionalMapSecondaryValue("")
-      return
-    }
+    if (!isStateFullscreen) return
 
     let active = true
+    const controller = new AbortController()
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setRegionalMapFiltersLoading(true)
 
     const baseParams = {
       source,
       dataset_type: datasetType,
-      metric: "quantity",
+      metric: regionalAnalysisMetric,
       job_id: jobId || undefined,
-      from_date: fromDate || undefined,
-      to_date: toDate || undefined,
+      from_date: fullscreenFromDate || fromDate || undefined,
+      to_date: fullscreenToDate || toDate || undefined,
       limit: 200,
     } as const
+
+    const primaryFilterParams = toRegionalAnalyticsFilterParams(
+      activeRegionalMapFilters,
+      regionalMapFilterConfig.primary.dimension
+    )
+    const secondaryFilterParams = toRegionalAnalyticsFilterParams(
+      activeRegionalMapFilters,
+      regionalMapFilterConfig.secondary.dimension
+    )
 
     Promise.all([
       fetchCategoryPercentage({
         ...baseParams,
         dimension: regionalMapFilterConfig.primary.dimension,
-      }),
+        ...primaryFilterParams,
+      }, { signal: controller.signal }),
       fetchCategoryPercentage({
         ...baseParams,
         dimension: regionalMapFilterConfig.secondary.dimension,
-      }),
+        ...secondaryFilterParams,
+      }, { signal: controller.signal }),
     ])
       .then(([primaryRes, secondaryRes]) => {
         if (!active) return
@@ -1275,14 +1610,19 @@ export default function MultiGraphView({
 
     return () => {
       active = false
+      controller.abort()
     }
   }, [
     isStateFullscreen,
     source,
     datasetType,
     jobId,
+    fullscreenFromDate,
+    fullscreenToDate,
     fromDate,
     toDate,
+    regionalAnalysisMetric,
+    activeRegionalMapFilters,
     regionalMapFilterConfig.primary.dimension,
     regionalMapFilterConfig.secondary.dimension,
   ])
@@ -1325,14 +1665,14 @@ export default function MultiGraphView({
               source === "reliance" && group === "device_category"
                 ? "article_brand"
                 : preset.dimension
-            const visibleMetrics =
-              datasetType === "sales"
-                ? preset.metrics.filter((m: string) => SALES_METRICS.includes(m))
-                : preset.metrics.filter((m: string) => CLAIMS_METRICS.includes(m))
+            const metricPriority = getSectionMetricPriority(datasetType)
+            const visibleMetrics = metricPriority.filter((metric) =>
+              preset.metrics.includes(metric)
+            )
             return {
               preset: { ...preset, dimension: resolvedDimension },
               visibleMetrics,
-              mergedMetrics: visibleMetrics.slice(0, 4),
+              mergedMetrics: visibleMetrics.slice(0, datasetType === "sales" ? 4 : 2),
             }
           })
           .filter(entry => entry.visibleMetrics.length > 0)
@@ -1349,6 +1689,100 @@ export default function MultiGraphView({
     }),
     [sectionConfigs, sectionMergedMap]
   )
+
+  useEffect(() => {
+    if (!isSamsungOverview || !samsungOverviewCards.length) return
+
+    let active = true
+    const controller = new AbortController()
+    const requestKeys = new Set<string>()
+    const batchRequests: FetchByDimensionBatchItem[] = []
+
+    samsungOverviewCards.forEach((card) => {
+      const metrics = [
+        card.metric,
+        card.tooltipMetricOverride,
+      ].filter((value): value is string => Boolean(value))
+
+      metrics.forEach((metricKey) => {
+        const requestKey = `${card.dimension}::${metricKey}::${card.bucket || ""}`
+        if (requestKeys.has(requestKey)) return
+        requestKeys.add(requestKey)
+        batchRequests.push({
+          request_key: requestKey,
+          source,
+          dataset_type: datasetType,
+          dimension: card.dimension,
+          metric: metricKey,
+          bucket: card.bucket,
+          job_id: jobId || undefined,
+          from_date: fromDate || undefined,
+          to_date: toDate || undefined,
+        })
+      })
+    })
+
+    if (!batchRequests.length) return
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetchByDimensionBatch(batchRequests, { signal: controller.signal })
+        if (!active) return
+
+        const rowsByRequest = new Map<string, Array<Record<string, unknown>>>()
+        ;(response.results || []).forEach((item) => {
+          rowsByRequest.set(item.request_key, Array.isArray(item.rows) ? item.rows : [])
+        })
+
+        batchRequests.forEach((request) => {
+          const rows = rowsByRequest.get(request.request_key)
+          if (!rows?.length) return
+          seedGraphDataCache({
+            source: request.source,
+            dimension: request.dimension,
+            metric: request.metric,
+            datasetType,
+            bucket: request.bucket || undefined,
+            jobId: request.job_id || null,
+            from_date: request.from_date || undefined,
+            to_date: request.to_date || undefined,
+          }, rows)
+        })
+      } catch {
+        // Embedded samsung cards fall back to their own cached fetch path.
+      }
+    }, 0)
+
+    return () => {
+      active = false
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [isSamsungOverview, samsungOverviewCards, source, datasetType, jobId, fromDate, toDate])
+
+  useEffect(() => {
+    if (!source || datasetType === "claims") return
+
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      void fetchAnnualComparison({
+        source,
+        dataset_type: datasetType,
+        job_id: jobId || undefined,
+        from_date: fromDate || undefined,
+        to_date: toDate || undefined,
+      }, {
+        signal: controller.signal,
+      }).catch(() => {
+        // The chart falls back to its normal path if this warm request misses.
+      })
+    }, 0)
+
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [source, datasetType, jobId, fromDate, toDate])
 
   const navigableGraphs = useMemo(() => {
     if (isSamsungOverview) {
@@ -1396,7 +1830,7 @@ export default function MultiGraphView({
     if (isSamsungOverview || !sectionConfigs.length) return
 
     let active = true
-    let idleHandle: number | null = null
+    const controller = new AbortController()
     const run = async () => {
       if (!active) return
 
@@ -1405,6 +1839,64 @@ export default function MultiGraphView({
         loadingState[group] = { loading: true, error: null, rows: [] }
       })
       setSectionMergedMap((prev) => ({ ...prev, ...loadingState }))
+
+      const buildSectionState = (
+        entries: Array<{ preset: Preset; visibleMetrics: string[]; mergedMetrics: string[] }>,
+        rowsByMetric: Map<string, Array<Record<string, unknown>>>
+      ): SectionMergedState => {
+        const firstEntry = entries[0]
+        if (!firstEntry) {
+          return { loading: false, error: "No section preset available.", rows: [] }
+        }
+
+        const dimension = firstEntry.preset.dimension
+        const mergedMetrics = firstEntry.mergedMetrics
+        const dimKey = toSafeKey(dimension)
+        const merged = new Map<string, SectionMergedRow>()
+        let successCount = 0
+
+        mergedMetrics.forEach((metric) => {
+          const metricRows = rowsByMetric.get(metric)
+          if (!metricRows) return
+          successCount += 1
+
+          metricRows.forEach((rawRow) => {
+            const row = normalizeSectionBatchRow(rawRow, dimension)
+            if (!row) return
+
+            const rawDim = row[dimKey]
+            const dimValue = String(rawDim ?? "").trim()
+            if (!dimValue) return
+
+            if (!merged.has(dimValue)) {
+              const seed: SectionMergedRow = { [dimKey]: dimValue }
+              mergedMetrics.forEach((m) => {
+                seed[m] = 0
+              })
+              merged.set(dimValue, seed)
+            }
+
+            const target = merged.get(dimValue)
+            if (!target) return
+            target[metric] = Math.max(0, getSourceMetricValue(row, metric, source))
+          })
+        })
+
+        if (successCount === 0) {
+          return { loading: false, error: "Unable to load section graph data.", rows: [] }
+        }
+
+        const rows = Array.from(merged.values())
+        if (dimKey.includes("month") || dimKey.includes("date")) {
+          rows.sort((a, b) => (
+            monthSortValue(String(a[dimKey] || ""), dimKey) - monthSortValue(String(b[dimKey] || ""), dimKey)
+          ))
+        } else {
+          rows.sort((a, b) => String(a[dimKey] || "").localeCompare(String(b[dimKey] || "")))
+        }
+
+        return { loading: false, error: rows.length ? null : "No data available in selected range.", rows }
+      }
 
       const fetchSectionState = async (
         entries: Array<{ preset: Preset; visibleMetrics: string[]; mergedMetrics: string[] }>
@@ -1417,7 +1909,6 @@ export default function MultiGraphView({
         const dimension = firstEntry.preset.dimension
         const bucket = firstEntry.preset.bucket
         const mergedMetrics = firstEntry.mergedMetrics
-        const dimKey = dimension.toLowerCase()
 
         try {
           const metricResponses = await Promise.allSettled(
@@ -1431,93 +1922,102 @@ export default function MultiGraphView({
                 jobId,
                 from_date: fromDate,
                 to_date: toDate,
-              })
+              }, { signal: controller.signal })
             )
           )
 
-          const merged = new Map<string, SectionMergedRow>()
-          let successCount = 0
+          const rowsByMetric = new Map<string, Array<Record<string, unknown>>>()
 
           metricResponses.forEach((response, idx) => {
             const metric = mergedMetrics[idx]
             if (response.status !== "fulfilled") return
-            successCount += 1
-
-            for (const row of response.value.data || []) {
-              const rawDim = row[dimKey]
-              const dimValue = String(rawDim ?? "").trim()
-              if (!dimValue) continue
-
-              if (!merged.has(dimValue)) {
-                const seed: SectionMergedRow = { [dimKey]: dimValue }
-                mergedMetrics.forEach((m) => {
-                  seed[m] = 0
-                })
-                merged.set(dimValue, seed)
-              }
-
-              const target = merged.get(dimValue)
-              if (!target) continue
-              target[metric] = Math.max(0, getSourceMetricValue(row, metric, source))
-            }
+            rowsByMetric.set(metric, response.value.data || [])
           })
 
-          if (successCount === 0) {
-            return { loading: false, error: "Unable to load section graph data.", rows: [] }
-          }
-
-          const rows = Array.from(merged.values())
-          if (dimKey.includes("month") || dimKey.includes("date")) {
-            rows.sort((a, b) => monthSortValue(String(a[dimKey] || "")) - monthSortValue(String(b[dimKey] || "")))
-          } else {
-            rows.sort((a, b) => String(a[dimKey] || "").localeCompare(String(b[dimKey] || "")))
-          }
-
-          return { loading: false, error: rows.length ? null : "No data available in selected range.", rows }
+          return buildSectionState(entries, rowsByMetric)
         } catch {
           return { loading: false, error: "Unable to load section graph data.", rows: [] }
         }
       }
 
-      // Progressive section loading reduces backend request bursts and improves
-      // time-to-first-chart rendering.
-      for (const section of sectionConfigs) {
-        if (!active) break
-        const state = await fetchSectionState(section.entries)
-        if (!active) break
-        setSectionMergedMap((prev) => ({
-          ...prev,
-          [section.group]: state,
+      const batchRequests: FetchByDimensionBatchItem[] = sectionConfigs.flatMap(({ group, entries }) => {
+        const firstEntry = entries[0]
+        if (!firstEntry) return []
+        const { preset, mergedMetrics } = firstEntry
+        return mergedMetrics.map((metric) => ({
+          request_key: `${group}::${metric}`,
+          source,
+          dataset_type: datasetType,
+          dimension: preset.dimension,
+          metric,
+          bucket: preset.bucket,
+          job_id: jobId || undefined,
+          from_date: fromDate || undefined,
+          to_date: toDate || undefined,
         }))
+      })
+
+      try {
+        if (batchRequests.length) {
+          const response = await fetchByDimensionBatch(batchRequests, { signal: controller.signal })
+          if (!active) return
+
+          const rowsByRequest = new Map<string, Array<Record<string, unknown>>>()
+          ;(response.results || []).forEach((item) => {
+            rowsByRequest.set(item.request_key, Array.isArray(item.rows) ? item.rows : [])
+          })
+
+          batchRequests.forEach((request) => {
+            const rows = rowsByRequest.get(request.request_key)
+            if (!rows?.length) return
+            seedGraphDataCache({
+              source: request.source,
+              dimension: request.dimension,
+              metric: request.metric,
+              datasetType,
+              bucket: request.bucket || undefined,
+              jobId: request.job_id || null,
+              from_date: request.from_date || undefined,
+              to_date: request.to_date || undefined,
+            }, rows)
+          })
+
+          const nextState: Record<string, SectionMergedState> = {}
+          sectionConfigs.forEach(({ group, entries }) => {
+            const firstEntry = entries[0]
+            const mergedMetrics = firstEntry?.mergedMetrics || []
+            const rowsByMetric = new Map<string, Array<Record<string, unknown>>>()
+            mergedMetrics.forEach((metric) => {
+              rowsByMetric.set(metric, rowsByRequest.get(`${group}::${metric}`) || [])
+            })
+            nextState[group] = buildSectionState(entries, rowsByMetric)
+          })
+
+          setSectionMergedMap((prev) => ({ ...prev, ...nextState }))
+          return
+        }
+      } catch {
+        // Fall back to individual graph fetches when the batch endpoint is not yet deployed.
       }
+
+      const sectionStates = await Promise.all(
+        sectionConfigs.map(async ({ group, entries }) => (
+          [group, await fetchSectionState(entries)] as const
+        ))
+      )
+      if (!active) return
+      setSectionMergedMap((prev) => ({
+        ...prev,
+        ...Object.fromEntries(sectionStates),
+      }))
     }
 
-    const scheduleIdle = () => {
-      if (typeof window === "undefined") return
-      const w = window as Window & {
-        requestIdleCallback?: (cb: IdleRequestCallback, opts?: IdleRequestOptions) => number
-        cancelIdleCallback?: (id: number) => void
-      }
-      if (w.requestIdleCallback) {
-        idleHandle = w.requestIdleCallback(() => { void run() }, { timeout: 1200 })
-      } else {
-        idleHandle = window.setTimeout(() => { void run() }, 0)
-      }
-    }
-
-    const timer = window.setTimeout(scheduleIdle, 120)
+    const timer = window.setTimeout(() => { void run() }, 60)
 
     return () => {
       active = false
+      controller.abort()
       window.clearTimeout(timer)
-      if (idleHandle !== null) {
-        const w = window as Window & { cancelIdleCallback?: (id: number) => void }
-        if (w.cancelIdleCallback) {
-          w.cancelIdleCallback(idleHandle)
-        } else {
-          window.clearTimeout(idleHandle)
-        }
-      }
     }
   }, [isSamsungOverview, sectionConfigs, source, datasetType, jobId, fromDate, toDate])
 
@@ -1564,22 +2064,18 @@ export default function MultiGraphView({
     }
   }, [fullscreen, sectionConfigs, sectionMergedMap, source, datasetType])
 
-  const fullscreenCompositeUseLogScale = false
-
   const fullscreenCompositeChartRows = useMemo(() => (
     fullscreenCompositeData?.displayRows || []
   ), [fullscreenCompositeData])
-
-  useEffect(() => {
-    if (!fullscreen?.isComposite) return
+  const activeOpenedGraphData = useMemo<GraphDataSnapshot | null>(() => {
+    if (!fullscreen?.isComposite) return openedGraphData
     if (
       !fullscreenCompositeData
       || fullscreenCompositeData.sectionData.loading
       || Boolean(fullscreenCompositeData.sectionData.error)
       || !fullscreenCompositeData.displayRows.length
     ) {
-      setOpenedGraphData(null)
-      return
+      return null
     }
 
     const fallbackMetric = datasetType === "sales" ? "gross_premium" : "claims"
@@ -1587,21 +2083,495 @@ export default function MultiGraphView({
       fullscreen.metric || fullscreenCompositeData.mergedMetrics[0] || fallbackMetric
     )
 
-    setOpenedGraphData({
+    return {
       rows: fullscreenCompositeData.displayRows,
       measure: insightMetric,
       dimensionKey: fullscreenCompositeData.dimKey,
       compareMode: false,
+    }
+  }, [datasetType, fullscreen, fullscreenCompositeData, openedGraphData])
+  const stateOptions = useMemo(() => {
+    if (!isStateFullscreen || !activeOpenedGraphData?.rows.length || !activeOpenedGraphData.dimensionKey) {
+      return []
+    }
+
+    const seen = new Set<string>()
+    const out: string[] = []
+    const dimKey = activeOpenedGraphData.dimensionKey
+    for (const row of activeOpenedGraphData.rows) {
+      const rawValue = row[dimKey]
+      const label = rawValue == null ? "" : String(rawValue).trim()
+      if (!label || seen.has(label)) continue
+      seen.add(label)
+      out.push(label)
+    }
+    return out
+  }, [activeOpenedGraphData, isStateFullscreen])
+  const activeSelectedState =
+    isStateFullscreen && stateOptions.includes(selectedState) ? selectedState : ""
+  const activeComparisonStates = useMemo(
+    () => selectedComparisonStates.filter((state) => stateOptions.includes(state)),
+    [selectedComparisonStates, stateOptions]
+  )
+  const activeCityKey = useMemo(() => {
+    if (!cityBreakdownRows.length) return ""
+    if (activeCityName && cityBreakdownRows.some((row) => row.city === activeCityName)) {
+      return activeCityName
+    }
+    return cityBreakdownRows[0]?.city || ""
+  }, [cityBreakdownRows, activeCityName])
+  const cityBreakdownColors = useMemo(
+    () => buildDistinctSolidColors(
+      cityBreakdownRows.length,
+      CITY_PIE_COLORS,
+      `${selectedState}-${fullscreen?.metric || ""}-city-breakdown`
+    ),
+    [cityBreakdownRows.length, fullscreen?.metric, selectedState]
+  )
+  const stateMetricMap = useMemo(() => {
+    const map = new Map<string, number>()
+    if (!isStateFullscreen || !activeOpenedGraphData?.rows.length || !activeOpenedGraphData.dimensionKey) {
+      return map
+    }
+
+    const dimKey = activeOpenedGraphData.dimensionKey
+    const measureKey = activeOpenedGraphData.measure
+    for (const row of activeOpenedGraphData.rows) {
+      const raw = row[dimKey]
+      const label = raw == null ? "" : String(raw).trim()
+      if (!label) continue
+
+      const value = activeOpenedGraphData.compareMode
+        ? sumSamsungPartnerValues(row as Record<string, unknown>)
+        : asNumber(row[measureKey])
+      map.set(label, (map.get(label) ?? 0) + Math.max(0, value))
+    }
+    return map
+  }, [activeOpenedGraphData, isStateFullscreen])
+  const comparisonMetricRows = useMemo(() => {
+    const rows: StateComparisonRow[] = activeComparisonStates.map((state) => ({
+      state,
+      value: asNumber(stateMetricMap.get(state)),
+    }))
+
+    rows.sort((a, b) => b.value - a.value)
+    return rows
+  }, [activeComparisonStates, stateMetricMap])
+  const stateComparisonLayout = useMemo(
+    () => getStateComparisonLayout(activeComparisonStates.length),
+    [activeComparisonStates.length]
+  )
+  const comparisonPieSizing = useMemo(
+    () => getPieSizing(activeComparisonStates.length),
+    [activeComparisonStates.length]
+  )
+
+  useEffect(() => {
+    if (!fullscreen || !isFullscreenCompareMode) return
+
+    let active = true
+    const controller = new AbortController()
+
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setFullscreenCompareSummaries({
+      loading: true,
+      error: null,
+      sales: null,
+      claims: null,
     })
-  }, [fullscreen, fullscreenCompositeData, datasetType])
+
+    Promise.all([
+      fetchSummary({
+        source,
+        dataset_type: "sales",
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      }, { signal: controller.signal }),
+      fetchSummary({
+        source,
+        dataset_type: "claims",
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      }, { signal: controller.signal }),
+    ])
+      .then(([sales, claims]) => {
+        if (!active) return
+        const normalizedSales = normalizeFocusCompareSummary(
+          (sales || null) as FocusCompareSummary | null,
+          "sales"
+        )
+        const normalizedClaims = normalizeFocusCompareSummary(
+          (claims || null) as FocusCompareSummary | null,
+          "claims",
+          normalizedSales
+        )
+        setFullscreenCompareSummaries({
+          loading: false,
+          error: null,
+          sales: normalizedSales,
+          claims: normalizedClaims,
+        })
+      })
+      .catch((err) => {
+        if (!active) return
+        const message = err instanceof Error ? err.message : "Unable to load comparison metrics."
+        setFullscreenCompareSummaries({
+          loading: false,
+          error: message,
+          sales: null,
+          claims: null,
+        })
+      })
+
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [
+    fullscreen,
+    isFullscreenCompareMode,
+    source,
+    jobId,
+    fullscreenFromDate,
+    fullscreenToDate,
+    fromDate,
+    toDate,
+  ])
+
+  const fullscreenCompareMetricCards = useMemo(() => {
+    const sales = fullscreenCompareSummaries.sales
+    const claims = fullscreenCompareSummaries.claims
+    return [
+      {
+        key: "gross_premium",
+        family: "Sales",
+        label: "Gross Premium",
+        metric: "gross_premium",
+        value: sales?.gross_premium,
+      },
+      {
+        key: "earned_premium",
+        family: "Sales",
+        label: "Earned Premium",
+        metric: "earned_premium",
+        value: sales?.earned_premium,
+      },
+      {
+        key: "zopper_earned_premium",
+        family: "Sales",
+        label: "Zopper Earned Premium",
+        metric: "zopper_earned_premium",
+        value: sales?.zopper_earned_premium,
+      },
+      {
+        key: "quantity",
+        family: "Sales",
+        label: "Volume",
+        metric: "quantity",
+        value: sales?.units_sold,
+      },
+      {
+        key: "claims",
+        family: "Claims",
+        label: "Claims Cost",
+        metric: "claims",
+        value: claims?.claims,
+      },
+      {
+        key: "net_claims",
+        family: "Claims",
+        label: "Net Claims Paid",
+        metric: "net_claims",
+        value: claims?.net_claims,
+      },
+      {
+        key: "loss_ratio",
+        family: "Claims",
+        label: "Loss Ratio",
+        metric: "loss_ratio",
+        value: claims?.loss_ratio,
+      },
+    ]
+  }, [fullscreenCompareSummaries.claims, fullscreenCompareSummaries.sales])
+
+  useEffect(() => {
+    if (!fullscreen || !isFullscreenCompareMode || fullscreen.chartType !== "india_map") return
+
+    let active = true
+    const controller = new AbortController()
+    const dimension = fullscreen.dimension || "state"
+    const batchRequests: FetchByDimensionBatchItem[] = [
+      {
+        request_key: "gross_premium",
+        source,
+        dataset_type: "sales",
+        dimension,
+        metric: "gross_premium",
+        bucket: fullscreen.bucket,
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      },
+      {
+        request_key: "earned_premium",
+        source,
+        dataset_type: "sales",
+        dimension,
+        metric: "earned_premium",
+        bucket: fullscreen.bucket,
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      },
+      {
+        request_key: "zopper_earned_premium",
+        source,
+        dataset_type: "sales",
+        dimension,
+        metric: "zopper_earned_premium",
+        bucket: fullscreen.bucket,
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      },
+      {
+        request_key: "claims",
+        source,
+        dataset_type: "claims",
+        dimension,
+        metric: "claims",
+        bucket: fullscreen.bucket,
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      },
+      {
+        request_key: "net_claims",
+        source,
+        dataset_type: "claims",
+        dimension,
+        metric: "net_claims",
+        bucket: fullscreen.bucket,
+        job_id: jobId || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
+      },
+    ]
+
+    activeRegionalMapFilters.slice(0, 2).forEach((filter, index) => {
+      const slot = index + 1
+      batchRequests.forEach((request) => {
+        request[`filter_${slot}_dimension` as "filter_1_dimension" | "filter_2_dimension"] = filter.dimension
+        request[`filter_${slot}_values` as "filter_1_values" | "filter_2_values"] = filter.values.join(",")
+      })
+    })
+
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setIsFullscreenCompareMatrixOthersExpanded(false)
+    setFullscreenCompareMatrixState((prev) => ({
+      loading: true,
+      error: null,
+      rows: prev.rows.length ? prev.rows : [],
+      othersBreakdownRows: prev.othersBreakdownRows.length ? prev.othersBreakdownRows : [],
+    }))
+
+    fetchByDimensionBatch(batchRequests, { signal: controller.signal })
+      .then((response) => {
+        if (!active) return
+
+        const rowsByRequest = new Map<string, Array<Record<string, unknown>>>()
+        ;(response.results || []).forEach((result) => {
+          rowsByRequest.set(result.request_key, Array.isArray(result.rows) ? result.rows : [])
+        })
+
+        const dimKey = toSafeKey(dimension)
+        const grossMap = new Map<string, number>()
+        const earnedMap = new Map<string, number>()
+        const zopperMap = new Map<string, number>()
+        const claimsMap = new Map<string, number>()
+        const netClaimsMap = new Map<string, number>()
+
+        const ingestRows = (
+          rows: Array<Record<string, unknown>>,
+          metric:
+            | "gross_premium"
+            | "earned_premium"
+            | "zopper_earned_premium"
+            | "claims"
+            | "net_claims",
+          target: Map<string, number>
+        ) => {
+          rows.forEach((rawRow) => {
+            const row = normalizeSectionBatchRow(rawRow, dimension)
+            if (!row) return
+            const label = String(row[dimKey] ?? "").trim()
+            if (!label) return
+            const value = getFullscreenCompareMatrixMetricValue(row, metric, source)
+            target.set(label, (target.get(label) ?? 0) + value)
+          })
+        }
+
+        ingestRows(rowsByRequest.get("gross_premium") || [], "gross_premium", grossMap)
+        ingestRows(rowsByRequest.get("earned_premium") || [], "earned_premium", earnedMap)
+        ingestRows(rowsByRequest.get("zopper_earned_premium") || [], "zopper_earned_premium", zopperMap)
+        ingestRows(rowsByRequest.get("claims") || [], "claims", claimsMap)
+        ingestRows(rowsByRequest.get("net_claims") || [], "net_claims", netClaimsMap)
+
+        const labels = Array.from(
+          new Set([
+            ...grossMap.keys(),
+            ...earnedMap.keys(),
+            ...zopperMap.keys(),
+            ...claimsMap.keys(),
+            ...netClaimsMap.keys(),
+          ])
+        )
+
+        const othersSeed: FullscreenCompareMatrixRow = {
+          label: "Others",
+          grossPremiumValue: 0,
+          earnedPremiumValue: 0,
+          claimsValue: 0,
+          ratioValue: 0,
+          lossRatioValue: 0,
+        }
+        const othersBreakdownRows: FullscreenCompareMatrixRow[] = []
+        let othersZopperEarnedPremiumValue = 0
+        let othersNetClaimsValue = 0
+
+        const nextRows = labels
+          .map((label) => {
+            const grossPremiumValue = asNumber(grossMap.get(label))
+            const earnedPremiumValue = asNumber(earnedMap.get(label))
+            const zopperEarnedPremiumValue = asNumber(zopperMap.get(label))
+            const claimsValue = asNumber(claimsMap.get(label))
+            const netClaimsValue = asNumber(netClaimsMap.get(label))
+            const ratioValue = grossPremiumValue > 0 ? (claimsValue / grossPremiumValue) * 100 : 0
+            const lossRatioValue = zopperEarnedPremiumValue > 0
+              ? Math.min(
+                FULLSCREEN_COMPARE_MATRIX_LOSS_RATIO_CAP,
+                Math.max(0, (netClaimsValue / zopperEarnedPremiumValue) * 100)
+              )
+              : 0
+
+            return {
+              label,
+              grossPremiumValue,
+              earnedPremiumValue,
+              claimsValue,
+              ratioValue,
+              lossRatioValue,
+              zopperEarnedPremiumValue,
+              netClaimsValue,
+            }
+          })
+          .filter((row) => row.grossPremiumValue > 0 || row.earnedPremiumValue > 0 || row.claimsValue > 0)
+          .reduce<FullscreenCompareMatrixRow[]>((acc, row) => {
+            if (row.grossPremiumValue < FULLSCREEN_COMPARE_MATRIX_OTHERS_GROSS_THRESHOLD) {
+              othersSeed.grossPremiumValue += row.grossPremiumValue
+              othersSeed.earnedPremiumValue += row.earnedPremiumValue
+              othersSeed.claimsValue += row.claimsValue
+              othersZopperEarnedPremiumValue += row.zopperEarnedPremiumValue
+              othersNetClaimsValue += row.netClaimsValue
+              othersBreakdownRows.push({
+                label: row.label,
+                grossPremiumValue: row.grossPremiumValue,
+                earnedPremiumValue: row.earnedPremiumValue,
+                claimsValue: row.claimsValue,
+                ratioValue: row.ratioValue,
+                lossRatioValue: row.lossRatioValue,
+              })
+              return acc
+            }
+
+            acc.push({
+              label: row.label,
+              grossPremiumValue: row.grossPremiumValue,
+              earnedPremiumValue: row.earnedPremiumValue,
+              claimsValue: row.claimsValue,
+              ratioValue: row.ratioValue,
+              lossRatioValue: row.lossRatioValue,
+            })
+            return acc
+          }, [])
+
+        if (othersSeed.grossPremiumValue > 0 || othersSeed.earnedPremiumValue > 0 || othersSeed.claimsValue > 0) {
+          othersSeed.ratioValue =
+            othersSeed.grossPremiumValue > 0
+              ? (othersSeed.claimsValue / othersSeed.grossPremiumValue) * 100
+              : 0
+          othersSeed.lossRatioValue =
+            othersZopperEarnedPremiumValue > 0
+              ? Math.min(
+                FULLSCREEN_COMPARE_MATRIX_LOSS_RATIO_CAP,
+                Math.max(0, (othersNetClaimsValue / othersZopperEarnedPremiumValue) * 100)
+              )
+              : 0
+          nextRows.push(othersSeed)
+        }
+
+        othersBreakdownRows.sort((a, b) => b.grossPremiumValue - a.grossPremiumValue)
+        nextRows.sort((a, b) => {
+          if (a.label === "Others") return 1
+          if (b.label === "Others") return -1
+          return b.grossPremiumValue - a.grossPremiumValue
+        })
+
+        setFullscreenCompareMatrixState({
+          loading: false,
+          error: null,
+          rows: nextRows,
+          othersBreakdownRows,
+        })
+      })
+      .catch((err) => {
+        if (!active || controller.signal.aborted) return
+        const message = err instanceof Error ? err.message : "Unable to load comparison matrix."
+        setFullscreenCompareMatrixState({
+          loading: false,
+          error: message,
+          rows: [],
+          othersBreakdownRows: [],
+        })
+      })
+
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [
+    fullscreen,
+    isFullscreenCompareMode,
+    source,
+    jobId,
+    fullscreenFromDate,
+    fullscreenToDate,
+    fromDate,
+    toDate,
+    activeRegionalMapFilters,
+  ])
+
+  const fullscreenCompareMatrixRows = fullscreenCompareMatrixState.rows
+  const fullscreenCompareMatrixOthersBreakdownRows = fullscreenCompareMatrixState.othersBreakdownRows
+  const hasFullscreenCompareMatrixOthersBreakdown = fullscreenCompareMatrixOthersBreakdownRows.length > 0
+
+  const fullscreenCompareMatrixMaxima = useMemo(() => ({
+    grossPremiumValue: fullscreenCompareMatrixRows.reduce((max, row) => Math.max(max, row.grossPremiumValue), 0),
+    earnedPremiumValue: fullscreenCompareMatrixRows.reduce((max, row) => Math.max(max, row.earnedPremiumValue), 0),
+    claimsValue: fullscreenCompareMatrixRows.reduce((max, row) => Math.max(max, row.claimsValue), 0),
+    ratioValue: fullscreenCompareMatrixRows.reduce((max, row) => Math.max(max, row.ratioValue), 0),
+    lossRatioValue: fullscreenCompareMatrixRows.reduce((max, row) => Math.max(max, row.lossRatioValue), 0),
+  }), [fullscreenCompareMatrixRows])
 
   useEffect(() => {
     if (!INSIGHTS_ENABLED) return
-    if (!fullscreen || !openedGraphData) return
-    if (!openedGraphData.rows.length) return
-    if (!openedGraphData.measure || !openedGraphData.dimensionKey) return
+    if (!fullscreen || !activeOpenedGraphData) return
+    if (!activeOpenedGraphData.rows.length) return
+    if (!activeOpenedGraphData.measure || !activeOpenedGraphData.dimensionKey) return
 
-    const insightsRows = buildInsightsRows(openedGraphData)
+    const insightsRows = buildInsightsRows(activeOpenedGraphData)
     if (!insightsRows.length) return
 
     const insightsRequestKey = JSON.stringify({
@@ -1613,7 +2583,7 @@ export default function MultiGraphView({
       dimension: fullscreen.dimension,
       metric: fullscreen.metric,
       bucket: fullscreen.bucket || "",
-      compareMode: openedGraphData.compareMode,
+      compareMode: activeOpenedGraphData.compareMode,
       rows: insightsRows,
     })
 
@@ -1634,7 +2604,7 @@ export default function MultiGraphView({
         job_id: jobId || undefined,
         from_date: fromDate || undefined,
         to_date: toDate || undefined,
-        compare_mode: openedGraphData.compareMode,
+        compare_mode: activeOpenedGraphData.compareMode,
         rows: insightsRows,
       })
         .then((res) => {
@@ -1669,13 +2639,14 @@ export default function MultiGraphView({
       active = false
       clearTimeout(timer)
     }
-  }, [source, datasetType, jobId, fromDate, toDate, fullscreen, openedGraphData])
+  }, [source, datasetType, jobId, fromDate, toDate, fullscreen, activeOpenedGraphData])
 
   useEffect(() => {
     if (!fullscreen || !isStateFullscreen || !activeSelectedState) return
     if (!isBreakdownMetricSupported) return
 
     let active = true
+    const controller = new AbortController()
     const timer = setTimeout(() => {
       if (!active) return
       setCityBreakdownLoading(true)
@@ -1688,10 +2659,11 @@ export default function MultiGraphView({
         source,
         dataset_type: datasetType,
         job_id: jobId || undefined,
-        from_date: fromDate || undefined,
-        to_date: toDate || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
         limit: 150,
-      })
+        ...toRegionalAnalyticsFilterParams(activeRegionalMapFilters),
+      }, { signal: controller.signal })
         .then((res) => {
           if (!active) return
 
@@ -1734,6 +2706,7 @@ export default function MultiGraphView({
 
     return () => {
       active = false
+      controller.abort()
       clearTimeout(timer)
     }
   }, [
@@ -1743,9 +2716,12 @@ export default function MultiGraphView({
     source,
     datasetType,
     jobId,
+    fullscreenFromDate,
+    fullscreenToDate,
     fromDate,
     toDate,
     isBreakdownMetricSupported,
+    activeRegionalMapFilters,
   ])
 
   useEffect(() => {
@@ -1753,6 +2729,7 @@ export default function MultiGraphView({
     if (!isBreakdownMetricSupported) return
 
     let active = true
+    const controller = new AbortController()
     const timer = setTimeout(() => {
       if (!active) return
       if (!activeComparisonStates.length) {
@@ -1768,12 +2745,13 @@ export default function MultiGraphView({
       const baseParams = {
         source,
         dataset_type: datasetType,
-        metric: "quantity",
+        metric: regionalAnalysisMetric,
         job_id: jobId || undefined,
-        from_date: fromDate || undefined,
-        to_date: toDate || undefined,
+        from_date: fullscreenFromDate || fromDate || undefined,
+        to_date: fullscreenToDate || toDate || undefined,
         limit: 200,
       } as const
+      const regionalFilterParams = toRegionalAnalyticsFilterParams(activeRegionalMapFilters)
 
       Promise.all(
         activeComparisonStates.map(async (stateLabel) => {
@@ -1784,12 +2762,14 @@ export default function MultiGraphView({
                 ...baseParams,
                 dimension: activeRegionalPrimaryDescriptor.dimension,
                 state: stateLabel,
-              }),
+                ...regionalFilterParams,
+              }, { signal: controller.signal }),
               fetchCategoryPercentage({
                 ...baseParams,
                 dimension: activeRegionalSecondaryDescriptor.dimension,
                 state: stateLabel,
-              }),
+                ...regionalFilterParams,
+              }, { signal: controller.signal }),
             ])
 
             const planRows = normalizeCategoryRows((planRes.rows as CategoryOption[]) || [])
@@ -1856,6 +2836,7 @@ export default function MultiGraphView({
 
     return () => {
       active = false
+      controller.abort()
       clearTimeout(timer)
     }
   }, [
@@ -1864,6 +2845,8 @@ export default function MultiGraphView({
     source,
     datasetType,
     jobId,
+    fullscreenFromDate,
+    fullscreenToDate,
     fromDate,
     toDate,
     activeComparisonStates,
@@ -1873,6 +2856,8 @@ export default function MultiGraphView({
     activeRegionalPrimaryDescriptor.label,
     activeRegionalSecondaryDescriptor.dimension,
     activeRegionalSecondaryDescriptor.label,
+    regionalAnalysisMetric,
+    activeRegionalMapFilters,
   ])
 
   const pickerMaxDate = useMemo(() => (
@@ -1914,10 +2899,14 @@ export default function MultiGraphView({
   }
 
   const handleOpenFullscreen = (item: NonNullable<FullscreenGraph>) => {
+    const shouldCollapseFocusFilters = item.dimension.toLowerCase().includes("state")
     setFullscreenFromDate(fromDate || "")
     setFullscreenToDate(toDate || "")
     setFullscreen(item)
     setOpenedGraphData(null)
+    setIsFullscreenCompareMode(false)
+    resetFullscreenCompareSummaries()
+    resetFullscreenCompareMatrix()
     setInsights([])
     setInsightsModel("")
     setInsightsError(null)
@@ -1931,13 +2920,17 @@ export default function MultiGraphView({
     setStateComparisonMixRows([])
     setStateComparisonMixLoading(false)
     setStateComparisonMixError(null)
-    setIsRegionFilterCardCollapsed(false)
+    clearRegionalMapFilters()
+    setIsRegionFilterCardCollapsed(shouldCollapseFocusFilters)
     lastInsightsKeyRef.current = ""
   }
 
   const handleCloseFullscreen = () => {
     setFullscreen(null)
     setOpenedGraphData(null)
+    setIsFullscreenCompareMode(false)
+    resetFullscreenCompareSummaries()
+    resetFullscreenCompareMatrix()
     setInsights([])
     setInsightsModel("")
     setInsightsError(null)
@@ -1951,7 +2944,18 @@ export default function MultiGraphView({
     setStateComparisonMixRows([])
     setStateComparisonMixLoading(false)
     setStateComparisonMixError(null)
+    clearRegionalMapFilters()
     lastInsightsKeyRef.current = ""
+  }
+  const handleToggleFullscreenCompareMode = () => {
+    setIsFullscreenCompareMode((prev) => {
+      const next = !prev
+      if (!next) {
+        resetFullscreenCompareSummaries()
+        resetFullscreenCompareMatrix()
+      }
+      return next
+    })
   }
 
   const handleTraverseGraph = (direction: -1 | 1) => {
@@ -2115,6 +3119,83 @@ export default function MultiGraphView({
     )
   }
 
+  const yearOnYearTitle = datasetType === "sales"
+    ? "Financial Year Plan-Wise Quantity"
+    : "Financial Year Plan-Wise Claims"
+
+  const yearOnYearSubtitle = datasetType === "sales"
+    ? "Financial-year buckets stacked by plan. Hover for quantity, gross, earned, and zopper earned premium."
+    : "Financial-year buckets stacked by plan category with year-wise claims comparison."
+  const yearOnYearInitialDelay = datasetType === "claims" ? 900 : 0
+
+  const handleOpenYearOnYearFullscreen = () => {
+    handleOpenFullscreen({
+      metric: datasetType === "sales" ? "quantity" : "claims",
+      dimension: "year_on_year",
+      chartType: "bar",
+      isYearOnYear: true,
+    })
+  }
+
+  const renderYearOnYearCard = (
+    layout: "partner-side" | "samsung-small",
+    key: string,
+    initialDelayMs: number
+  ) => (
+    <motion.div
+      key={key}
+      initial={prefersReducedMotion ? false : { opacity: 0, y: 16 }}
+      animate={prefersReducedMotion ? undefined : { opacity: 1, y: 0 }}
+      transition={prefersReducedMotion ? undefined : { duration: 0.35, ease: "easeOut" }}
+      whileHover={prefersReducedMotion ? undefined : { y: -4 }}
+      className={
+        layout === "samsung-small"
+          ? "smooth-surface content-auto relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-4 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-5"
+          : "smooth-surface content-auto relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/60 p-3 shadow-sm transition-shadow hover:shadow-[0_18px_40px_-26px_rgba(15,23,42,0.5)] sm:p-4"
+      }
+    >
+      <div className={`pointer-events-none absolute -top-16 right-[-58px] rounded-full bg-cyan-100/60 blur-2xl ${layout === "samsung-small" ? "h-32 w-32" : "h-28 w-28"}`} />
+      <div className="relative">
+        <div className={`flex items-start justify-between gap-3 ${layout === "samsung-small" ? "mb-3" : "mb-2"}`}>
+          <div className="min-w-0">
+            <div className={`font-bold leading-snug text-slate-800 ${layout === "samsung-small" ? "text-sm sm:text-base" : "text-sm"}`}>
+              {yearOnYearTitle}
+            </div>
+            {layout === "samsung-small" && (
+              <div className="mt-1 text-[11px] text-slate-500">
+                {yearOnYearSubtitle}
+              </div>
+            )}
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-900"
+              onClick={handleOpenYearOnYearFullscreen}
+            >
+              <Maximize2 size={16} />
+            </button>
+          </div>
+        </div>
+
+        <YearOnYearComparisonChart
+          source={source}
+          datasetType={datasetType}
+          jobId={jobId}
+          fromDate={fromDate}
+          toDate={toDate}
+          initialDelayMs={initialDelayMs}
+          embedded
+          compact
+          heightClassName={
+            layout === "samsung-small"
+              ? "h-[300px] sm:h-[340px]"
+              : "h-[230px] sm:h-[260px]"
+          }
+        />
+      </div>
+    </motion.div>
+  )
+
   return (
     <>
       {isSamsungOverview ? (
@@ -2123,6 +3204,7 @@ export default function MultiGraphView({
             .filter((card) => card.size === "main")
             .map((card, index) => renderSamsungCard(card, "main", index))}
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            {renderYearOnYearCard("samsung-small", "samsung-yoy-comparison", yearOnYearInitialDelay)}
             {samsungOverviewCards
             .filter((card) => card.size === "small")
             .map((card, index) => renderSamsungCard(card, "small", index))}
@@ -2130,7 +3212,24 @@ export default function MultiGraphView({
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(300px,1fr)] xl:items-start">
-          <div className="space-y-2">
+          <div className="space-y-3">
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => setIsPartnerGraphScrollEnabled((current) => !current)}
+                className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/90 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-600 shadow-sm transition-colors hover:border-slate-300 hover:text-slate-900"
+                aria-pressed={isPartnerGraphScrollEnabled}
+              >
+                <ChevronDown
+                  size={14}
+                  className={`transition-transform ${isPartnerGraphScrollEnabled ? "-rotate-90" : "rotate-0"}`}
+                />
+                {isPartnerGraphScrollEnabled ? "Graph Scroll On" : "Graph Scroll Off"}
+              </button>
+            </div>
+            <div
+              className={`space-y-2 ${isPartnerGraphScrollEnabled ? "custom-scrollbar max-h-[72vh] overflow-y-auto pr-1 sm:max-h-[78vh] sm:pr-2 xl:max-h-[calc(100vh-2.5rem)]" : ""}`}
+            >
             {visibleSectionConfigs.map(({ group, entries }) => {
         const sectionTitle = getSectionTitle(group)
         const entry = entries[0]
@@ -2160,7 +3259,6 @@ export default function MultiGraphView({
                 ? SECTION_HEATMAP_MAX_ROWS
                 : SECTION_METRIC_STRIP_MAX_ROWS
             )
-        const sectionUseLogScale = false
         const sectionChartRows = sectionDisplayRows
         const sectionMetricMaxima = mergedMetrics.reduce((acc, metric) => {
           acc[metric] = sectionDisplayRows.reduce(
@@ -2411,7 +3509,7 @@ export default function MultiGraphView({
                               minTickGap={isMobileViewport ? 8 : 12}
                               tickFormatter={(value) =>
                                 isTemporalDimensionKey(dimKey)
-                                  ? formatMonthLabel(String(value || ""))
+                                  ? formatMonthLabel(String(value || ""), dimKey)
                                   : String(value || "")
                               }
                             />
@@ -2435,7 +3533,7 @@ export default function MultiGraphView({
                                   <div className={`rounded-lg border bg-white shadow ${isMobileViewport ? "p-2.5" : "p-3"}`}>
                                     <p className={`${isMobileViewport ? "text-[11px]" : "text-xs"} font-bold text-gray-400`}>
                                       {isTemporalDimensionKey(dimKey)
-                                        ? formatMonthLabel(String(label || ""))
+                                        ? formatMonthLabel(String(label || ""), dimKey)
                                         : String(label || "")}
                                     </p>
                                     <div className={`${isMobileViewport ? "mt-1 space-y-0.5" : "mt-1 space-y-1"}`}>
@@ -2501,14 +3599,14 @@ export default function MultiGraphView({
           </div>
         )
       })}
-          </div>
-          {!!partnerSideCards.length && (
-            <div className="xl:sticky xl:top-4">
-              <div className="grid grid-cols-1 gap-3">
-                {partnerSideCards.map((card, index) => renderPartnerSideCard(card, "frozen-side-rail", index))}
-              </div>
             </div>
-          )}
+          </div>
+          <div className="xl:sticky xl:top-4">
+            <div className="grid grid-cols-1 gap-3">
+              {renderYearOnYearCard("partner-side", `${source}-${datasetType}-yoy-comparison`, yearOnYearInitialDelay)}
+              {partnerSideCards.map((card, index) => renderPartnerSideCard(card, "frozen-side-rail", index))}
+            </div>
+          </div>
         </div>
       )}
 
@@ -2518,16 +3616,18 @@ export default function MultiGraphView({
           <motion.div className="fixed inset-0 z-50 bg-slate-950/35 p-1.5 sm:p-2 md:p-4">
             <div className="h-full w-full overflow-hidden rounded-[20px] border border-slate-200 bg-gradient-to-b from-slate-50 via-white to-slate-100 shadow-2xl sm:rounded-[28px]">
               <div className="h-full w-full overflow-auto">
-                <div className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur sm:px-4 sm:py-4 md:px-6">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="sticky top-0 z-20 border-b border-slate-200/80 bg-white/92 px-3 py-2 backdrop-blur sm:px-4 sm:py-2.5 md:px-5">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
                       Expanded View
                     </div>
-                    <div className="text-sm font-semibold text-slate-800">
-                      {getGraphTitle(fullscreen.metric, fullscreen.dimension, source)}
+                    <div className="text-sm font-semibold leading-tight text-slate-800">
+                      {isYearOnYearFullscreen
+                        ? yearOnYearTitle
+                        : getGraphTitle(fullscreen.metric, fullscreen.dimension, source)}
                     </div>
-                    {currentNavigableGraph && (
+                    {!isYearOnYearFullscreen && currentNavigableGraph && (
                       <div className="mt-1 text-[11px] text-slate-500">
                         {currentNavigableGraph.sectionTitle} | Graph {fullscreenGraphIndex + 1} of {navigableGraphs.length}
                       </div>
@@ -2535,7 +3635,30 @@ export default function MultiGraphView({
                   </div>
                   <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
                     <button
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                      type="button"
+                      onClick={handleToggleFullscreenCompareMode}
+                      className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-1.5 text-[10px] font-black uppercase tracking-[0.12em] transition-colors sm:text-[11px] ${
+                        isFullscreenCompareMode
+                          ? "border-cyan-300 bg-cyan-50 text-cyan-800"
+                          : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+                      }`}
+                      aria-pressed={isFullscreenCompareMode}
+                    >
+                      <span
+                        className={`relative inline-flex h-[18px] w-8 items-center rounded-full transition-colors ${
+                          isFullscreenCompareMode ? "bg-cyan-500" : "bg-slate-300"
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-[14px] w-[14px] rounded-full bg-white shadow transition-transform ${
+                            isFullscreenCompareMode ? "translate-x-[17px]" : "translate-x-0.5"
+                          }`}
+                        />
+                      </span>
+                      {isFullscreenCompareMode ? "Comparison Mode" : "Normal Mode"}
+                    </button>
+                    <button
+                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={() => handleTraverseGraph(-1)}
                       disabled={!canGoToPreviousGraph}
                     >
@@ -2543,7 +3666,7 @@ export default function MultiGraphView({
                       <span className="hidden sm:inline">Previous Graph</span>
                     </button>
                     <button
-                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={() => handleTraverseGraph(1)}
                       disabled={!canGoToNextGraph}
                     >
@@ -2551,7 +3674,7 @@ export default function MultiGraphView({
                       <span className="hidden sm:inline">Next Graph</span>
                     </button>
                     <button
-                      className="ml-auto rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 sm:ml-0"
+                      className="ml-auto rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 sm:ml-0"
                       onClick={handleCloseFullscreen}
                     >
                       Close
@@ -2560,7 +3683,7 @@ export default function MultiGraphView({
                   </div>
                 </div>
 
-                <div className="sticky top-[116px] z-30 border-b border-slate-200/80 bg-white/90 px-3 py-3 backdrop-blur sm:top-[73px] sm:px-4 md:px-6">
+                <div className="sticky top-[96px] z-30 border-b border-slate-200/80 bg-white/92 px-3 py-2 backdrop-blur sm:top-[64px] sm:px-4 md:px-5">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">
                       Date Window
@@ -2741,7 +3864,455 @@ export default function MultiGraphView({
                 }`}
               >
                 <div className="w-full max-w-6xl">
-                  {fullscreenCompositeData ? (
+                  {isFullscreenCompareMode ? (
+                    <div className="space-y-6">
+                      <div className="rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                              Comparative Metrics
+                            </h4>
+                            <div className="mt-1 text-[11px] text-slate-500">
+                              Compare sales and claims metrics together for this focused date range.
+                            </div>
+                          </div>
+                          <div className="rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1 text-[10px] font-black uppercase tracking-[0.14em] text-cyan-700">
+                            Comparison Mode
+                          </div>
+                        </div>
+                        {fullscreenCompareSummaries.error ? (
+                          <div className="text-sm text-rose-600">
+                            {fullscreenCompareSummaries.error}
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                            {fullscreenCompareMetricCards.map((card) => (
+                              <div
+                                key={`fullscreen-compare-card-${card.key}`}
+                                className="rounded-2xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50 to-slate-100 p-3 shadow-sm"
+                              >
+                                <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.14em] text-slate-400">
+                                  <span
+                                    className="inline-block h-2.5 w-2.5 rounded-full"
+                                    style={{ backgroundColor: METRIC_LINE_COLORS[card.metric] || "#2563eb" }}
+                                  />
+                                  {card.family}
+                                </div>
+                                <div className="mt-2 text-[11px] font-semibold text-slate-500">
+                                  {card.label}
+                                </div>
+                                <div className="mt-1 text-base font-black text-slate-800 sm:text-lg">
+                                  {fullscreenCompareSummaries.loading
+                                    ? "Loading..."
+                                    : card.value == null
+                                      ? "N/A"
+                                      : formatMetricValue(asNumber(card.value), card.metric)}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {isYearOnYearFullscreen ? (
+                        <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+                          <div className="rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                            <div className="mb-3">
+                              <div className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                                Sales Lens
+                              </div>
+                              <div className="mt-1 text-[11px] text-slate-500">
+                                Financial-year comparison for sales metrics.
+                              </div>
+                            </div>
+                            <YearOnYearComparisonChart
+                              source={source}
+                              datasetType="sales"
+                              jobId={jobId}
+                              fromDate={fullscreenFromDate || fromDate}
+                              toDate={fullscreenToDate || toDate}
+                              initialDelayMs={0}
+                              heightClassName="h-[48vh] min-h-[360px]"
+                            />
+                          </div>
+                          <div className="rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                            <div className="mb-3">
+                              <div className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                                Claims Lens
+                              </div>
+                              <div className="mt-1 text-[11px] text-slate-500">
+                                Financial-year comparison for claims metrics.
+                              </div>
+                            </div>
+                            <YearOnYearComparisonChart
+                              source={source}
+                              datasetType="claims"
+                              jobId={jobId}
+                              fromDate={fullscreenFromDate || fromDate}
+                              toDate={fullscreenToDate || toDate}
+                              initialDelayMs={0}
+                              heightClassName="h-[48vh] min-h-[360px]"
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+                          <div className="rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                            <div className="mb-3">
+                              <div className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                                Sales Lens
+                              </div>
+                              <div className="mt-1 text-[11px] text-slate-500">
+                                {`${getMetricLabel(fullscreenCompareSalesMetric)} by ${getDimensionLabel(fullscreen.dimension, source).toLowerCase()}.`}
+                              </div>
+                            </div>
+                            <div className="h-[52vh] min-h-[360px]">
+                              <GraphView
+                                source={source}
+                                dimension={fullscreen.dimension}
+                                metric={fullscreenCompareSalesMetric}
+                                datasetType="sales"
+                                bucket={fullscreen.bucket}
+                                jobId={jobId}
+                                fromDate={fullscreenFromDate || fromDate}
+                                toDate={fullscreenToDate || toDate}
+                                chartType={fullscreen.chartType}
+                                tooltipMetricOverride={fullscreenCompareSalesMetric}
+                                categoryFilters={isStateFullscreen ? activeRegionalMapFilters : undefined}
+                                enableCrossDatasetHoverCompare={false}
+                                eagerMapHoverPrefetch={false}
+                                heightClassName="h-full"
+                              />
+                            </div>
+                          </div>
+                          <div className="rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                            <div className="mb-3">
+                              <div className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                                Claims Lens
+                              </div>
+                              <div className="mt-1 text-[11px] text-slate-500">
+                                {`${getMetricLabel(fullscreenCompareClaimsMetric)} by ${getDimensionLabel(fullscreen.dimension, source).toLowerCase()}.`}
+                              </div>
+                            </div>
+                            <div className="h-[52vh] min-h-[360px]">
+                              <GraphView
+                                source={source}
+                                dimension={fullscreen.dimension}
+                                metric={fullscreenCompareClaimsMetric}
+                                datasetType="claims"
+                                bucket={fullscreen.bucket}
+                                jobId={jobId}
+                                fromDate={fullscreenFromDate || fromDate}
+                                toDate={fullscreenToDate || toDate}
+                                chartType={fullscreen.chartType}
+                                tooltipMetricOverride={fullscreenCompareClaimsMetric}
+                                categoryFilters={isStateFullscreen ? activeRegionalMapFilters : undefined}
+                                enableCrossDatasetHoverCompare={false}
+                                eagerMapHoverPrefetch={false}
+                                heightClassName="h-full"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {fullscreen.chartType === "india_map" && (
+                        <div className="rounded-3xl border border-slate-200/80 bg-white/95 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
+                          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <div className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                                Sales Vs Claims Matrix
+                              </div>
+                              <div className="mt-1 text-[11px] text-slate-500">
+                                States below Rs 80 L gross premium are merged into Others. Click Others to expand its state-wise bifurcation. Darker cells indicate stronger contribution within that column.
+                              </div>
+                            </div>
+                            <div className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[10px] font-black uppercase tracking-[0.14em] text-slate-600">
+                              Ratio = Claims / Gross
+                            </div>
+                          </div>
+                          {fullscreenCompareMatrixState.loading ? (
+                            <div className="flex min-h-[220px] items-center justify-center text-sm text-slate-500">
+                              Loading comparison matrix...
+                            </div>
+                          ) : fullscreenCompareMatrixState.error ? (
+                            <div className="flex min-h-[220px] items-center justify-center text-sm text-rose-600">
+                              {fullscreenCompareMatrixState.error}
+                            </div>
+                          ) : !fullscreenCompareMatrixRows.length ? (
+                            <div className="flex min-h-[220px] items-center justify-center text-sm text-slate-500">
+                              No regional comparison data available for this selection.
+                            </div>
+                          ) : (
+                            <div className="overflow-auto">
+                              <table className="w-full min-w-[1040px] border-separate border-spacing-y-2 text-[11px]">
+                                <thead>
+                                  <tr>
+                                    <th className="px-3 py-2 text-left text-[10px] font-black uppercase tracking-[0.14em] text-slate-500">
+                                      {getDimensionLabel(fullscreen.dimension, source)}
+                                    </th>
+                                    <th className="px-3 py-2 text-right text-[10px] font-black uppercase tracking-[0.14em] text-slate-500">
+                                      Gross Premium
+                                    </th>
+                                    <th className="px-3 py-2 text-right text-[10px] font-black uppercase tracking-[0.14em] text-slate-500">
+                                      Earned Premium
+                                    </th>
+                                    <th className="px-3 py-2 text-right text-[10px] font-black uppercase tracking-[0.14em] text-slate-500">
+                                      Claims Cost
+                                    </th>
+                                    <th className="px-3 py-2 text-right text-[10px] font-black uppercase tracking-[0.14em] text-slate-500">
+                                      Claims Vs Sales
+                                    </th>
+                                    <th className="px-3 py-2 text-right text-[10px] font-black uppercase tracking-[0.14em] text-slate-500">
+                                      Loss Ratio
+                                    </th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {fullscreenCompareMatrixRows.map((row) => {
+                                    const isOthersRow =
+                                      row.label === "Others" && hasFullscreenCompareMatrixOthersBreakdown
+                                    const isOthersExpanded =
+                                      isOthersRow && isFullscreenCompareMatrixOthersExpanded
+                                    const grossIntensity = fullscreenCompareMatrixMaxima.grossPremiumValue > 0
+                                      ? row.grossPremiumValue / fullscreenCompareMatrixMaxima.grossPremiumValue
+                                      : 0
+                                    const earnedIntensity = fullscreenCompareMatrixMaxima.earnedPremiumValue > 0
+                                      ? row.earnedPremiumValue / fullscreenCompareMatrixMaxima.earnedPremiumValue
+                                      : 0
+                                    const claimsIntensity = fullscreenCompareMatrixMaxima.claimsValue > 0
+                                      ? row.claimsValue / fullscreenCompareMatrixMaxima.claimsValue
+                                      : 0
+                                    const ratioIntensity = fullscreenCompareMatrixMaxima.ratioValue > 0
+                                      ? row.ratioValue / fullscreenCompareMatrixMaxima.ratioValue
+                                      : 0
+                                    const lossRatioIntensity = fullscreenCompareMatrixMaxima.lossRatioValue > 0
+                                      ? row.lossRatioValue / fullscreenCompareMatrixMaxima.lossRatioValue
+                                      : 0
+
+                                    const grossCellStyle = {
+                                      backgroundColor: `rgba(37, 99, 235, ${0.1 + (grossIntensity * 0.7)})`,
+                                      color: grossIntensity > 0.55 ? "#eff6ff" : "#1e3a8a",
+                                    }
+                                    const earnedCellStyle = {
+                                      backgroundColor: `rgba(8, 145, 178, ${0.1 + (earnedIntensity * 0.68)})`,
+                                      color: earnedIntensity > 0.55 ? "#ecfeff" : "#155e75",
+                                    }
+                                    const claimsCellStyle = {
+                                      backgroundColor: `rgba(249, 115, 22, ${0.1 + (claimsIntensity * 0.68)})`,
+                                      color: claimsIntensity > 0.55 ? "#fff7ed" : "#9a3412",
+                                    }
+                                    const ratioCellStyle = {
+                                      backgroundColor: `rgba(109, 40, 217, ${0.1 + (ratioIntensity * 0.68)})`,
+                                      color: ratioIntensity > 0.55 ? "#f5f3ff" : "#5b21b6",
+                                    }
+                                    const lossRatioCellStyle = {
+                                      backgroundColor: `rgba(13, 148, 136, ${0.1 + (lossRatioIntensity * 0.68)})`,
+                                      color: lossRatioIntensity > 0.55 ? "#f0fdfa" : "#115e59",
+                                    }
+
+                                    const renderedRows = [
+                                      <tr
+                                        key={`fullscreen-compare-matrix-${row.label}`}
+                                        className={isOthersRow ? "cursor-pointer" : undefined}
+                                        onClick={isOthersRow ? () => {
+                                          setIsFullscreenCompareMatrixOthersExpanded((prev) => !prev)
+                                        } : undefined}
+                                        onKeyDown={isOthersRow ? (event) => {
+                                          if (event.key === "Enter" || event.key === " ") {
+                                            event.preventDefault()
+                                            setIsFullscreenCompareMatrixOthersExpanded((prev) => !prev)
+                                          }
+                                        } : undefined}
+                                        role={isOthersRow ? "button" : undefined}
+                                        tabIndex={isOthersRow ? 0 : undefined}
+                                        aria-expanded={isOthersRow ? isOthersExpanded : undefined}
+                                        title={isOthersRow ? "Click to expand Others breakdown" : undefined}
+                                      >
+                                        <td className="rounded-l-2xl border border-r-0 border-slate-200/80 bg-white px-3 py-2.5">
+                                          <div className="font-semibold text-slate-800">{row.label}</div>
+                                        </td>
+                                        <td
+                                          className="border border-slate-200/70 px-3 py-2.5 text-right align-middle"
+                                          style={grossCellStyle}
+                                          title={`${row.label} | Gross Premium: ${formatMetricValue(row.grossPremiumValue, "gross_premium")}`}
+                                        >
+                                          <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                            Gross
+                                          </div>
+                                          <div className="mt-1 text-sm font-black">
+                                            {formatMetricValue(row.grossPremiumValue, "gross_premium")}
+                                          </div>
+                                        </td>
+                                        <td
+                                          className="border border-slate-200/70 px-3 py-2.5 text-right align-middle"
+                                          style={earnedCellStyle}
+                                          title={`${row.label} | Earned Premium: ${formatMetricValue(row.earnedPremiumValue, "earned_premium")}`}
+                                        >
+                                          <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                            Earned
+                                          </div>
+                                          <div className="mt-1 text-sm font-black">
+                                            {formatMetricValue(row.earnedPremiumValue, "earned_premium")}
+                                          </div>
+                                        </td>
+                                        <td
+                                          className="border border-slate-200/70 px-3 py-2.5 text-right align-middle"
+                                          style={claimsCellStyle}
+                                          title={`${row.label} | Claims Cost: ${formatMetricValue(row.claimsValue, "claims")}`}
+                                        >
+                                          <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                            Claims
+                                          </div>
+                                          <div className="mt-1 text-sm font-black">
+                                            {formatMetricValue(row.claimsValue, "claims")}
+                                          </div>
+                                        </td>
+                                        <td
+                                          className="border border-slate-200/70 px-3 py-2.5 text-right align-middle"
+                                          style={ratioCellStyle}
+                                          title={`${row.label} | Claims Vs Sales: ${formatMetricValue(row.ratioValue, "loss_ratio")}`}
+                                        >
+                                          <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                            Ratio
+                                          </div>
+                                          <div className="mt-1 text-sm font-black">
+                                            {formatMetricValue(row.ratioValue, "loss_ratio")}
+                                          </div>
+                                        </td>
+                                        <td
+                                          className="rounded-r-2xl border border-l-0 border-slate-200/70 px-3 py-2.5 text-right align-middle"
+                                          style={lossRatioCellStyle}
+                                          title={`${row.label} | Loss Ratio: ${formatMetricValue(row.lossRatioValue, "loss_ratio")}`}
+                                        >
+                                          <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                            Loss Ratio
+                                          </div>
+                                          <div className="mt-1 text-sm font-black">
+                                            {formatMetricValue(row.lossRatioValue, "loss_ratio")}
+                                          </div>
+                                        </td>
+                                      </tr>,
+                                    ]
+
+                                    if (isOthersExpanded) {
+                                      fullscreenCompareMatrixOthersBreakdownRows.forEach((breakdownRow) => {
+                                        const breakdownGrossIntensity = fullscreenCompareMatrixMaxima.grossPremiumValue > 0
+                                          ? breakdownRow.grossPremiumValue / fullscreenCompareMatrixMaxima.grossPremiumValue
+                                          : 0
+                                        const breakdownEarnedIntensity = fullscreenCompareMatrixMaxima.earnedPremiumValue > 0
+                                          ? breakdownRow.earnedPremiumValue / fullscreenCompareMatrixMaxima.earnedPremiumValue
+                                          : 0
+                                        const breakdownClaimsIntensity = fullscreenCompareMatrixMaxima.claimsValue > 0
+                                          ? breakdownRow.claimsValue / fullscreenCompareMatrixMaxima.claimsValue
+                                          : 0
+                                        const breakdownRatioIntensity = fullscreenCompareMatrixMaxima.ratioValue > 0
+                                          ? breakdownRow.ratioValue / fullscreenCompareMatrixMaxima.ratioValue
+                                          : 0
+                                        const breakdownLossRatioIntensity = fullscreenCompareMatrixMaxima.lossRatioValue > 0
+                                          ? breakdownRow.lossRatioValue / fullscreenCompareMatrixMaxima.lossRatioValue
+                                          : 0
+
+                                        const breakdownGrossCellStyle = {
+                                          backgroundColor: `rgba(37, 99, 235, ${0.08 + (breakdownGrossIntensity * 0.55)})`,
+                                          color: breakdownGrossIntensity > 0.58 ? "#eff6ff" : "#1e3a8a",
+                                        }
+                                        const breakdownEarnedCellStyle = {
+                                          backgroundColor: `rgba(8, 145, 178, ${0.08 + (breakdownEarnedIntensity * 0.53)})`,
+                                          color: breakdownEarnedIntensity > 0.58 ? "#ecfeff" : "#155e75",
+                                        }
+                                        const breakdownClaimsCellStyle = {
+                                          backgroundColor: `rgba(249, 115, 22, ${0.08 + (breakdownClaimsIntensity * 0.53)})`,
+                                          color: breakdownClaimsIntensity > 0.58 ? "#fff7ed" : "#9a3412",
+                                        }
+                                        const breakdownRatioCellStyle = {
+                                          backgroundColor: `rgba(109, 40, 217, ${0.08 + (breakdownRatioIntensity * 0.53)})`,
+                                          color: breakdownRatioIntensity > 0.58 ? "#f5f3ff" : "#5b21b6",
+                                        }
+                                        const breakdownLossRatioCellStyle = {
+                                          backgroundColor: `rgba(13, 148, 136, ${0.08 + (breakdownLossRatioIntensity * 0.53)})`,
+                                          color: breakdownLossRatioIntensity > 0.58 ? "#f0fdfa" : "#115e59",
+                                        }
+
+                                        renderedRows.push(
+                                          <tr key={`fullscreen-compare-matrix-breakdown-${breakdownRow.label}`}>
+                                            <td className="rounded-l-2xl border border-r-0 border-slate-200/70 bg-slate-50/90 px-3 py-2.5">
+                                              <div className="pl-4 font-medium text-slate-700">{breakdownRow.label}</div>
+                                            </td>
+                                            <td
+                                              className="border border-slate-200/60 px-3 py-2.5 text-right align-middle"
+                                              style={breakdownGrossCellStyle}
+                                              title={`${breakdownRow.label} | Gross Premium: ${formatMetricValue(breakdownRow.grossPremiumValue, "gross_premium")}`}
+                                            >
+                                              <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                                Gross
+                                              </div>
+                                              <div className="mt-1 text-sm font-black">
+                                                {formatMetricValue(breakdownRow.grossPremiumValue, "gross_premium")}
+                                              </div>
+                                            </td>
+                                            <td
+                                              className="border border-slate-200/60 px-3 py-2.5 text-right align-middle"
+                                              style={breakdownEarnedCellStyle}
+                                              title={`${breakdownRow.label} | Earned Premium: ${formatMetricValue(breakdownRow.earnedPremiumValue, "earned_premium")}`}
+                                            >
+                                              <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                                Earned
+                                              </div>
+                                              <div className="mt-1 text-sm font-black">
+                                                {formatMetricValue(breakdownRow.earnedPremiumValue, "earned_premium")}
+                                              </div>
+                                            </td>
+                                            <td
+                                              className="border border-slate-200/60 px-3 py-2.5 text-right align-middle"
+                                              style={breakdownClaimsCellStyle}
+                                              title={`${breakdownRow.label} | Claims Cost: ${formatMetricValue(breakdownRow.claimsValue, "claims")}`}
+                                            >
+                                              <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                                Claims
+                                              </div>
+                                              <div className="mt-1 text-sm font-black">
+                                                {formatMetricValue(breakdownRow.claimsValue, "claims")}
+                                              </div>
+                                            </td>
+                                            <td
+                                              className="border border-slate-200/60 px-3 py-2.5 text-right align-middle"
+                                              style={breakdownRatioCellStyle}
+                                              title={`${breakdownRow.label} | Claims Vs Sales: ${formatMetricValue(breakdownRow.ratioValue, "loss_ratio")}`}
+                                            >
+                                              <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                                Ratio
+                                              </div>
+                                              <div className="mt-1 text-sm font-black">
+                                                {formatMetricValue(breakdownRow.ratioValue, "loss_ratio")}
+                                              </div>
+                                            </td>
+                                            <td
+                                              className="rounded-r-2xl border border-l-0 border-slate-200/60 px-3 py-2.5 text-right align-middle"
+                                              style={breakdownLossRatioCellStyle}
+                                              title={`${breakdownRow.label} | Loss Ratio: ${formatMetricValue(breakdownRow.lossRatioValue, "loss_ratio")}`}
+                                            >
+                                              <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                                                Loss Ratio
+                                              </div>
+                                              <div className="mt-1 text-sm font-black">
+                                                {formatMetricValue(breakdownRow.lossRatioValue, "loss_ratio")}
+                                              </div>
+                                            </td>
+                                          </tr>
+                                        )
+                                      })
+                                    }
+
+                                    return renderedRows
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ) : fullscreenCompositeData ? (
                     <div className={fullscreenGraphHeightClass}>
                       {fullscreenCompositeData.sectionData.loading ? (
                         <div className="flex h-full items-center justify-center text-sm text-slate-500">
@@ -2881,7 +4452,7 @@ export default function MultiGraphView({
                               minTickGap={isMobileViewport ? 8 : 12}
                               tickFormatter={(value) =>
                                 isTemporalDimensionKey(fullscreenCompositeData.dimKey)
-                                  ? formatMonthLabel(String(value || ""))
+                                  ? formatMonthLabel(String(value || ""), fullscreenCompositeData.dimKey)
                                   : String(value || "")
                               }
                             />
@@ -2905,7 +4476,7 @@ export default function MultiGraphView({
                                   <div className={`rounded-lg border bg-white shadow ${isMobileViewport ? "p-2.5" : "p-3"}`}>
                                     <p className={`${isMobileViewport ? "text-[11px]" : "text-xs"} font-bold text-gray-400`}>
                                       {isTemporalDimensionKey(fullscreenCompositeData.dimKey)
-                                        ? formatMonthLabel(String(label || ""))
+                                        ? formatMonthLabel(String(label || ""), fullscreenCompositeData.dimKey)
                                         : String(label || "")}
                                     </p>
                                     <div className={`${isMobileViewport ? "mt-1 space-y-0.5" : "mt-1 space-y-1"}`}>
@@ -2964,6 +4535,18 @@ export default function MultiGraphView({
                         </ResponsiveContainer>
                       )}
                     </div>
+                  ) : isYearOnYearFullscreen ? (
+                    <div className="w-full max-w-6xl">
+                      <YearOnYearComparisonChart
+                        source={source}
+                        datasetType={datasetType}
+                        jobId={jobId}
+                        fromDate={fullscreenFromDate || fromDate}
+                        toDate={fullscreenToDate || toDate}
+                        initialDelayMs={0}
+                        heightClassName="h-[58vh] min-h-[420px]"
+                      />
+                    </div>
                   ) : (
                     <div className={fullscreenGraphHeightClass}>
                       <GraphView
@@ -2973,17 +4556,19 @@ export default function MultiGraphView({
                         datasetType={datasetType}
                         bucket={fullscreen.bucket}
                         jobId={jobId}
-                        fromDate={fromDate}
-                        toDate={toDate}
+                        fromDate={fullscreenFromDate || fromDate}
+                        toDate={fullscreenToDate || toDate}
                         chartType={fullscreen.chartType}
                         tooltipMetricOverride={fullscreen.tooltipMetricOverride}
                         categoryFilters={isStateFullscreen ? activeRegionalMapFilters : undefined}
+                        enableCrossDatasetHoverCompare={fullscreen.chartType === "india_map"}
+                        eagerMapHoverPrefetch={fullscreen.chartType === "india_map"}
                         heightClassName="h-full"
                         onDataReady={setOpenedGraphData}
                       />
                     </div>
                   )}
-                  {isStateFullscreen && (
+                  {!isFullscreenCompareMode && isStateFullscreen && (
                     <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
                       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
                         <div>
@@ -3045,7 +4630,7 @@ export default function MultiGraphView({
                                     {cityBreakdownRows.map((entry, idx) => (
                                       <Cell
                                         key={`${entry.city}-${idx}`}
-                                        fill={getCityColor(idx)}
+                                        fill={cityBreakdownColors[idx] || getCityColor(idx)}
                                       />
                                     ))}
                                   </Pie>
@@ -3074,7 +4659,7 @@ export default function MultiGraphView({
                                     <div className="flex items-center gap-2 text-sm">
                                       <span
                                         className="inline-block h-2.5 w-2.5 rounded-full"
-                                        style={{ backgroundColor: getCityColor(idx) }}
+                                        style={{ backgroundColor: cityBreakdownColors[idx] || getCityColor(idx) }}
                                       />
                                       <span className="font-semibold text-slate-700">
                                         {row.city}
@@ -3099,7 +4684,7 @@ export default function MultiGraphView({
                       )}
                     </div>
                   )}
-                  {isStateFullscreen && (
+                  {!isFullscreenCompareMode && isStateFullscreen && (
                     <div className="mt-6 rounded-3xl border border-slate-200/80 bg-white/90 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5">
                       <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
                         <div>
@@ -3220,7 +4805,7 @@ export default function MultiGraphView({
                                                     const payload = (entry?.payload || {}) as MixSlice
                                                     const rawValue = asNumber(Array.isArray(value) ? value[0] : value)
                                                     return [
-                                                      `${rawValue.toLocaleString()} records`,
+                                                      formatMetricValue(rawValue, regionalAnalysisMetric),
                                                       `${payload.label} (${payload.percentage.toFixed(1)}%)`,
                                                     ]
                                                   }}
@@ -3283,41 +4868,43 @@ export default function MultiGraphView({
                       )}
                     </div>
                   )}
-                  <div
-                    className={`rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/50 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5 ${
-                      isStateFullscreen ? "mt-6" : "mt-4"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-3 mb-3">
-                      <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
-                        Sahyogi Insights
-                      </h4>
-                      {insightsModel && (
-                        <span className="text-[10px] font-semibold text-slate-400">
-                          Model: {insightsModel}
-                        </span>
+                  {!isFullscreenCompareMode && (
+                    <div
+                      className={`rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50/90 to-cyan-50/50 p-4 shadow-[0_18px_40px_-28px_rgba(15,23,42,0.45)] sm:p-5 ${
+                        isStateFullscreen ? "mt-6" : "mt-4"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3 mb-3">
+                        <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-500">
+                          Sahyogi Insights
+                        </h4>
+                        {insightsModel && (
+                          <span className="text-[10px] font-semibold text-slate-400">
+                            Model: {insightsModel}
+                          </span>
+                        )}
+                      </div>
+                      {!INSIGHTS_ENABLED ? (
+                        <div className="text-sm text-slate-500">
+                          Insights are disabled in this deployment.
+                        </div>
+                      ) : insightsLoading ? (
+                        <div className="text-sm text-slate-500">Generating insights...</div>
+                      ) : insightsError ? (
+                        <div className="text-sm text-rose-600">{insightsError}</div>
+                      ) : insights.length ? (
+                        <ul className="space-y-2">
+                          {insights.map((line, idx) => (
+                            <li key={`${idx}-${line.slice(0, 24)}`} className="text-sm text-slate-700 leading-relaxed">
+                              {line}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <div className="text-sm text-slate-500">Open graph data to view insights.</div>
                       )}
                     </div>
-                    {!INSIGHTS_ENABLED ? (
-                      <div className="text-sm text-slate-500">
-                        Insights are disabled in this deployment.
-                      </div>
-                    ) : insightsLoading ? (
-                      <div className="text-sm text-slate-500">Generating insights...</div>
-                    ) : insightsError ? (
-                      <div className="text-sm text-rose-600">{insightsError}</div>
-                    ) : insights.length ? (
-                      <ul className="space-y-2">
-                        {insights.map((line, idx) => (
-                          <li key={`${idx}-${line.slice(0, 24)}`} className="text-sm text-slate-700 leading-relaxed">
-                            {line}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <div className="text-sm text-slate-500">Open graph data to view insights.</div>
-                    )}
-                  </div>
+                  )}
                   </div>
                 </div>
               </div>

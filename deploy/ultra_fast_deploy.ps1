@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$serverIP = "13.235.56.166"
+$serverIP = "13.202.80.63"
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
 $remoteUser = "ubuntu"
 $remotePath = "/home/ubuntu/live-dashboard"
@@ -116,11 +116,11 @@ Write-Host "`n[6/6] Verifying..." -ForegroundColor Yellow
 Start-Sleep -Seconds 5
 
 try {
-    $response = Invoke-RestMethod -Uri "http://${serverIP}:8000/health" -Method GET -TimeoutSec 10
+    $response = Invoke-RestMethod -Uri "http://${serverIP}/api/health" -Method GET -TimeoutSec 10
     Write-Host "  Backend: OK" -ForegroundColor Green
     
     try {
-        Invoke-WebRequest -Uri "http://${serverIP}:3000" -Method GET -TimeoutSec 10 -UseBasicParsing | Out-Null
+        Invoke-WebRequest -Uri "http://${serverIP}/" -Method GET -TimeoutSec 10 -UseBasicParsing | Out-Null
         Write-Host "  Frontend: OK" -ForegroundColor Green
     }
     catch {
@@ -135,6 +135,6 @@ catch {
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "DEPLOYMENT COMPLETE!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host "`nFrontend: http://${serverIP}:3000" -ForegroundColor Cyan
-Write-Host "Backend: http://${serverIP}:8000" -ForegroundColor Cyan
-Write-Host "Docs: http://${serverIP}:8000/docs" -ForegroundColor Cyan
+Write-Host "`nFrontend: http://${serverIP}/" -ForegroundColor Cyan
+Write-Host "Backend: http://${serverIP}/api" -ForegroundColor Cyan
+Write-Host "Docs: http://${serverIP}/docs" -ForegroundColor Cyan

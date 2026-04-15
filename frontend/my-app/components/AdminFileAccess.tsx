@@ -54,7 +54,6 @@ const ADMIN_SOURCE_LABELS: Record<string, string> = {
   samsung: "Samsung Overview",
   samsung_vs: "Samsung Vijay Sales",
   samsung_croma: "Samsung Croma",
-  samsung_croma_dsdsg: "Croma DS/DSG",
   samsung_reliance_digital: "Samsung Reliance Digital",
   reliance: "Reliance ResQ",
   godrej: "Godrej",
@@ -192,6 +191,20 @@ function DataUpdationPanel() {
     () => Array.from(new Set(scopedItems.map((item) => item.job_id).filter(Boolean))) as string[],
     [scopedItems]
   )
+  const suggestedJobId = useMemo(() => scopedItems[0]?.job_id || "", [scopedItems])
+
+  useEffect(() => {
+    const hasCurrentJob = jobId ? scopedJobIds.includes(jobId) : false
+    if (suggestedJobId) {
+      if (!hasCurrentJob) {
+        setJobId(suggestedJobId)
+      }
+      return
+    }
+    if (jobId && !hasCurrentJob) {
+      setJobId("")
+    }
+  }, [datasetType, jobId, scopedJobIds, source, suggestedJobId])
 
   const refreshDashboard = useCallback(() => {
     if (typeof window === "undefined") return
@@ -348,7 +361,7 @@ function DataUpdationPanel() {
           value={jobId}
           onChange={(e) => setJobId(e.target.value)}
           list="data-job-id-suggestions"
-          placeholder="job_id tag (optional, blank creates a new auto-generated tag)"
+          placeholder="job_id tag (optional, defaults to the latest live tag)"
           className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-[11px]"
         />
         <datalist id="data-job-id-suggestions">
@@ -357,7 +370,7 @@ function DataUpdationPanel() {
           ))}
         </datalist>
         <p className="text-[10px] text-gray-500">
-          Leave this blank to create a new auto-generated job_id. Pick an existing tag only when you want to merge into that same dataset bucket.
+          Leave this blank to merge into the latest live tag for this source and dataset. Enter a custom job_id only when you intentionally want a separate bucket.
         </p>
         {scopedJobIds.length > 0 && (
           <div className="flex flex-wrap gap-1">
@@ -375,13 +388,13 @@ function DataUpdationPanel() {
                 {tag}
               </button>
             ))}
-            {jobId && (
+            {suggestedJobId && jobId !== suggestedJobId && (
               <button
                 type="button"
-                onClick={() => setJobId("")}
+                onClick={() => setJobId(suggestedJobId)}
                 className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-100"
               >
-                Use new auto tag
+                Use latest live tag
               </button>
             )}
           </div>
@@ -802,6 +815,19 @@ function FilterFilePanel() {
     return sorted[0]?.job_id || ""
   }, [matchingTags])
 
+  useEffect(() => {
+    const hasCurrentJob = jobId ? jobIdOptions.includes(jobId) : false
+    if (suggestedJobId) {
+      if (!hasCurrentJob) {
+        setJobId(suggestedJobId)
+      }
+      return
+    }
+    if (jobId && !hasCurrentJob) {
+      setJobId("")
+    }
+  }, [datasetType, jobId, jobIdOptions, source, suggestedJobId])
+
   const refreshDashboard = useCallback(() => {
     if (!applyToDb || typeof window === "undefined") return
     notifyDashboardDataRefresh()
@@ -1058,7 +1084,7 @@ function FilterFilePanel() {
             value={jobId}
             onChange={(e) => setJobId(e.target.value)}
             list="job-id-suggestions"
-            placeholder="job_id tag (optional, blank creates a new auto-generated tag when applied)"
+            placeholder="job_id tag (optional, defaults to the latest live tag when applied)"
             className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
           />
         </div>
@@ -1098,15 +1124,6 @@ function FilterFilePanel() {
                 Use latest tag
               </button>
             )}
-            {jobId && (
-              <button
-                type="button"
-                onClick={() => setJobId("")}
-                className="rounded-full border border-cyan-200 bg-cyan-50 px-2 py-0.5 text-[10px] font-semibold text-cyan-700 hover:bg-cyan-100"
-              >
-                Use new auto tag
-              </button>
-            )}
           </div>
         )}
 
@@ -1115,7 +1132,7 @@ function FilterFilePanel() {
         )}
 
         <p className="text-[10px] text-slate-500">
-          Leave job_id blank to create a fresh auto-generated tag when the file is applied to DB. Choose an existing tag only if the new file should merge into that same dataset.
+          Leave job_id blank to merge into the latest live tag for this source and dataset. Enter a custom job_id only if you intentionally want a separate dataset bucket.
         </p>
 
         {selectedTag && (

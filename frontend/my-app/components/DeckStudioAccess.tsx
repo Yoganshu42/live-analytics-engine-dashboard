@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Image from "next/image"
 import { useRouter } from "next/navigation"
-import { Download, ExternalLink, Loader2, Maximize2, X } from "lucide-react"
+import { ChevronDown, Download, ExternalLink, Loader2, Maximize2, X } from "lucide-react"
 
 import { downloadDeckPptx, fetchDateBounds } from "@/app/lib/api"
 import { buildGoogleSlidesEditUrl, getGoogleDriveAccessToken, uploadPptxAsGoogleSlides } from "@/app/lib/googleSlides"
@@ -14,6 +14,7 @@ type DatasetType = "sales" | "claims"
 
 type Props = {
   collapsed?: boolean
+  onToggleCollapse?: () => void
 }
 
 type PartnerOption = {
@@ -34,7 +35,10 @@ const PARTNERS: PartnerOption[] = [
   { key: "hitachi", label: "Hitachi", logo: "/hitachi_logo.png", cardLabel: "Hitachi" },
 ]
 
-export default function DeckStudioAccess({ collapsed = false }: Props) {
+export default function DeckStudioAccess({
+  collapsed = false,
+  onToggleCollapse,
+}: Props) {
   const router = useRouter()
   const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
   const [open, setOpen] = useState(false)
@@ -58,6 +62,7 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
   const [boundsRefreshTick, setBoundsRefreshTick] = useState(0)
   const lastAutoBoundsKeyRef = useRef("")
   const focusedPartner = selectedPartners.length === 1 ? selectedPartners[0] : null
+  const effectiveCollapsed = collapsed
 
   const canDownload = useMemo(
     () => selectedPartners.length > 0 && !isDownloading && !isOpeningSlides,
@@ -457,33 +462,29 @@ export default function DeckStudioAccess({ collapsed = false }: Props) {
 
   return (
     <>
-      <div className={`rounded-2xl border border-slate-200 bg-white p-2.5 shadow-sm sm:p-3 ${collapsed ? "md:px-1.5" : ""}`}>
-        <div className={`px-2 pb-2 text-[10px] font-black uppercase tracking-[0.18em] text-slate-400 ${collapsed ? "md:hidden" : ""}`}>
-          Deck Studio
+      <div className="rounded-2xl border border-slate-200 bg-white p-2.5 shadow-sm sm:p-3">
+        <div className="flex items-center justify-between gap-2 px-2 pb-2">
+          <div className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-400">
+            Deck Studio
+          </div>
+          {onToggleCollapse ? (
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-bold uppercase tracking-[0.08em] text-slate-500 transition hover:bg-slate-100"
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? "Expand deck studio" : "Collapse deck studio"}
+            >
+              <ChevronDown
+                size={12}
+                className={`transition-transform ${collapsed ? "-rotate-90" : ""}`}
+              />
+              {collapsed ? "Expand" : "Collapse"}
+            </button>
+          ) : null}
         </div>
 
-        {collapsed ? (
-          <div className="grid grid-cols-1 gap-2">
-            {PARTNERS.map((partner) => {
-              const active = focusedPartner === partner.key
-              return (
-                <button
-                  key={partner.key}
-                  type="button"
-                  onClick={() => openStudio([partner.key])}
-                  className={`flex items-center justify-center rounded-lg border px-1.5 py-2 transition ${
-                    active
-                      ? "border-[#1f6fe5] bg-[#eaf2ff]"
-                      : "border-slate-200 bg-white hover:bg-slate-50"
-                  }`}
-                  title={`Open ${partner.label} deck`}
-                >
-                  <Image src={partner.logo} alt={partner.label} width={34} height={14} className="h-4 w-8 object-contain" />
-                </button>
-              )
-            })}
-          </div>
-        ) : (
+        {!effectiveCollapsed && (
           <div className="mt-2 grid grid-cols-2 gap-2">
             {PARTNERS.map((partner) => {
               const active = focusedPartner === partner.key

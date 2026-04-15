@@ -11,7 +11,7 @@ if ([string]::IsNullOrWhiteSpace($ServerIP)) {
     $ServerIP = $env:LIVE_DASHBOARD_SERVER_IP
 }
 if ([string]::IsNullOrWhiteSpace($ServerIP)) {
-    $ServerIP = "13.235.56.166"
+    $ServerIP = "13.202.80.63"
 }
 
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
@@ -172,6 +172,10 @@ if ($parallelFailed) {
 # Step 4: Start services
 Write-Host "`n[4/4] Starting services..." -ForegroundColor Yellow
 Invoke-Ssh -CommandText "cd $remotePath && docker compose up -d && sleep 10 && docker compose ps" -FailureMessage "Failed to start docker services."
+
+Write-Host "  Installing daily refresh cron..." -ForegroundColor Gray
+$cronCommand = "30 22 * * * cd $remotePath && /usr/bin/docker compose exec -T backend python /app/daily_refresh.py >> $remotePath/deploy/logs/daily_refresh.log 2>&1 # live-dashboard-daily-refresh"
+Invoke-Ssh -CommandText "mkdir -p $remotePath/deploy/logs && (crontab -l 2>/dev/null | grep -v 'live-dashboard-daily-refresh'; echo '$cronCommand') | crontab -" -FailureMessage "Failed to install daily refresh cron."
 
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "DEPLOYMENT COMPLETE!" -ForegroundColor Green

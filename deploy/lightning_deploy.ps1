@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$serverIP = "13.235.56.166"
+$serverIP = "13.202.80.63"
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
 $remoteUser = "ubuntu"
 $remotePath = "/home/ubuntu/live-dashboard"
@@ -79,7 +79,7 @@ Write-Host "`n[4/5] Verifying deployment..." -ForegroundColor Yellow
 Start-Sleep -Seconds 5
 
 try {
-    $null = Invoke-RestMethod -Uri "http://${serverIP}:8000/health" -Method GET -TimeoutSec 10
+    $null = Invoke-RestMethod -Uri "http://${serverIP}/api/health" -Method GET -TimeoutSec 10
     Write-Host "  Backend: HEALTHY" -ForegroundColor Green
 }
 catch {
@@ -88,7 +88,7 @@ catch {
 }
 
 try {
-    $null = Invoke-WebRequest -Uri "http://${serverIP}:3000" -Method GET -TimeoutSec 10 -UseBasicParsing
+        $null = Invoke-WebRequest -Uri "http://${serverIP}/" -Method GET -TimeoutSec 10 -UseBasicParsing
     Write-Host "  Frontend: ACCESSIBLE" -ForegroundColor Green
 }
 catch {
@@ -101,9 +101,9 @@ Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "DEPLOYMENT COMPLETE!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host "`nAccess your application:" -ForegroundColor Cyan
-Write-Host "  Frontend:  http://${serverIP}:3000" -ForegroundColor White
-Write-Host "  Backend:   http://${serverIP}:8000" -ForegroundColor White
-Write-Host "  API Docs:  http://${serverIP}:8000/docs" -ForegroundColor White
+Write-Host "  Frontend:  http://${serverIP}/" -ForegroundColor White
+Write-Host "  Backend:   http://${serverIP}/api" -ForegroundColor White
+Write-Host "  API Docs:  http://${serverIP}/docs" -ForegroundColor White
 Write-Host "`nCredentials:" -ForegroundColor Cyan
 Write-Host "  Admin:    admin.user@zopper.com / admin123" -ForegroundColor White
 Write-Host "  Employee: employee.user@zopper.com / employee123" -ForegroundColor White

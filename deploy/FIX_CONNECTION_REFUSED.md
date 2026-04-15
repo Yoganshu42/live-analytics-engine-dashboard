@@ -17,7 +17,7 @@ AWS Security Group is blocking ports 3000 and 8000 from external access.
 
 ### Step 2: Find Your EC2 Instance
 1. Click **"Instances"** in the left sidebar
-2. Find instance with IP: **13.235.56.166**
+2. Find instance with IP: **13.202.80.63**
 3. Click on the instance ID
 
 ### Step 3: Edit Security Group
@@ -47,8 +47,8 @@ Click **"Add rule"** and add these TWO rules:
 
 ### Step 6: Test Access
 Open in your browser:
-- Frontend: http://13.235.56.166:3000
-- Backend: http://13.235.56.166:8000/health
+- Frontend: http://13.202.80.63:3000
+- Backend: http://13.202.80.63:8000/health
 
 ---
 
@@ -71,10 +71,10 @@ After adding the security group rules, run this to verify:
 
 ```powershell
 # Test backend
-curl http://13.235.56.166:8000/health
+curl http://13.202.80.63:8000/health
 
 # Test frontend (should return HTML)
-curl http://13.235.56.166:3000
+curl http://13.202.80.63:3000
 ```
 
 ---
@@ -96,16 +96,16 @@ Opening ports to `0.0.0.0/0` means anyone can access your application.
 Ask your AWS administrator to:
 1. Open port **8000** (TCP) for backend
 2. Open port **3000** (TCP) for frontend
-3. On security group for instance **13.235.56.166**
+3. On security group for instance **13.202.80.63**
 
 ---
 
 ## ✅ After Fixing
 
 Your app will be accessible at:
-- **Dashboard**: http://13.235.56.166:3000
-- **API**: http://13.235.56.166:8000
-- **Docs**: http://13.235.56.166:8000/docs
+- **Dashboard**: http://13.202.80.63:3000
+- **API**: http://13.202.80.63:8000
+- **Docs**: http://13.202.80.63:8000/docs
 
 Login with:
 - Email: `admin.user@zopper.com`

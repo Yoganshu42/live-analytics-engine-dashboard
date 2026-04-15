@@ -9,8 +9,10 @@ from sqlalchemy.orm import Session
 
 from models.data_rows import DataRow
 from routers.analytics import (
-    _normalize_source,
+    analytics_annual_comparison,
     analytics_date_bounds,
+    _normalize_source,
+    compute_date_bounds_payload,
     compute_by_dimension_rows,
     compute_summary_values,
 )
@@ -52,6 +54,11 @@ APPLIANCE_DIMENSIONS = [
     "channel",
     "product_category",
 ]
+CLAIMS_ANNUAL_METRICS = [
+    "claims",
+    "net_claims",
+    "loss_ratio",
+]
 
 
 def _normalize_dataset_type(value: str) -> str:
@@ -87,7 +94,7 @@ def _dimensions_for_source(source: str) -> list[str]:
         dimensions.extend(APPLIANCE_DIMENSIONS)
     if source == "reliance":
         # Reliance ResQ dashboard uses ARTICLE_BRAND sidecards; precompute to avoid live slowness.
-        dimensions.append("article_brand")
+        dimensions.extend(["article_brand", "brand"])
     return _dedupe_preserve(dimensions)
 
 
@@ -345,6 +352,51 @@ def rebuild_precomputed_analytics(
                             insights=insights,
                             model="rule-based-precomputed",
                         )
+
+            annual_metrics = [None] if normalized_dataset == "sales" else CLAIMS_ANNUAL_METRICS
+            for annual_metric in annual_metrics:
+                try:
+                    analytics_annual_comparison(
+                        job_id=job_id,
+                        source=src,
+                        dataset_type=normalized_dataset,
+                        metric=annual_metric,
+                        from_date=from_date,
+                        to_date=to_date,
+                        db=db,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed precompute annual comparison source=%s dataset=%s metric=%s from=%s to=%s",
+                        src,
+                        normalized_dataset,
+                        annual_metric or "sales",
+                        from_date,
+                        to_date,
+                    )
+        try:
+            date_bounds = compute_date_bounds_payload(
+                db=db,
+                source=src,
+                dataset_type=normalized_dataset,
+                job_id=job_id,
+            )
+            upsert_precomputed_summary(
+                db=db,
+                source=src,
+                dataset_type=f"{normalized_dataset}_date_bounds",
+                job_id=job_id,
+                from_date=None,
+                to_date=None,
+                summary=date_bounds if isinstance(date_bounds, dict) else {},
+            )
+        except Exception:
+            logger.exception(
+                "Failed precompute date bounds source=%s dataset=%s job_id=%s",
+                src,
+                normalized_dataset,
+                job_id,
+            )
         # Persist each source chunk independently to reduce long transaction pressure.
         db.commit()
 
@@ -363,25 +415,37 @@ def rebuild_precomputed_for_all_tags(
     source: str | None = None,
     dataset_type: str | None = None,
     job_id: str | None = None,
+    include_tagged_jobs: bool = True,
 ) -> dict[str, Any]:
-    query = db.query(DataRow.source, DataRow.dataset_type, DataRow.job_id).distinct()
     resolved_source = None
+    normalized_dataset = _normalize_dataset_type(dataset_type) if dataset_type else None
     if source:
         resolved_source, _ = _normalize_source(source)
+
+    if job_id is None and not include_tagged_jobs:
+        aggregate_only_query = db.query(DataRow.source, DataRow.dataset_type).distinct()
+        if resolved_source == "samsung":
+            aggregate_only_query = aggregate_only_query.filter(
+                DataRow.source.in_(["samsung", *SAMSUNG_PARTNER_SOURCES, "samsung_vijay_sales"])
+            )
+        elif resolved_source:
+            aggregate_only_query = aggregate_only_query.filter(DataRow.source == resolved_source)
+        if normalized_dataset:
+            aggregate_only_query = aggregate_only_query.filter(DataRow.dataset_type == normalized_dataset)
+        tags = [(src, ds, None) for src, ds in aggregate_only_query.all()]
+    else:
+        query = db.query(DataRow.source, DataRow.dataset_type, DataRow.job_id).distinct()
         if resolved_source == "samsung":
             query = query.filter(
                 DataRow.source.in_(["samsung", *SAMSUNG_PARTNER_SOURCES, "samsung_vijay_sales"])
             )
         elif resolved_source:
             query = query.filter(DataRow.source == resolved_source)
-
-    normalized_dataset = _normalize_dataset_type(dataset_type) if dataset_type else None
-    if normalized_dataset:
-        query = query.filter(DataRow.dataset_type == normalized_dataset)
-    if job_id is not None:
-        query = query.filter(DataRow.job_id == (job_id or None))
-
-    tags = list(query.all())
+        if normalized_dataset:
+            query = query.filter(DataRow.dataset_type == normalized_dataset)
+        if job_id is not None:
+            query = query.filter(DataRow.job_id == (job_id or None))
+        tags = list(query.all())
 
     # Also rebuild aggregate (no job filter) snapshots so dashboards without a selected tag
     # refresh correctly after tag-specific uploads.
@@ -402,6 +466,14 @@ def rebuild_precomputed_for_all_tags(
             if key not in existing:
                 tags.append(key)
                 existing.add(key)
+
+        if resolved_source == "samsung":
+            samsung_datasets = [normalized_dataset] if normalized_dataset else ["sales", "claims"]
+            for ds in samsung_datasets:
+                key = ("samsung", ds, None)
+                if key not in existing:
+                    tags.append(key)
+                    existing.add(key)
 
     completed = 0
     for src, ds, jb in tags:

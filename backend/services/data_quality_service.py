@@ -466,6 +466,19 @@ def _build_row_hash_payload(row: dict[str, Any], candidate_cols: list[str]) -> d
     return out or row
 
 
+def _use_row_fingerprint_claim_keys(
+    *,
+    source: str,
+    dataset_type: str,
+    key_column: str | None,
+) -> bool:
+    source_key = _normalize_source(source)
+    dataset_key = _normalize_dataset_type(dataset_type)
+    if source_key != "hitachi" or dataset_key != "claims":
+        return False
+    return _clean_key(key_column or "") == "callno"
+
+
 def _assign_record_instances(
     base_record_keys: list[str],
     rows: list[dict[str, Any]],
@@ -548,6 +561,15 @@ def prepare_rows_for_storage(
     active_strategy = "natural_column"
     active_key_columns: list[str] = [str(key_col)] if natural_key_selected and key_col else []
     active_uniqueness_ratio = float(key_meta.get("uniqueness_ratio") or 0.0)
+    row_fingerprint_claim_keys = (
+        natural_key_selected
+        and key_col is not None
+        and _use_row_fingerprint_claim_keys(
+            source=source_key,
+            dataset_type=dataset_key,
+            key_column=str(key_col),
+        )
+    )
 
     if not active_key_columns and composite_key_columns:
         active_strategy = "composite_candidate_columns"
@@ -561,7 +583,24 @@ def prepare_rows_for_storage(
         or ("claim_id" if dataset_key == "claims" else "plan_id")
     )
 
-    if active_strategy == "natural_column" and key_col:
+    if active_strategy == "natural_column" and key_col and row_fingerprint_claim_keys:
+        series = working_df[key_col]
+        missing_mask = _missing_mask(series)
+        missing_key_values = int(missing_mask.sum())
+        active_strategy = "natural_column_row_fingerprint"
+        for idx, row in enumerate(normalized_rows):
+            raw_value = "" if missing_mask.iloc[idx] else str(series.iloc[idx]).strip()
+            if raw_value:
+                key_payload = {
+                    "claim_key": raw_value,
+                    "row": row,
+                }
+                digest = _stable_hash(key_payload)
+                record_keys.append(f"{role}:row:{digest[:24]}")
+            else:
+                fallback_payload = _build_row_hash_payload(row, hash_candidates)
+                record_keys.append(f"{role}:row:{_stable_hash(fallback_payload)[:24]}")
+    elif active_strategy == "natural_column" and key_col:
         series = working_df[key_col]
         missing_mask = _missing_mask(series)
         missing_key_values = int(missing_mask.sum())
@@ -612,7 +651,7 @@ def prepare_rows_for_storage(
         "dataset_type": dataset_key,
         "primary_key_name": role,
         "strategy": active_strategy,
-        "key_column": key_col if active_strategy == "natural_column" else None,
+        "key_column": key_col if active_strategy.startswith("natural_column") else None,
         "key_columns": active_key_columns,
         "key_candidates": get_primary_key_candidate_order(source=source_key, dataset_type=dataset_key),
         "rows_in": int(len(normalized_rows)),

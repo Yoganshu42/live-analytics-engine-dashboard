@@ -13,3 +13,4 @@ bcrypt==4.1.2
 email-validator
 python-pptx
 matplotlib
+orjson

@@ -75,7 +75,7 @@ def classify_samsung_plan_key(value: Any) -> str:
         return "combo"
     if "adld" in text or "accidental" in text or "liquid" in text:
         return "adld"
-    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text:
+    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text or "protect max" in text:
         return "screen_protection"
     if re.search(r"\bew\b", text) or "extended warranty" in text or text.startswith("ew") or "warranty" in text:
         return "ew"
@@ -135,6 +135,36 @@ def _pick_labeled_date(
     return candidates[0]
 
 
+def infer_samsung_plan_tenure_months(plan_type: Any, default: int = 12) -> int:
+    text = re.sub(r"\s+", " ", _clean_text(plan_type).lower())
+    if text:
+        if re.search(r"2\s*yr|2\s*year|24\s*m|24\s*month", text):
+            return 24
+        if re.search(r"6\s*m|6\s*month", text):
+            return 6
+        if re.search(r"1\s*yr|1\s*year|12\s*m|12\s*month", text):
+            return 12
+
+    plan_key = classify_samsung_plan_key(plan_type)
+    if plan_key == "combo":
+        return 24
+    if plan_key in {"adld", "screen_protection", "ew"}:
+        return 12
+    return default
+
+
+def _derive_plan_end_from_tenure(start_dt: pd.Timestamp, tenure_months: int) -> pd.Timestamp:
+    if pd.isna(start_dt):
+        return pd.NaT
+    try:
+        months = int(tenure_months or 0)
+    except Exception:
+        months = 0
+    if months <= 0:
+        return pd.NaT
+    return pd.Timestamp(start_dt) + pd.DateOffset(months=months) - pd.Timedelta(days=1)
+
+
 def resolve_samsung_plan_window(
     *,
     plan_type: Any,
@@ -157,6 +187,11 @@ def resolve_samsung_plan_window(
             start_dt = start_direct if not pd.isna(start_direct) else transaction_dt
         if pd.isna(end_dt):
             end_dt = end_direct
+        if pd.isna(end_dt) or (not pd.isna(start_dt) and not pd.isna(end_dt) and end_dt <= start_dt):
+            end_dt = _derive_plan_end_from_tenure(
+                start_dt,
+                infer_samsung_plan_tenure_months(plan_type, default=24),
+            )
         return start_dt, end_dt
 
     preferred_keys = {
@@ -172,7 +207,12 @@ def resolve_samsung_plan_window(
         start_dt = start_direct
     if pd.isna(end_dt):
         end_dt = end_direct
-    if pd.isna(start_dt) and plan_key in {"adld", "screen_protection"} and not pd.isna(transaction_dt):
+    if pd.isna(start_dt) and plan_key in {"adld", "screen_protection", "ew", "combo"} and not pd.isna(transaction_dt):
         start_dt = transaction_dt
+    if pd.isna(end_dt) or (not pd.isna(start_dt) and not pd.isna(end_dt) and end_dt <= start_dt):
+        end_dt = _derive_plan_end_from_tenure(
+            start_dt,
+            infer_samsung_plan_tenure_months(plan_type, default=12),
+        )
 
     return start_dt, end_dt

@@ -9,7 +9,7 @@ import {
   Maximize2,
   Activity,
   LogOut,
-  ChevronRight
+  ChevronRight,
 } from "lucide-react"
 
 import Sidebar from "@/components/Sidebar"
@@ -17,7 +17,11 @@ import Tabs from "@/components/Tabs"
 import { clearGraphDataCache } from "@/components/GraphView"
 import DateRangePicker from "@/components/DateRangePicker"
 import HomeParticleField from "@/components/HomeParticleField"
-import { fetchDateBounds, fetchAuthMe } from "./lib/api"
+import {
+  clearMasterDashboardCache,
+  fetchDateBounds,
+  fetchAuthMe,
+} from "./lib/api"
 import { normalizeSamsungSource } from "@/lib/samsungPartners"
 
 const GraphSection = dynamic(() => import("@/components/GraphSection"), {
@@ -247,6 +251,17 @@ export default function DashboardPage() {
     return { from: nextTo, to: nextFrom }
   }, [clampToCurrentMonth])
 
+  const readActiveJobId = useCallback(() => {
+    if (typeof window === "undefined") return null
+    const useJobFilter = localStorage.getItem("use_job_filter") === "1"
+    const rawJobId = (localStorage.getItem("job_id") || "").trim()
+    return (
+      useJobFilter && rawJobId && rawJobId !== "null" && rawJobId !== "undefined" && rawJobId !== "all"
+        ? rawJobId
+        : null
+    )
+  }, [])
+
   const router = useRouter()
   const [initialDashboardState] = useState<InitialDashboardState>(() => {
     if (typeof window === "undefined") {
@@ -266,12 +281,7 @@ export default function DashboardPage() {
     const storedFrom = localStorage.getItem("dashboard_from_date") || ""
     const storedTo = localStorage.getItem("dashboard_to_date") || ""
 
-    const useJobFilter = localStorage.getItem("use_job_filter") === "1"
-    const rawJobId = (localStorage.getItem("job_id") || "").trim()
-    const jobId =
-      useJobFilter && rawJobId && rawJobId !== "null" && rawJobId !== "undefined" && rawJobId !== "all"
-        ? rawJobId
-        : null
+    const jobId = readActiveJobId()
 
     const normalizedBrand = storedBrand ? normalizeBrand(storedBrand) : "samsung"
     const normalizedMode: "sales" | "claims" = storedMode === "claims" ? "claims" : "sales"
@@ -301,7 +311,7 @@ export default function DashboardPage() {
     return localStorage.getItem("dashboard_sidebar_collapsed") === "1"
   })
   const [isLoggingOut, setIsLoggingOut] = useState(false)
-  const [jobId] = useState<string | null>(initialDashboardState.jobId)
+  const [jobId, setJobId] = useState<string | null>(initialDashboardState.jobId)
   const effectiveJobId = jobId
   const [authRole, setAuthRole] = useState<"admin" | "employee" | null>(() => {
     if (typeof window === "undefined") return null
@@ -427,10 +437,44 @@ export default function DashboardPage() {
     }
   }, [isMobileViewport, view])
 
-  const forceFilterRefresh = useCallback(() => {
+  const invalidateDashboardData = useCallback(() => {
     clearGraphDataCache()
+    clearMasterDashboardCache()
     setFilterRefreshTick((prev) => prev + 1)
   }, [])
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+
+    const syncDashboardRefreshState = () => {
+      const nextJobId = readActiveJobId()
+      setJobId((prev) => (prev === nextJobId ? prev : nextJobId))
+      setDefaultKey("")
+      invalidateDashboardData()
+    }
+
+    const handleDashboardDataRefreshed = () => {
+      syncDashboardRefreshState()
+    }
+
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        event.key === null
+        || event.key === "job_id"
+        || event.key === "use_job_filter"
+        || event.key === "dashboard_data_refresh_at"
+      ) {
+        syncDashboardRefreshState()
+      }
+    }
+
+    window.addEventListener("dashboard-data-refreshed", handleDashboardDataRefreshed as EventListener)
+    window.addEventListener("storage", handleStorage)
+    return () => {
+      window.removeEventListener("dashboard-data-refreshed", handleDashboardDataRefreshed as EventListener)
+      window.removeEventListener("storage", handleStorage)
+    }
+  }, [invalidateDashboardData, readActiveJobId])
 
   const todayIso = useCallback(() => new Date().toISOString().slice(0, 10), [])
 
@@ -454,7 +498,7 @@ export default function DashboardPage() {
       localStorage.setItem("dashboard_to_date", "")
       localStorage.setItem("dashboard_fullscreen", "0")
     }
-    forceFilterRefresh()
+    invalidateDashboardData()
   }
 
   useEffect(() => {
@@ -501,6 +545,25 @@ export default function DashboardPage() {
 
     return () => { active = false }
   }, [router])
+
+  useEffect(() => {
+    if (!authReady) return
+    void import("@/components/GraphSection")
+    void import("@/components/KpiCardsRow")
+    void import("@/components/MasterDashboardView")
+  }, [authReady])
+
+  useEffect(() => {
+    if (!authReady || !brand || !mode) return
+
+    fetchDateBounds({
+      job_id: effectiveJobId || undefined,
+      source: brand,
+      dataset_type: mode,
+    }).catch(() => {
+      // Date bounds still load through the main dashboard flow if prefetch misses.
+    })
+  }, [authReady, brand, mode, effectiveJobId])
 
   useEffect(() => { localStorage.setItem("dashboard_view", view) }, [view])
   useEffect(() => {
@@ -564,8 +627,13 @@ export default function DashboardPage() {
         setDefaultKey(nextKey)
 
         const isNewKeyLoad = snapshot.defaultKey !== nextKey
+        const hadNoExplicitRange = !snapshot.fromDate && !snapshot.toDate
+        const matchedPreviousDefault =
+          Boolean(snapshot.defaultFromDate || snapshot.defaultToDate)
+          && snapshot.fromDate === snapshot.defaultFromDate
+          && snapshot.toDate === snapshot.defaultToDate
 
-        if (isNewKeyLoad) {
+        if (isNewKeyLoad || hadNoExplicitRange || matchedPreviousDefault) {
           setFromDate(defaultRange.from)
           setToDate(defaultRange.to)
           setDraftFromDate(defaultRange.from)
@@ -631,7 +699,7 @@ export default function DashboardPage() {
       localStorage.setItem("dashboard_view", "dashboard")
       localStorage.setItem("dashboard_fullscreen", "0")
     }
-    forceFilterRefresh()
+    invalidateDashboardData()
   }
 
   const handleViewChange = (nextView: "home" | "master" | "dashboard") => {
@@ -682,22 +750,30 @@ export default function DashboardPage() {
       fromDate || defaultFromDate,
       toDate || defaultToDate
     )
+    if (next.from === fromDate && next.to === toDate) {
+      setDraftFromDate(next.from)
+      setDraftToDate(next.to)
+      return
+    }
     setDraftFromDate(next.from)
     setDraftToDate(next.to)
     setFromDate(next.from)
     setToDate(next.to)
     persistCurrentDashboardContext()
-    forceFilterRefresh()
   }
 
   const resetDateRange = useCallback(() => {
     if (!defaultFromDate && !defaultToDate) {
+      if (!fromDate && !toDate) {
+        setDraftFromDate("")
+        setDraftToDate("")
+        return
+      }
       setFromDate("")
       setToDate("")
       setDraftFromDate("")
       setDraftToDate("")
       persistCurrentDashboardContext()
-      forceFilterRefresh()
       return
     }
     const defaultUpper = todayIso()
@@ -712,8 +788,7 @@ export default function DashboardPage() {
     setDraftFromDate(resetRange.from)
     setDraftToDate(resetRange.to)
     persistCurrentDashboardContext()
-    forceFilterRefresh()
-  }, [defaultFromDate, defaultToDate, fromDate, todayIso, normalizeDateRange, forceFilterRefresh, persistCurrentDashboardContext])
+  }, [defaultFromDate, defaultToDate, fromDate, toDate, todayIso, normalizeDateRange, persistCurrentDashboardContext])
 
   const brandLabel = (value: string) => {
     const labels: Record<string, string> = {

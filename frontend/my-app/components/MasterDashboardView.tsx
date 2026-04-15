@@ -24,7 +24,11 @@ import {
 } from "recharts"
 
 import DateRangePicker from "@/components/DateRangePicker"
-import { fetchMasterDashboard, type MasterDashboardResponse } from "@/app/lib/api"
+import {
+  clearMasterDashboardCache,
+  fetchMasterDashboard,
+  type MasterDashboardResponse,
+} from "@/app/lib/api"
 import { VISIBLE_SAMSUNG_PARTNERS, type SamsungPartnerKey } from "@/lib/samsungPartners"
 
 type Props = {
@@ -310,15 +314,65 @@ const mergeSeries = (seriesByKey: Record<string, Map<string, MonthPoint>>) => {
   return [buildZeroRow(prev), merged[0], buildZeroRow(next)]
 }
 
-const sumSeriesValues = (series: Map<string, MonthPoint>) =>
-  Array.from(series.values()).reduce((acc, point) => acc + asNumber(point.value), 0)
-
 const toKpis = (sales: Summary | null, claims: Summary | null): KpiValues => ({
   gross: asNumber(sales?.gross_premium),
   earned: asNumber(sales?.earned_premium),
   zopper: asNumber(sales?.zopper_earned_premium),
   claims: asNumber(claims?.gross_premium),
 })
+
+const sumMetricRows = (
+  rows: Array<Record<string, unknown>>,
+  metric: string
+) => rows.reduce((total, row) => total + metricFromRow(row, metric), 0)
+
+const toLiveKpis = ({
+  salesSummary,
+  claimsSummary,
+  grossRows,
+  earnedRows,
+  zopperRows,
+  claimsRows,
+}: {
+  salesSummary: Summary | null
+  claimsSummary: Summary | null
+  grossRows: Array<Record<string, unknown>>
+  earnedRows: Array<Record<string, unknown>>
+  zopperRows: Array<Record<string, unknown>>
+  claimsRows: Array<Record<string, unknown>>
+}): KpiValues => ({
+  gross: grossRows.length ? sumMetricRows(grossRows, "gross_premium") : asNumber(salesSummary?.gross_premium),
+  earned: earnedRows.length ? sumMetricRows(earnedRows, "earned_premium") : asNumber(salesSummary?.earned_premium),
+  zopper: zopperRows.length ? sumMetricRows(zopperRows, "zopper_earned_premium") : asNumber(salesSummary?.zopper_earned_premium),
+  claims: claimsRows.length ? sumMetricRows(claimsRows, "claims") : asNumber(claimsSummary?.gross_premium),
+})
+
+const toSummaryFirstKpis = ({
+  salesSummary,
+  claimsSummary,
+  grossRows,
+  earnedRows,
+  zopperRows,
+  claimsRows,
+}: {
+  salesSummary: Summary | null
+  claimsSummary: Summary | null
+  grossRows: Array<Record<string, unknown>>
+  earnedRows: Array<Record<string, unknown>>
+  zopperRows: Array<Record<string, unknown>>
+  claimsRows: Array<Record<string, unknown>>
+}): KpiValues => (
+  hasSummaryPayload(salesSummary) || hasSummaryPayload(claimsSummary)
+    ? toKpis(salesSummary, claimsSummary)
+    : toLiveKpis({
+        salesSummary,
+        claimsSummary,
+        grossRows,
+        earnedRows,
+        zopperRows,
+        claimsRows,
+      })
+)
 
 const addKpis = (a: KpiValues, b: KpiValues): KpiValues => ({
   gross: a.gross + b.gross,
@@ -327,12 +381,8 @@ const addKpis = (a: KpiValues, b: KpiValues): KpiValues => ({
   claims: a.claims + b.claims,
 })
 
-const EMPTY_KPIS: KpiValues = {
-  gross: 0,
-  earned: 0,
-  zopper: 0,
-  claims: 0,
-}
+const hasSummaryPayload = (summary: Summary | null | undefined) =>
+  Boolean(summary) && Object.values(summary || {}).some((value) => Math.abs(asNumber(value)) > 0)
 
 const hasChartSignal = (
   rows: Array<Record<string, number | string>>,
@@ -342,7 +392,6 @@ const hasChartSignal = (
 const SAMSUNG_MASTER_PREFIX: Record<SamsungPartnerKey, string> = {
   samsung_vs: "vs",
   samsung_croma: "croma",
-  samsung_croma_dsdsg: "croma_dsdsg",
   samsung_reliance_digital: "reliance_digital",
 }
 
@@ -350,6 +399,8 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
   const summaries = payload?.summaries || {}
   const rows = payload?.rows || {}
 
+  const samsungSalesSummary = summaries.samsung_sales || {}
+  const samsungClaimsSummary = summaries.samsung_claims || {}
   const relianceSalesSummary = summaries.reliance_sales || {}
   const godrejSalesSummary = summaries.godrej_sales || {}
   const hitachiSalesSummary = summaries.hitachi_sales || {}
@@ -397,6 +448,10 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
 
   const samsungSalesRows = mergeSeries(samsungSalesSeries)
   const samsungClaimsChartRows = mergeSeries(samsungClaimsSeries)
+  const samsungGrossRows = samsungPartnerSnapshots.flatMap((snapshot) => snapshot.grossRows)
+  const samsungEarnedRows = samsungPartnerSnapshots.flatMap((snapshot) => snapshot.earnedRows)
+  const samsungZopperRows = samsungPartnerSnapshots.flatMap((snapshot) => snapshot.zopperRows)
+  const samsungClaimsRows = samsungPartnerSnapshots.flatMap((snapshot) => snapshot.claimsRows)
 
   const relianceSalesRows = mergeSeries({
     gross: toMonthlySeries(relianceGrossRows, "gross_premium"),
@@ -428,47 +483,39 @@ const toMasterData = (payload: MasterDashboardResponse): MasterData => {
     claims: toMonthlySeries(hitachiClaimsRows, "claims"),
   })
 
-  const samsungKpisBase = samsungPartnerSnapshots.reduce(
-    (acc, snapshot) => addKpis(acc, toKpis(snapshot.salesSummary as Summary, snapshot.claimsSummary as Summary)),
-    EMPTY_KPIS
-  )
+  const samsungKpis = toSummaryFirstKpis({
+    salesSummary: samsungSalesSummary as Summary,
+    claimsSummary: samsungClaimsSummary as Summary,
+    grossRows: samsungGrossRows,
+    earnedRows: samsungEarnedRows,
+    zopperRows: samsungZopperRows,
+    claimsRows: samsungClaimsRows,
+  })
 
-  const samsungSummaryEarned = samsungPartnerSnapshots.reduce(
-    (sum, snapshot) => sum + asNumber((snapshot.salesSummary as Summary)?.earned_premium),
-    0
-  )
-  const samsungSummaryZopper = samsungPartnerSnapshots.reduce(
-    (sum, snapshot) => sum + asNumber((snapshot.salesSummary as Summary)?.zopper_earned_premium),
-    0
-  )
-  const samsungEarnedFromRows = samsungPartnerSnapshots.reduce(
-    (sum, snapshot) => sum + sumSeriesValues(samsungSalesSeries[`${snapshot.prefix}_earned`]),
-    0
-  )
-  const samsungZopperFromRows = samsungPartnerSnapshots.reduce(
-    (sum, snapshot) => sum + sumSeriesValues(samsungSalesSeries[`${snapshot.prefix}_zopper`]),
-    0
-  )
-  const hasSamsungEarnedRows = samsungPartnerSnapshots.some(
-    (snapshot) => samsungSalesSeries[`${snapshot.prefix}_earned`].size > 0
-  )
-  const hasSamsungZopperRows = samsungPartnerSnapshots.some(
-    (snapshot) => samsungSalesSeries[`${snapshot.prefix}_zopper`].size > 0
-  )
-
-  const samsungKpis: KpiValues = {
-    ...samsungKpisBase,
-    earned: samsungSummaryEarned > 0
-      ? samsungSummaryEarned
-      : (hasSamsungEarnedRows ? samsungEarnedFromRows : samsungKpisBase.earned),
-    zopper: samsungSummaryZopper > 0
-      ? samsungSummaryZopper
-      : (hasSamsungZopperRows ? samsungZopperFromRows : samsungKpisBase.zopper),
-  }
-
-  const relianceKpis = toKpis(relianceSalesSummary as Summary, relianceClaimsSummary as Summary)
-  const godrejKpis = toKpis(godrejSalesSummary as Summary, godrejClaimsSummary as Summary)
-  const hitachiKpis = toKpis(hitachiSalesSummary as Summary, hitachiClaimsSummary as Summary)
+  const relianceKpis = toSummaryFirstKpis({
+    salesSummary: relianceSalesSummary as Summary,
+    claimsSummary: relianceClaimsSummary as Summary,
+    grossRows: relianceGrossRows,
+    earnedRows: relianceEarnedRows,
+    zopperRows: relianceZopperRows,
+    claimsRows: relianceClaimsRows,
+  })
+  const godrejKpis = toSummaryFirstKpis({
+    salesSummary: godrejSalesSummary as Summary,
+    claimsSummary: godrejClaimsSummary as Summary,
+    grossRows: godrejGrossRows,
+    earnedRows: godrejEarnedRows,
+    zopperRows: godrejZopperRows,
+    claimsRows: godrejClaimsRows,
+  })
+  const hitachiKpis = toSummaryFirstKpis({
+    salesSummary: hitachiSalesSummary as Summary,
+    claimsSummary: hitachiClaimsSummary as Summary,
+    grossRows: hitachiGrossRows,
+    earnedRows: hitachiEarnedRows,
+    zopperRows: hitachiZopperRows,
+    claimsRows: hitachiClaimsRows,
+  })
   const totals = addKpis(addKpis(addKpis(samsungKpis, relianceKpis), godrejKpis), hitachiKpis)
 
   return {
@@ -569,6 +616,9 @@ export default function MasterDashboardView({
   const [draftToDate, setDraftToDate] = useState("")
   const [localRefreshTick, setLocalRefreshTick] = useState(0)
   const lastAutoSyncKeyRef = useRef("")
+  const requestSequenceRef = useRef(0)
+  const activeRequestRef = useRef(0)
+  const requestAbortRef = useRef<AbortController | null>(null)
   const prefersReducedMotion = useReducedMotion()
 
   const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), [])
@@ -589,9 +639,16 @@ export default function MasterDashboardView({
     async (
       nextFromDate?: string,
       nextToDate?: string,
-      options?: { silent?: boolean }
+      options?: { silent?: boolean; forceFresh?: boolean }
     ) => {
       const silent = Boolean(options?.silent)
+      const forceFresh = Boolean(options?.forceFresh)
+      const requestId = requestSequenceRef.current + 1
+      requestSequenceRef.current = requestId
+      activeRequestRef.current = requestId
+      requestAbortRef.current?.abort()
+      const controller = new AbortController()
+      requestAbortRef.current = controller
       if (!silent) {
         setLoading(true)
         setError(null)
@@ -601,23 +658,43 @@ export default function MasterDashboardView({
         if (jobId) params.job_id = jobId
         if (nextFromDate) params.from_date = nextFromDate
         if (nextToDate) params.to_date = nextToDate
-        const payload = await fetchMasterDashboard(params)
+        const payload = await fetchMasterDashboard(params, {
+          signal: controller.signal,
+          forceFresh,
+        })
+        if (controller.signal.aborted || requestId !== activeRequestRef.current) {
+          return null
+        }
         setData(toMasterData(payload))
+        setError(null)
         return payload
       } catch (err) {
+        const aborted =
+          controller.signal.aborted
+          || (err instanceof Error && err.name === "AbortError")
+          || requestId !== activeRequestRef.current
+        if (aborted) {
+          return null
+        }
         console.error("Master dashboard load failed:", err)
         if (!silent) {
           setError("Unable to load Master Dashboard data.")
         }
         return null
       } finally {
-        if (!silent) {
+        if (requestId === activeRequestRef.current && !controller.signal.aborted) {
           setLoading(false)
         }
       }
     },
     [jobId]
   )
+
+  useEffect(() => {
+    return () => {
+      requestAbortRef.current?.abort()
+    }
+  }, [])
 
   useEffect(() => {
     let isCancelled = false
@@ -642,7 +719,10 @@ export default function MasterDashboardView({
       setDraftToDate(nextTo)
 
       if ((orderedExternalRange.from || orderedExternalRange.to) && (nextFrom !== effectiveMin || nextTo !== max)) {
-        void loadMasterData(nextFrom || undefined, nextTo || undefined, { silent: true })
+        void loadMasterData(nextFrom || undefined, nextTo || undefined, {
+          silent: true,
+          forceFresh: true,
+        })
       }
     }
 
@@ -658,6 +738,7 @@ export default function MasterDashboardView({
   useEffect(() => {
     if (typeof window === "undefined") return
     const handleRefresh = () => {
+      clearMasterDashboardCache()
       setLocalRefreshTick((prev) => prev + 1)
     }
     const handleStorage = (event: StorageEvent) => {
@@ -674,23 +755,30 @@ export default function MasterDashboardView({
   }, [])
 
   useEffect(() => {
+    const hasResolvedBaseRange = Boolean(defaultFromDate || defaultToDate)
+    const hasExternalRange = Boolean(orderedExternalRange.from || orderedExternalRange.to)
+    if (!hasResolvedBaseRange && !hasExternalRange) return
+
     const nextFrom = orderedExternalRange.from || defaultFromDate
-    const nextTo = orderedExternalRange.to || defaultToDate || todayIso
+    const nextTo = orderedExternalRange.to || defaultToDate
     if (!nextFrom && !nextTo) return
+
     const requestKey = toRequestKey(jobId, nextFrom || undefined, nextTo || undefined)
     const syncKey = `${requestKey}|${refreshTick}|${localRefreshTick}`
     if (syncKey === lastAutoSyncKeyRef.current) return
     setDraftFromDate(nextFrom)
     setDraftToDate(nextTo)
     lastAutoSyncKeyRef.current = syncKey
-    void loadMasterData(nextFrom || undefined, nextTo || undefined, { silent: true })
+    void loadMasterData(nextFrom || undefined, nextTo || undefined, {
+      silent: true,
+      forceFresh: localRefreshTick > 0,
+    })
   }, [
     jobId,
     orderedExternalRange.from,
     orderedExternalRange.to,
     defaultFromDate,
     defaultToDate,
-    todayIso,
     refreshTick,
     localRefreshTick,
     loadMasterData,
@@ -706,7 +794,7 @@ export default function MasterDashboardView({
     if (onDateRangeApply) {
       onDateRangeApply(orderedFrom, orderedTo)
     }
-    await loadMasterData(orderedFrom || undefined, orderedTo || undefined)
+    await loadMasterData(orderedFrom || undefined, orderedTo || undefined, { forceFresh: true })
   }
 
   const handleResetDateRange = async () => {
@@ -715,7 +803,7 @@ export default function MasterDashboardView({
     if (onDateRangeApply) {
       onDateRangeApply(defaultFromDate, defaultToDate)
     }
-    await loadMasterData(defaultFromDate || undefined, defaultToDate || undefined)
+    await loadMasterData(defaultFromDate || undefined, defaultToDate || undefined, { forceFresh: true })
   }
 
   const samsungSeriesMeta = VISIBLE_SAMSUNG_PARTNERS.map((partner) => ({
@@ -742,6 +830,7 @@ export default function MasterDashboardView({
     (chartId: ExpandableChartId, expanded = false) => {
       if (!data) return null
       const chartHeight = expanded ? 540 : 320
+      const animateCharts = !prefersReducedMotion && expanded
 
       if (chartId === "samsung-premium") {
         return (
@@ -782,7 +871,7 @@ export default function MasterDashboardView({
                     name={`${series.shortLabel} Gross Premium`}
                     stroke={series.color}
                     strokeWidth={2.4}
-                    isAnimationActive={!prefersReducedMotion}
+                    isAnimationActive={animateCharts}
                     dot={<ArrowPointDot />}
                     activeDot={{ r: 5 }}
                   />
@@ -811,7 +900,7 @@ export default function MasterDashboardView({
                     name={`${series.shortLabel} Claims Cost`}
                     stroke={series.color}
                     strokeWidth={2.4}
-                    isAnimationActive={!prefersReducedMotion}
+                    isAnimationActive={animateCharts}
                     dot={<ArrowPointDot />}
                     activeDot={{ r: 5 }}
                   />
@@ -832,9 +921,9 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -851,7 +940,7 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -868,9 +957,9 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -887,7 +976,7 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -904,9 +993,9 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="gross" name="Gross Premium" stroke="#2563eb" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" name="Earned Premium" stroke="#0ea5a4" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="zopper" name="Zopper Earned Premium" stroke="#8b5cf6" strokeWidth={2.3} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -923,7 +1012,7 @@ export default function MasterDashboardView({
                 <YAxis tickFormatter={axisMoney} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(value: unknown) => money(asNumber(value))} />
                 <Legend />
-                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={!prefersReducedMotion} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="claims" name="Claims Cost" stroke="#ef4444" strokeWidth={2.4} isAnimationActive={animateCharts} dot={<ArrowPointDot />} activeDot={{ r: 5 }} />
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -988,7 +1077,7 @@ export default function MasterDashboardView({
         {!loading && !error && data && (
           <div className="space-y-6">
             <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-              <KpiStrip title="Samsung KPI (Vijay Sales + Croma + Croma DS/DSG + Reliance Digital)" values={data.samsung.kpis} showTotalLossRatio />
+              <KpiStrip title="Samsung KPI (Vijay Sales + Croma + Reliance Digital)" values={data.samsung.kpis} showTotalLossRatio />
               <div className={`mt-4 grid grid-cols-1 gap-4 ${showSamsungClaimsChart ? "lg:grid-cols-2" : ""}`}>
                 <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                   <div className="mb-2 flex items-center justify-between gap-3">

@@ -7,8 +7,10 @@ import logging
 import threading
 
 from fastapi import APIRouter, Query, Depends
+from fastapi.responses import ORJSONResponse
 import pandas as pd
-from sqlalchemy import func
+from pydantic import BaseModel, Field
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from collections import Counter
 from datetime import datetime
@@ -23,7 +25,7 @@ from services.analytics_engine import (
 )
 from models.data_rows import DataRow
 from models.manual_updates import ManualUpdateMarker
-from models.precomputed_analytics import PrecomputedSummary
+from models.precomputed_analytics import PrecomputedGraph, PrecomputedSummary
 from services.precomputed_repository import (
     get_precomputed_graph,
     get_precomputed_summary,
@@ -31,17 +33,163 @@ from services.precomputed_repository import (
     upsert_precomputed_summary,
 )
 from services.manual_update_service import mark_manual_update
+from services.admin_upload_service import get_latest_available_job_id
+from services.forecast_service import build_forecast_response
 from services.samsung_partner_config import (
     SAMSUNG_PARTNER_SOURCES,
     SAMSUNG_SOURCE_VARIANTS,
     normalize_samsung_source,
 )
-router = APIRouter(prefix="/analytics", tags=["analytics"])
+router = APIRouter(
+    prefix="/analytics",
+    tags=["analytics"],
+    default_response_class=ORJSONResponse,
+)
 logger = logging.getLogger(__name__)
 APPLIANCE_SOURCES = {"godrej", "hitachi"}
 
 _master_rebuild_lock = threading.Lock()
 _master_rebuild_inflight: set[str] = set()
+_summary_rebuild_lock = threading.Lock()
+_summary_rebuild_inflight: set[str] = set()
+_graph_rebuild_lock = threading.Lock()
+_graph_rebuild_inflight: set[str] = set()
+_batch_engine_state = threading.local()
+_DATE_BOUNDS_CACHE_DATASET_SUFFIX = "_date_bounds"
+_DATE_BOUNDS_METRIC_CANDIDATES: dict[str, list[str]] = {
+    "sales": [
+        "quantity",
+        "gross_premium",
+        "earned_premium",
+        "zopper_earned_premium",
+    ],
+    "claims": [
+        "quantity",
+        "claims",
+        "net_claims",
+        "loss_ratio",
+    ],
+}
+_ANNUAL_COMPARISON_DIMENSION = "annual_comparison"
+_ANNUAL_COMPARISON_CACHE_BUCKET = "compact_v3"
+_ANNUAL_SALES_SUMMARY_METRICS = [
+    "gross_premium",
+    "earned_premium",
+    "zopper_earned_premium",
+]
+_ANNUAL_SUPPORTED_CLAIMS_METRICS = {
+    "claims",
+    "net_claims",
+    "loss_ratio",
+    "quantity",
+}
+_SALES_SCOPING_CACHE_UPDATED_AT = datetime.fromisoformat("2026-03-29T17:43:21+05:30")
+_RELIANCE_BRAND_CACHE_UPDATED_AT = datetime.fromisoformat("2026-03-30T10:43:16+05:30")
+_HITACHI_PLAN_CACHE_UPDATED_AT = datetime.fromisoformat("2026-03-30T23:15:00+05:30")
+_MASTER_DASHBOARD_CACHE_UPDATED_AT = datetime.fromisoformat("2026-04-13T10:30:00+05:30")
+_SUMMARY_SCOPE_REFRESH_SOURCES = {
+    "samsung",
+    "samsung_vs",
+    "samsung_vijay_sales",
+    "samsung_croma",
+    "samsung_reliance_digital",
+    "reliance",
+    "godrej",
+}
+_GRAPH_SCOPE_REFRESH_SOURCES = {
+    "reliance",
+}
+
+
+def _annual_comparison_cache_bucket(source: str) -> str:
+    # Samsung annual overview payloads before this fix could be built from a
+    # stale or duplicated partner merge, so force a fresh cache namespace for
+    # that source.
+    if source == "samsung":
+        return "compact_v7"
+    if source == "hitachi":
+        return "compact_v5"
+    return _ANNUAL_COMPARISON_CACHE_BUCKET
+
+
+class ByDimensionBatchItem(BaseModel):
+    request_key: str | None = None
+    job_id: str | None = None
+    dimension: str
+    metric: str
+    source: str
+    dataset_type: str
+    bucket: str | None = None
+    from_date: str | None = None
+    to_date: str | None = None
+    filter_1_dimension: str | None = None
+    filter_1_values: str | None = None
+    filter_2_dimension: str | None = None
+    filter_2_values: str | None = None
+
+
+class ByDimensionBatchPayload(BaseModel):
+    requests: list[ByDimensionBatchItem] = Field(default_factory=list)
+
+
+def _get_active_batch_engine_cache() -> dict[tuple[str, ...], Any] | None:
+    cache = getattr(_batch_engine_state, "engines", None)
+    return cache if isinstance(cache, dict) else None
+
+
+def _get_or_create_batch_engine(
+    *,
+    engine_cls: type,
+    engine_key: str,
+    source: str,
+    job_id: str | None,
+    dataset_type: str,
+    from_date: str | None,
+    to_date: str | None,
+    allow_shared: bool,
+    db: Session,
+):
+    if not allow_shared:
+        return engine_cls(
+            db=db,
+            job_id=job_id,
+            source=source,
+            dataset_type=dataset_type,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
+    cache = _get_active_batch_engine_cache()
+    if cache is None:
+        return engine_cls(
+            db=db,
+            job_id=job_id,
+            source=source,
+            dataset_type=dataset_type,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
+    cache_key = (
+        engine_key,
+        (source or "").strip().lower(),
+        (job_id or "").strip(),
+        (dataset_type or "").strip().lower(),
+        from_date or "",
+        to_date or "",
+    )
+    engine = cache.get(cache_key)
+    if engine is None:
+        engine = engine_cls(
+            db=db,
+            job_id=job_id,
+            source=source,
+            dataset_type=dataset_type,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        cache[cache_key] = engine
+    return engine
 
 
 def _normalize_source(source: str) -> tuple[str, str]:
@@ -65,9 +213,7 @@ def _normalize_source(source: str) -> tuple[str, str]:
 
 
 def _current_month_cap() -> pd.Timestamp:
-    now = datetime.now()
-    start = pd.Timestamp(year=now.year, month=now.month, day=1)
-    return start + pd.offsets.MonthEnd(0)
+    return pd.Timestamp.now().normalize()
 
 
 def _parse_series(series: pd.Series) -> pd.Series:
@@ -145,6 +291,33 @@ def _resolve_job_id_fallback(
 ) -> str | None:
     job_key = (job_id or "").strip()
     if not job_key:
+        if (
+            resolved_source == "samsung"
+            or resolved_source in SAMSUNG_PARTNER_SOURCES
+            or resolved_source == "reliance"
+            or resolved_source in APPLIANCE_SOURCES
+        ):
+            logger.info(
+                "No job filter supplied for %s/%s (%s); using merged all-tag dataset.",
+                resolved_source,
+                dataset_key,
+                context,
+            )
+            return None
+        implicit_job = get_latest_available_job_id(
+            db,
+            source=resolved_source,
+            dataset_type=dataset_key,
+        )
+        if implicit_job:
+            logger.info(
+                "No job filter supplied for %s/%s (%s); defaulting to latest uploaded tag %s",
+                resolved_source,
+                dataset_key,
+                context,
+                implicit_job,
+            )
+            return implicit_job
         return None
 
     if resolved_source not in {"reliance", *APPLIANCE_SOURCES}:
@@ -434,6 +607,8 @@ def _resolve_state_from_label(label: str) -> str | None:
     key = _normalize_lookup_key(label)
     if not key:
         return None
+    if key in _STATE_CODE_TO_NAME:
+        return _STATE_CODE_TO_NAME[key]
     if key in _STATE_NAME_TO_CANONICAL:
         return _STATE_NAME_TO_CANONICAL[key]
     return _CITY_TO_STATE_NAME.get(key)
@@ -1006,7 +1181,7 @@ def _canonical_plan_category_value(value: Any) -> str:
         return "Combo"
     if "adld" in text or "accidental" in text or "liquid" in text:
         return "ADLD"
-    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text:
+    if re.search(r"\bsp\b|\bspp\b", text) or "screen" in text or "crack" in text or "protect max" in text:
         return "Screen Protection"
     if re.search(r"\bew\b", text) or "extended warranty" in text:
         return "Extended Warranty"
@@ -1221,6 +1396,89 @@ def _is_samsung_claims_loss_ratio_cache_suspicious(
     return has_duplicate_dimension or max_abs_value > 500.0
 
 
+def _is_reliance_brand_cache_suspicious(
+    rows: list[dict[str, Any]] | None,
+    *,
+    dimension: str,
+) -> bool:
+    if not rows:
+        return False
+
+    dimension_key = _to_safe_key(dimension or "")
+    label_groups: dict[str, set[str]] = {}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+        dim_col = (
+            safe_map.get(dimension_key)
+            or safe_map.get("brand")
+            or safe_map.get("article_brand")
+            or safe_map.get(_to_safe_key(dimension or ""))
+        )
+        raw_label = row.get(dim_col) if dim_col is not None else row.get(dimension)
+        label = str(raw_label or "").strip()
+        if not label:
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", "", label.lower())
+        if not normalized:
+            continue
+        label_groups.setdefault(normalized, set()).add(label)
+
+    alias_groups = [
+        {"vivo"},
+        {"realme"},
+        {"motorola", "moto"},
+        {"mi", "redmi", "xiaomi"},
+        {"oneplus", "onepluslite", "onepluslite8"},
+    ]
+
+    for group in alias_groups:
+        present_keys = [key for key in group if key in label_groups]
+        if len(present_keys) > 1:
+            return True
+        if any(len(label_groups[key]) > 1 for key in present_keys):
+            return True
+
+    return False
+
+
+def _is_hitachi_plan_cache_suspicious(
+    rows: list[dict[str, Any]] | None,
+    *,
+    dimension: str,
+) -> bool:
+    if not rows:
+        return False
+
+    dimension_key = _to_safe_key(dimension or "")
+    suspicious_labels = {
+        "extendedwarrantywithservice",
+        "plan1",
+        "plan2",
+        "plan3",
+        "plan5",
+        "newwarrantykit",
+    }
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+        dim_col = (
+            safe_map.get(dimension_key)
+            or safe_map.get("plan_category")
+            or safe_map.get(_to_safe_key(dimension or ""))
+        )
+        raw_label = row.get(dim_col) if dim_col is not None else row.get(dimension)
+        label = re.sub(r"[^a-z0-9]+", "", str(raw_label or "").strip().lower())
+        if label in suspicious_labels:
+            return True
+
+    return False
+
+
 def _load_godrej_claims_dataframe(
     *,
     db: Session,
@@ -1326,6 +1584,83 @@ def _bounds_from_columns(df: pd.DataFrame, columns: list[str]) -> tuple[pd.Times
     return min_found, max_found
 
 
+def _bounds_source_variants(source: str) -> list[str]:
+    source_key = (source or "").strip().lower()
+    if source_key == "samsung":
+        return list(SAMSUNG_SOURCE_VARIANTS)
+    if source_key == "samsung_vs":
+        return ["samsung_vs", "samsung_vijay_sales"]
+    if source_key in {"reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+        return ["reliance", "reliance resq", "reliance_resq", "reliance-resq", "resq"]
+    if source_key in {"godrej", "goodrej", "goddrej"}:
+        return ["godrej", "goodrej", "goddrej"]
+    return [source_key]
+
+
+def _bounds_from_jsonb_columns(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    columns: list[str],
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    cleaned_columns = [str(col).strip() for col in columns if str(col).strip()]
+    if not cleaned_columns:
+        return None, None
+
+    source_values = _bounds_source_variants(source)
+    source_placeholders = ", ".join([f":source_{idx}" for idx in range(len(source_values))])
+    date_exprs = [
+        f"NULLIF(jsonb_extract_path_text(data::jsonb, :col_{idx}), '')"
+        for idx, _value in enumerate(cleaned_columns)
+    ]
+    stmt = f"""
+        SELECT COALESCE({", ".join(date_exprs)}) AS raw_date
+        FROM data_rows
+        WHERE source IN ({source_placeholders})
+          AND dataset_type = :dataset_type
+    """
+    params: dict[str, Any] = {
+        "dataset_type": (dataset_type or "").strip().lower(),
+    }
+    for idx, value in enumerate(source_values):
+        params[f"source_{idx}"] = value
+    for idx, value in enumerate(cleaned_columns):
+        params[f"col_{idx}"] = value
+
+    if job_id is not None:
+        stmt += " AND job_id = :job_id"
+        params["job_id"] = job_id
+
+    try:
+        rows = db.execute(text(stmt), params).fetchall()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed raw date-bounds query source=%s dataset=%s job_id=%s columns=%s",
+            source,
+            dataset_type,
+            job_id,
+            cleaned_columns,
+        )
+        return None, None
+
+    raw_values = [
+        str(row[0]).strip()
+        for row in rows
+        if row and row[0] is not None and str(row[0]).strip()
+    ]
+    if not raw_values:
+        return None, None
+
+    series = _parse_series(pd.Series(raw_values, dtype="object")).dropna()
+    if series.empty:
+        return None, None
+    series = _clip_to_current_month(series)
+    return series.min(), series.max()
+
+
 def compute_by_dimension_rows(
     *,
     db: Session,
@@ -1401,12 +1736,11 @@ def compute_by_dimension_rows(
                                 merged[key]["period_end"] = end_val
 
             def _fetch_and_merge(src: str, out_key: str):
-                metric_key_local = _to_safe_key(metric or "")
                 dimension_key_local = _to_safe_key(dimension or "")
                 force_live_partner_metric = (
                     (
                         dataset_type == "sales"
-                        and metric_key_local in {"earned_premium", "zopper_earned_premium"}
+                        and _to_safe_key(metric or "") in {"earned_premium", "zopper_earned_premium"}
                     )
                     or (
                         dataset_type == "claims"
@@ -1460,13 +1794,16 @@ def compute_by_dimension_rows(
                             _merge(partner_cached, out_key)
                             return
                 try:
-                    engine = engine_cls(
-                        db=db,
-                        job_id=job_id,
+                    engine = _get_or_create_batch_engine(
+                        engine_cls=engine_cls,
+                        engine_key=engine_key,
                         source=src,
+                        job_id=job_id,
                         dataset_type=dataset_type,
                         from_date=from_date,
                         to_date=to_date,
+                        allow_shared=not active_category_filters,
+                        db=db,
                     )
                     if active_category_filters:
                         needs_sales = dataset_type == "sales" or metric == "loss_ratio"
@@ -1499,13 +1836,16 @@ def compute_by_dimension_rows(
                 out_rows.sort(key=lambda r: str(r.get(dim_key, "")))
             return _normalize_dimension_rows(out_rows, dimension=dimension)
 
-        engine = engine_cls(
-            db=db,
-            job_id=job_id,
+        engine = _get_or_create_batch_engine(
+            engine_cls=engine_cls,
+            engine_key=engine_key,
             source=resolved_source,
+            job_id=job_id,
             dataset_type=dataset_type,
             from_date=from_date,
             to_date=to_date,
+            allow_shared=not active_category_filters,
+            db=db,
         )
         if active_category_filters:
             if engine_key in {"samsung", "godrej", "hitachi"}:
@@ -1650,22 +1990,12 @@ def analytics_by_dimension(
 
     metric_key = _to_safe_key(metric or "")
     dimension_key = _to_safe_key(dimension or "")
-    force_live_samsung_sales_metrics = (
-        resolved_source.startswith("samsung")
+    force_live_samsung_sales_earned_graph = (
+        resolved_source == "samsung"
         and normalized_dataset == "sales"
-        and metric_key in {"gross_premium", "earned_premium", "zopper_earned_premium"}
+        and metric_key in {"earned_premium", "zopper_earned_premium"}
     )
-    force_live_samsung_claims_trend = (
-        resolved_source.startswith("samsung")
-        and normalized_dataset == "claims"
-        and dimension_key in {"month", "date"}
-    )
-    force_live_hitachi_sales_graph = (
-        resolved_source == "hitachi"
-        and normalized_dataset == "sales"
-        and (dimension_key in {"month", "date"} or bool(from_date or to_date))
-    )
-    cached = None if (force_live_samsung_sales_metrics or force_live_samsung_claims_trend or force_live_hitachi_sales_graph) else get_precomputed_graph(
+    cached = None if force_live_samsung_sales_earned_graph else get_precomputed_graph(
         db=db,
         source=resolved_source,
         dataset_type=normalized_dataset,
@@ -1678,6 +2008,7 @@ def analytics_by_dimension(
     )
     if cached is not None and len(cached) > 0:
         is_stale_cached_shape = False
+        is_stale_manual_update = False
         is_stale_zero_metric = False
         is_stale_samsung_partner_mismatch = False
         is_stale_samsung_loss_ratio_cache = False
@@ -1686,6 +2017,40 @@ def analytics_by_dimension(
         is_stale_godrej_sales_month_mismatch = False
         is_stale_loss_ratio_period_window = False
         is_stale_reliance_month_floor = False
+        is_stale_reliance_brand_alias_cache = False
+        is_stale_hitachi_plan_cache = False
+        cache_updated_at = _get_graph_cache_updated_at(
+            db=db,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            job_id=job_id,
+            dimension=dimension,
+            metric=metric,
+            bucket=bucket_key,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        manual_cache_marker_updated_at = _latest_manual_update_marker_updated_at(
+            db=db,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            job_id=job_id,
+        )
+        latest_cache_marker_updated_at = _latest_cache_marker_updated_at(
+            db=db,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            job_id=job_id,
+            from_date=from_date,
+            to_date=to_date,
+            cache_kind="graph",
+            dimension=dimension,
+        )
+        if not _is_precomputed_cache_fresh(
+            cache_updated_at=cache_updated_at,
+            latest_marker_updated_at=latest_cache_marker_updated_at,
+        ):
+            is_stale_manual_update = True
         dimension_key = _to_safe_key(dimension or "")
         if isinstance(cached[0], dict):
             row_keys = {_to_safe_key(str(k)) for k in cached[0].keys()}
@@ -1709,6 +2074,22 @@ def analytics_by_dimension(
                 dimension=dimension,
                 metric=metric,
                 overview_mode=(resolved_source == "samsung"),
+            )
+
+        if (
+            resolved_source == "reliance"
+            and normalized_dataset == "sales"
+            and dimension_key in {"brand", "article_brand"}
+        ):
+            is_stale_reliance_brand_alias_cache = _is_reliance_brand_cache_suspicious(
+                cached,
+                dimension=dimension,
+            )
+
+        if resolved_source == "hitachi" and dimension_key == "plan_category":
+            is_stale_hitachi_plan_cache = _is_hitachi_plan_cache_suspicious(
+                cached,
+                dimension=dimension,
             )
 
         if resolved_source == "samsung":
@@ -1906,8 +2287,7 @@ def analytics_by_dimension(
         if (
             resolved_source == "godrej"
             and normalized_dataset == "sales"
-            and dimension_key == "month"
-            and (from_date or to_date)
+            and dimension_key in {"month", "date"}
         ):
             from_dt = pd.to_datetime(from_date, errors="coerce") if from_date else None
             to_dt = pd.to_datetime(to_date, errors="coerce") if to_date else None
@@ -1922,27 +2302,39 @@ def analytics_by_dimension(
                 else None
             )
 
-            month_points: list[pd.Timestamp] = []
-            for row in cached:
-                if not isinstance(row, dict):
-                    continue
-                safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
-                month_col = safe_map.get("month") or safe_map.get(dimension_key)
-                raw_month = row.get(month_col) if month_col is not None else row.get("month")
-                if raw_month is None:
-                    continue
-                parsed = pd.to_datetime(raw_month, errors="coerce")
-                if pd.isna(parsed):
-                    continue
-                month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+            if _rows_have_temporal_window_mismatch(
+                cached,
+                dimension_key=dimension_key,
+                from_date=from_date,
+                to_date=to_date,
+            ):
+                is_stale_godrej_sales_month_mismatch = True
 
-            if month_points:
-                cached_min_month = min(month_points)
-                cached_max_month = max(month_points)
-                if from_month is not None and from_month < cached_min_month:
-                    is_stale_godrej_sales_month_mismatch = True
-                if to_month is not None and cached_max_month > to_month:
-                    is_stale_godrej_sales_month_mismatch = True
+            if dimension_key == "month":
+                month_points: list[pd.Timestamp] = []
+                for row in cached:
+                    if not isinstance(row, dict):
+                        continue
+                    safe_map = {_to_safe_key(str(k)): k for k in row.keys()}
+                    month_col = safe_map.get("month") or safe_map.get(dimension_key)
+                    raw_month = row.get(month_col) if month_col is not None else row.get("month")
+                    if raw_month is None:
+                        continue
+                    parsed = pd.to_datetime(raw_month, errors="coerce")
+                    if pd.isna(parsed):
+                        continue
+                    month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+
+                if month_points:
+                    cached_min_month = min(month_points)
+                    cached_max_month = max(month_points)
+                    current_month = _current_month_cap().to_period("M").to_timestamp()
+                    if cached_max_month > current_month:
+                        is_stale_godrej_sales_month_mismatch = True
+                    if from_month is not None and from_month < cached_min_month:
+                        is_stale_godrej_sales_month_mismatch = True
+                    if to_month is not None and cached_max_month > to_month:
+                        is_stale_godrej_sales_month_mismatch = True
 
         if resolved_source == "reliance" and dimension_key in {"month", "date"}:
             month_values: list[str] = []
@@ -1977,7 +2369,43 @@ def analytics_by_dimension(
                     if expected_start is not None and cached_min > expected_start:
                         is_stale_reliance_month_floor = True
 
+        has_non_manual_staleness = any(
+            [
+                is_stale_cached_shape,
+                is_stale_zero_metric,
+                is_stale_samsung_partner_mismatch,
+                is_stale_samsung_loss_ratio_cache,
+                is_stale_godrej_legacy_region,
+                is_stale_godrej_claims_range_mismatch,
+                is_stale_godrej_sales_month_mismatch,
+                is_stale_reliance_month_floor,
+                is_stale_reliance_brand_alias_cache,
+                is_stale_loss_ratio_period_window,
+                is_stale_hitachi_plan_cache,
+            ]
+        )
+        manual_marker_only_stale = False
         if (
+            is_stale_manual_update
+            and not has_non_manual_staleness
+            and cache_updated_at is not None
+            and manual_cache_marker_updated_at is not None
+            and latest_cache_marker_updated_at is not None
+        ):
+            cache_ts = pd.Timestamp(cache_updated_at)
+            manual_ts = pd.Timestamp(manual_cache_marker_updated_at)
+            latest_ts = pd.Timestamp(latest_cache_marker_updated_at)
+            if cache_ts.tzinfo is not None:
+                cache_ts = cache_ts.tz_convert(None)
+            if manual_ts.tzinfo is not None:
+                manual_ts = manual_ts.tz_convert(None)
+            if latest_ts.tzinfo is not None:
+                latest_ts = latest_ts.tz_convert(None)
+            manual_marker_only_stale = cache_ts < manual_ts and latest_ts == manual_ts
+
+        if (
+            is_stale_manual_update
+            or
             is_stale_cached_shape
             or is_stale_zero_metric
             or is_stale_samsung_partner_mismatch
@@ -1986,9 +2414,35 @@ def analytics_by_dimension(
             or is_stale_godrej_claims_range_mismatch
             or is_stale_godrej_sales_month_mismatch
             or is_stale_reliance_month_floor
+            or is_stale_reliance_brand_alias_cache
             or is_stale_loss_ratio_period_window
+            or is_stale_hitachi_plan_cache
         ):
-            if is_stale_cached_shape:
+            if manual_marker_only_stale:
+                normalized_cached = _normalize_dimension_rows(cached, dimension=dimension)
+                _schedule_graph_rebuild(
+                    job_id=job_id,
+                    source=resolved_source,
+                    dataset_type=normalized_dataset,
+                    dimension=dimension,
+                    metric=metric,
+                    bucket=bucket_key,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                logger.info(
+                    "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=precomputed_stale_background rows=%s duration_ms=%.2f",
+                    source,
+                    dataset_type,
+                    dimension,
+                    metric,
+                    len(normalized_cached),
+                    (time.perf_counter() - started) * 1000,
+                )
+                return normalized_cached
+            if is_stale_manual_update:
+                reason = "manual_update_marker"
+            elif is_stale_cached_shape:
                 reason = "shape"
             elif is_stale_zero_metric:
                 reason = "all_zero_metric"
@@ -2002,8 +2456,12 @@ def analytics_by_dimension(
                 reason = "godrej_sales_month_mismatch"
             elif is_stale_reliance_month_floor:
                 reason = "reliance_month_floor"
+            elif is_stale_reliance_brand_alias_cache:
+                reason = "reliance_brand_alias_cache"
             elif is_stale_loss_ratio_period_window:
                 reason = "loss_ratio_period_window"
+            elif is_stale_hitachi_plan_cache:
+                reason = "hitachi_plan_cache"
             else:
                 reason = "samsung_partner_mismatch"
             logger.warning(
@@ -2027,6 +2485,40 @@ def analytics_by_dimension(
             )
             return normalized_cached
     if cached == [] and (resolved_source.startswith("samsung") or resolved_source in {"reliance", *APPLIANCE_SOURCES}):
+        cache_updated_at = _get_graph_cache_updated_at(
+            db=db,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            job_id=job_id,
+            dimension=dimension,
+            metric=metric,
+            bucket=bucket_key,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        cache_is_fresh = _is_precomputed_cache_fresh(
+            cache_updated_at=cache_updated_at,
+            latest_marker_updated_at=_latest_cache_marker_updated_at(
+                db=db,
+                source=resolved_source,
+                dataset_type=normalized_dataset,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+                cache_kind="graph",
+                dimension=dimension,
+            ),
+        )
+        if cache_is_fresh:
+            logger.info(
+                "TIMING analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s mode=precomputed rows=0 duration_ms=%.2f",
+                source,
+                dataset_type,
+                dimension,
+                metric,
+                (time.perf_counter() - started) * 1000,
+            )
+            return []
         logger.warning(
             "Empty precomputed graph detected; recomputing live source=%s dataset=%s dimension=%s metric=%s from=%s to=%s",
             resolved_source,
@@ -2049,6 +2541,7 @@ def analytics_by_dimension(
             to_date=to_date,
         )
     except Exception:
+        db.rollback()
         logger.exception(
             "Live compute failed for analytics.by_dimension source=%s dataset=%s dimension=%s metric=%s",
             source,
@@ -2097,6 +2590,7 @@ def analytics_by_dimension(
                     metric,
                 )
             except Exception:
+                db.rollback()
                 logger.exception(
                     "Fallback compute failed for reliance source=%s dataset=%s dimension=%s metric=%s",
                     source,
@@ -2140,6 +2634,55 @@ def analytics_by_dimension(
     return out
 
 
+@router.post("/by-dimension-batch")
+def analytics_by_dimension_batch(
+    payload: ByDimensionBatchPayload,
+    db: Session = Depends(get_db),
+):
+    requests = list(payload.requests or [])
+    if not requests:
+        return {"results": []}
+
+    max_requests = 96
+    results: list[dict[str, Any]] = []
+    previous_engine_cache = getattr(_batch_engine_state, "engines", None)
+    _batch_engine_state.engines = {}
+    try:
+        for index, item in enumerate(requests[:max_requests]):
+            rows = analytics_by_dimension(
+                job_id=item.job_id,
+                dimension=item.dimension,
+                metric=item.metric,
+                source=item.source,
+                dataset_type=item.dataset_type,
+                bucket=item.bucket,
+                from_date=item.from_date,
+                to_date=item.to_date,
+                filter_1_dimension=item.filter_1_dimension,
+                filter_1_values=item.filter_1_values,
+                filter_2_dimension=item.filter_2_dimension,
+                filter_2_values=item.filter_2_values,
+                db=db,
+            )
+            results.append({
+                "request_key": item.request_key or f"req_{index}",
+                "rows": rows if isinstance(rows, list) else [],
+            })
+    finally:
+        if previous_engine_cache is None:
+            try:
+                delattr(_batch_engine_state, "engines")
+            except AttributeError:
+                pass
+        else:
+            _batch_engine_state.engines = previous_engine_cache
+
+    return {
+        "results": results,
+        "truncated": len(requests) > max_requests,
+    }
+
+
 @router.get("/city-breakdown")
 def analytics_city_breakdown(
     state: str = Query(...),
@@ -2149,12 +2692,22 @@ def analytics_city_breakdown(
     job_id: str | None = Query(None),
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
+    filter_1_dimension: str | None = Query(None),
+    filter_1_values: str | None = Query(None),
+    filter_2_dimension: str | None = Query(None),
+    filter_2_values: str | None = Query(None),
     limit: int = Query(40, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     from_date, to_date = _sanitize_range(from_date, to_date)
     normalized_dataset = (dataset_type or "").strip().lower()
     resolved_source, _ = _normalize_source(source)
+    category_filters = _build_dimension_filters(
+        filter_1_dimension=filter_1_dimension,
+        filter_1_values=filter_1_values,
+        filter_2_dimension=filter_2_dimension,
+        filter_2_values=filter_2_values,
+    )
 
     if resolved_source in APPLIANCE_SOURCES and normalized_dataset == "claims":
         engine, df = _load_godrej_claims_dataframe(
@@ -2210,6 +2763,15 @@ def analytics_city_breakdown(
                 "metric": metric,
                 "rows": [],
                 "message": f"No rows found for state '{state}'.",
+            }
+
+        scoped = _apply_dimension_filters_to_frame(scoped, category_filters)
+        if scoped.empty:
+            return {
+                "state": state,
+                "metric": metric,
+                "rows": [],
+                "message": "No rows found for the selected filters.",
             }
 
         city_series = _godrej_claims_city_series(scoped, engine)
@@ -2340,6 +2902,15 @@ def analytics_city_breakdown(
             "message": f"No rows found for state '{state}'.",
         }
 
+    scoped = _apply_dimension_filters_to_frame(scoped, category_filters)
+    if scoped.empty:
+        return {
+            "state": state,
+            "metric": metric,
+            "rows": [],
+            "message": "No rows found for the selected filters.",
+        }
+
     metric_values = _metric_series_for_city_breakdown(scoped, metric)
     if metric_values is None:
         return {
@@ -2409,6 +2980,10 @@ def analytics_category_percentage(
     job_id: str | None = Query(None),
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
+    filter_1_dimension: str | None = Query(None),
+    filter_1_values: str | None = Query(None),
+    filter_2_dimension: str | None = Query(None),
+    filter_2_values: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
@@ -2416,6 +2991,12 @@ def analytics_category_percentage(
     normalized_dataset = (dataset_type or "").strip().lower()
     resolved_source, _ = _normalize_source(source)
     dim_key = _to_safe_key(dimension)
+    category_filters = _build_dimension_filters(
+        filter_1_dimension=filter_1_dimension,
+        filter_1_values=filter_1_values,
+        filter_2_dimension=filter_2_dimension,
+        filter_2_values=filter_2_values,
+    )
     if dim_key not in {
         "plan_category",
         "device_plan_category",
@@ -2494,6 +3075,16 @@ def analytics_category_percentage(
                     "rows": [],
                     "message": f"No rows found for state '{state}'.",
                 }
+
+        scoped = _apply_dimension_filters_to_frame(scoped, category_filters)
+        if scoped.empty:
+            return {
+                "dimension": dim_key,
+                "metric": metric,
+                "state": state,
+                "rows": [],
+                "message": "No rows found for the selected filters.",
+            }
 
         dim_col = _resolve_category_dimension_column(scoped, dim_key)
         if not dim_col and dim_key == "device_plan_category":
@@ -2598,6 +3189,16 @@ def analytics_category_percentage(
                 "rows": [],
                 "message": f"No rows found for state '{state}'.",
             }
+
+    scoped = _apply_dimension_filters_to_frame(scoped, category_filters)
+    if scoped.empty:
+        return {
+            "dimension": dimension,
+            "metric": metric,
+            "state": state,
+            "rows": [],
+            "message": "No rows found for the selected filters.",
+        }
 
     dim_col = _resolve_category_dimension_column(scoped, dim_key)
     if not dim_col:
@@ -2808,6 +3409,175 @@ def _summary_has_signal(summary: dict[str, Any] | None) -> bool:
     return any(abs(v) > 0 for v in [gross, earned, zopper]) or units > 0
 
 
+def _date_bounds_cache_dataset_type(dataset_type: str) -> str:
+    dataset_key = (dataset_type or "").strip().lower()
+    return f"{dataset_key}{_DATE_BOUNDS_CACHE_DATASET_SUFFIX}" if dataset_key else "date_bounds"
+
+
+def _month_bounds_from_precomputed_rows(
+    rows: list[dict[str, Any]] | None,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if not rows:
+        return None, None
+
+    month_points: list[pd.Timestamp] = []
+    for row in rows:
+        parsed = _extract_month_from_dimension_row(row)
+        if parsed is None:
+            continue
+        month_points.append(pd.Timestamp(parsed).to_period("M").to_timestamp())
+
+    if not month_points:
+        return None, None
+
+    min_dt = min(month_points)
+    max_dt = max(month_points) + pd.offsets.MonthEnd(0)
+    return min_dt, max_dt
+
+
+def _date_bounds_from_precomputed_month_graphs(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    dataset_key = (dataset_type or "").strip().lower()
+    metric_candidates = _DATE_BOUNDS_METRIC_CANDIDATES.get(dataset_key, [])
+    if not metric_candidates:
+        return None, None
+
+    source_candidates: list[str] = [source]
+    if source == "samsung":
+        source_candidates.extend(SAMSUNG_PARTNER_SOURCES)
+    source_candidates = list(dict.fromkeys(source_candidates))
+
+    min_candidates: list[pd.Timestamp] = []
+    max_candidates: list[pd.Timestamp] = []
+
+    for candidate_source in source_candidates:
+        for metric in metric_candidates:
+            rows = get_precomputed_graph(
+                db=db,
+                source=candidate_source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                dimension="month",
+                metric=metric,
+                bucket="month",
+                from_date=None,
+                to_date=None,
+            )
+            local_min, local_max = _month_bounds_from_precomputed_rows(rows)
+            if local_min is None and local_max is None:
+                continue
+            if local_min is not None:
+                min_candidates.append(local_min)
+            if local_max is not None:
+                max_candidates.append(local_max)
+            break
+
+    return (
+        min(min_candidates) if min_candidates else None,
+        max(max_candidates) if max_candidates else None,
+    )
+
+
+def compute_date_bounds_payload(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+) -> dict[str, Any]:
+    resolved_source, _ = _normalize_source(source)
+    dataset_key = (dataset_type or "").strip().lower()
+
+    min_date, max_date = _date_bounds_from_precomputed_month_graphs(
+        db=db,
+        source=resolved_source,
+        dataset_type=dataset_key,
+        job_id=job_id,
+    )
+
+    if min_date is None and max_date is None:
+        if resolved_source == "samsung":
+            bounds = [
+                _date_bounds_for_source_dataset(
+                    db=db,
+                    source=partner_source,
+                    dataset_type=dataset_key,
+                    job_id=job_id,
+                )
+                for partner_source in SAMSUNG_PARTNER_SOURCES
+            ]
+            min_candidates = [local_min for local_min, _local_max in bounds if local_min is not None]
+            max_candidates = [local_max for _local_min, local_max in bounds if local_max is not None]
+            min_date = min(min_candidates) if min_candidates else None
+            max_date = max(max_candidates) if max_candidates else None
+        else:
+            min_date, max_date = _date_bounds_for_source_dataset(
+                db=db,
+                source=resolved_source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+            )
+
+    month_cap = pd.Timestamp.now().normalize()
+    if resolved_source == "samsung" and dataset_key == "sales" and min_date is not None:
+        if max_date is None or pd.isna(max_date) or max_date < month_cap:
+            max_date = month_cap
+    if max_date is not None and pd.notna(max_date) and max_date > month_cap:
+        max_date = month_cap
+
+    if min_date is not None and max_date is not None and min_date > max_date:
+        min_date = max_date
+
+    return {
+        "min_date": min_date.date().isoformat() if min_date is not None else None,
+        "max_date": max_date.date().isoformat() if max_date is not None else None,
+    }
+
+
+def _get_date_bounds_cache_updated_at(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+) -> datetime | None:
+    row = (
+        db.query(PrecomputedSummary)
+        .filter(PrecomputedSummary.source == (source or "").strip().lower())
+        .filter(PrecomputedSummary.dataset_type == _date_bounds_cache_dataset_type(dataset_type))
+        .filter(PrecomputedSummary.job_key == (job_id or "").strip())
+        .filter(PrecomputedSummary.from_date == "")
+        .filter(PrecomputedSummary.to_date == "")
+        .first()
+    )
+    return row.updated_at if row is not None else None
+
+
+def _latest_date_bounds_marker_updated_at(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+) -> datetime | None:
+    source_key = (source or "").strip().lower()
+    source_variants = list(SAMSUNG_SOURCE_VARIANTS) if source_key == "samsung" else [source_key]
+    query = (
+        db.query(func.max(ManualUpdateMarker.updated_at))
+        .filter(ManualUpdateMarker.source.in_(source_variants))
+        .filter(ManualUpdateMarker.dataset_type == (dataset_type or "").strip().lower())
+    )
+    job_key = (job_id or "").strip()
+    if job_key:
+        query = query.filter(ManualUpdateMarker.job_key.in_([job_key, ""]))
+    return query.scalar()
+
+
 def _rows_have_values(rows: list[dict[str, Any]] | None, metric: str) -> bool:
     if not rows:
         return False
@@ -2823,7 +3593,7 @@ def _rows_have_values(rows: list[dict[str, Any]] | None, metric: str) -> bool:
                 return True
         except Exception:
             continue
-    return len(rows) > 0
+    return False
 
 
 def _extract_month_from_dimension_row(row: dict[str, Any]) -> pd.Timestamp | None:
@@ -2836,6 +3606,422 @@ def _extract_month_from_dimension_row(row: dict[str, Any]) -> pd.Timestamp | Non
             if not parsed.empty:
                 return parsed.iloc[0]
     return None
+
+
+def _rows_have_temporal_window_mismatch(
+    rows: list[dict[str, Any]] | None,
+    *,
+    dimension_key: str,
+    from_date: str | None,
+    to_date: str | None,
+) -> bool:
+    if not rows or not (from_date or to_date):
+        return False
+
+    parsed_points: list[pd.Timestamp] = []
+    for row in rows:
+        parsed = _extract_month_from_dimension_row(row)
+        if parsed is None:
+            continue
+        point = pd.Timestamp(parsed)
+        if _to_safe_key(dimension_key) == "month":
+            point = point.to_period("M").to_timestamp()
+        else:
+            point = point.normalize()
+        parsed_points.append(point)
+
+    if not parsed_points:
+        return False
+
+    cached_min = min(parsed_points)
+    cached_max = max(parsed_points)
+    if _to_safe_key(dimension_key) == "month":
+        cached_max = cached_max + pd.offsets.MonthEnd(0)
+
+    from_dt = pd.to_datetime(from_date, errors="coerce") if from_date else None
+    to_dt = pd.to_datetime(to_date, errors="coerce") if to_date else None
+    if from_dt is not None and not pd.isna(from_dt):
+        expected_from = pd.Timestamp(from_dt)
+        if _to_safe_key(dimension_key) == "month":
+            expected_from = expected_from.to_period("M").to_timestamp()
+        else:
+            expected_from = expected_from.normalize()
+        if cached_min < expected_from:
+            return True
+    if to_dt is not None and not pd.isna(to_dt):
+        expected_to = pd.Timestamp(to_dt)
+        if _to_safe_key(dimension_key) == "month":
+            expected_to = expected_to.to_period("M").to_timestamp()
+        else:
+            expected_to = expected_to.normalize()
+        if cached_max > expected_to:
+            return True
+
+    return False
+
+
+def _annual_build_current_range(
+    from_date: str | None,
+    to_date: str | None,
+) -> tuple[str, str]:
+    fallback_end = pd.to_datetime(to_date, errors="coerce") if to_date else pd.Timestamp.now().normalize()
+    if fallback_end is None or pd.isna(fallback_end):
+        fallback_end = pd.Timestamp.now().normalize()
+
+    fallback_start = pd.Timestamp(year=fallback_end.year, month=1, day=1)
+    current_from = pd.to_datetime(from_date, errors="coerce") if from_date else fallback_start
+    current_to = pd.to_datetime(to_date, errors="coerce") if to_date else fallback_end
+
+    if current_from is None or pd.isna(current_from):
+        current_from = fallback_start
+    if current_to is None or pd.isna(current_to):
+        current_to = fallback_end
+    if current_from > current_to:
+        current_from, current_to = current_to, current_from
+
+    return current_from.date().isoformat(), current_to.date().isoformat()
+
+
+def _annual_financial_year_start(value: str) -> int:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if parsed is None or pd.isna(parsed):
+        return 0
+    return int(parsed.year if parsed.month >= 4 else parsed.year - 1)
+
+
+def _annual_financial_year_label(financial_year_start: int) -> str:
+    return f"{financial_year_start} - {financial_year_start + 1}"
+
+
+def _annual_shift_year(value: str, delta: int) -> str:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if parsed is None or pd.isna(parsed):
+        return value
+    shifted = pd.Timestamp(parsed) + pd.DateOffset(years=delta)
+    return shifted.date().isoformat()
+
+
+def _annual_build_year_buckets(
+    current_from: str,
+    current_to: str,
+) -> list[dict[str, str]]:
+    start_financial_year = _annual_financial_year_start(current_from)
+    end_financial_year = _annual_financial_year_start(current_to)
+    if not start_financial_year or not end_financial_year:
+        return []
+
+    if start_financial_year == end_financial_year:
+        return [
+            {
+                "label": _annual_financial_year_label(start_financial_year - 1),
+                "from": _annual_shift_year(current_from, -1),
+                "to": _annual_shift_year(current_to, -1),
+            },
+            {
+                "label": _annual_financial_year_label(start_financial_year),
+                "from": current_from,
+                "to": current_to,
+            },
+        ]
+
+    buckets: list[dict[str, str]] = []
+    for financial_year in range(start_financial_year, end_financial_year + 1):
+        buckets.append(
+            {
+                "label": _annual_financial_year_label(financial_year),
+                "from": current_from if financial_year == start_financial_year else f"{financial_year}-04-01",
+                "to": current_to if financial_year == end_financial_year else f"{financial_year + 1}-03-31",
+            }
+        )
+    return buckets
+
+
+def _annual_canonicalize_plan_label(source: str, value: Any) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    text = raw.lower()
+    if not text:
+        return ""
+
+    plan_number_match = re.match(r"^plan\s*(\d+)$", raw, flags=re.IGNORECASE)
+    if plan_number_match:
+        return f"Plan {plan_number_match.group(1)}"
+
+    if "combo" in text:
+        return "Combo"
+    if "adld" in text or "accidental" in text or "liquid" in text:
+        return "ADLD"
+    if source == "reliance" and (
+        "crack" in text or "screen" in text or re.search(r"\bsp\b|\bspp\b", text)
+    ):
+        return "Crack Screen"
+    if "screen" in text or "crack" in text or "protect max" in text or re.search(r"\bsp\b|\bspp\b", text):
+        return "Screen Protection"
+    if "extended" in text or "warranty" in text or re.search(r"\bew\b", text):
+        return "Extended Warranty"
+    return raw
+
+
+def _annual_plan_order(source: str) -> list[str]:
+    if source == "reliance":
+        return ["ADLD", "Crack Screen", "Extended Warranty"]
+    if source == "samsung" or source in SAMSUNG_PARTNER_SOURCES:
+        return ["Combo", "ADLD", "Screen Protection", "Extended Warranty"]
+    return []
+
+
+def _annual_plan_sort_tuple(source: str, value: str) -> tuple[int, int, str]:
+    canonical = _annual_canonicalize_plan_label(source, value)
+    order = [candidate.lower() for candidate in _annual_plan_order(source)]
+    normalized = canonical.lower()
+    if normalized in order:
+        return (0, order.index(normalized), canonical)
+
+    plan_number_match = re.match(r"^plan\s+(\d+)$", canonical, flags=re.IGNORECASE)
+    if plan_number_match:
+        return (1, int(plan_number_match.group(1)), canonical)
+
+    return (2, 999, canonical)
+
+
+def _annual_extract_plans(
+    source: str,
+    rows: list[dict[str, Any]] | None,
+) -> list[str]:
+    if not rows:
+        return []
+
+    plans: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_map = {_to_safe_key(str(key)): key for key in row.keys()}
+        raw_plan = None
+        for candidate in ["plan_category", "device_plan_category", "plan"]:
+            actual = safe_map.get(candidate)
+            if actual is not None:
+                raw_plan = row.get(actual)
+                break
+        label = _annual_canonicalize_plan_label(source, raw_plan)
+        if not label:
+            continue
+        plan_key = label.lower()
+        if plan_key in seen:
+            continue
+        seen.add(plan_key)
+        plans.append(label)
+
+    return sorted(plans, key=lambda value: _annual_plan_sort_tuple(source, value))
+
+
+def _annual_extract_metric_value(
+    row: dict[str, Any],
+    metric: str,
+) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    safe_map = {_to_safe_key(str(key)): key for key in row.keys()}
+    metric_key = _to_safe_key(metric)
+    metric_col = safe_map.get(metric_key)
+    raw_value = row.get(metric_col) if metric_col is not None else row.get(metric)
+    try:
+        numeric = float(raw_value or 0)
+    except Exception:
+        return 0.0
+    return float(numeric) if pd.notna(numeric) else 0.0
+
+
+def _annual_sum_samsung_partner_rows(
+    rows: list[dict[str, Any]] | None,
+    *,
+    dimension: str,
+    metric: str,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    dim_key = _to_safe_key(dimension)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        safe_map = {_to_safe_key(str(key)): key for key in row.keys()}
+        dim_col = safe_map.get(dim_key)
+        if dim_col is None:
+            if dim_key == "plan_category":
+                dim_col = safe_map.get("device_plan_category") or safe_map.get("plan")
+            elif dim_key == "device_plan_category":
+                dim_col = safe_map.get("plan_category") or safe_map.get("plan")
+
+        dim_value = row.get(dim_col) if dim_col is not None else row.get(dimension)
+        if dim_value in (None, ""):
+            continue
+
+        total = 0.0
+        saw_partner_column = False
+        for partner_source in SAMSUNG_PARTNER_SOURCES:
+            partner_col = safe_map.get(_to_safe_key(partner_source))
+            if partner_col is None:
+                continue
+            saw_partner_column = True
+            try:
+                numeric = float(row.get(partner_col) or 0)
+            except Exception:
+                numeric = 0.0
+            if pd.notna(numeric):
+                total += float(numeric)
+
+        next_row: dict[str, Any] = {
+            dim_key: dim_value,
+            metric: total if saw_partner_column else _annual_extract_metric_value(row, metric),
+        }
+        for metadata_key in ("period_start", "period_end"):
+            actual = safe_map.get(metadata_key)
+            if actual is None:
+                continue
+            value = row.get(actual)
+            if value not in (None, ""):
+                next_row[metadata_key] = value
+        out.append(next_row)
+
+    return out
+
+
+def _annual_empty_rows(
+    year_buckets: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "label": bucket["label"],
+            "total": 0.0,
+            "values": {},
+        }
+        for bucket in year_buckets
+    ]
+
+
+def _annual_find_bucket_label(
+    month_value: pd.Timestamp | None,
+    year_buckets: list[dict[str, str]],
+) -> str | None:
+    if month_value is None or pd.isna(month_value):
+        return None
+    month_key = pd.Timestamp(month_value).date().isoformat()
+    for bucket in year_buckets:
+        if bucket["from"] <= month_key <= bucket["to"]:
+            return bucket["label"]
+    return None
+
+
+def _annual_build_total_payload(
+    rows: list[dict[str, Any]] | None,
+    metric: str,
+    year_buckets: list[dict[str, str]],
+) -> dict[str, Any]:
+    chart_rows = _annual_empty_rows(year_buckets)
+    row_map = {str(row["label"]): row for row in chart_rows}
+
+    for row in rows or []:
+        month_value = _extract_month_from_dimension_row(row)
+        label = _annual_find_bucket_label(month_value, year_buckets)
+        if not label:
+            continue
+        target = row_map.get(label)
+        if target is None:
+            continue
+        target["total"] = float(target.get("total", 0.0) or 0.0) + _annual_extract_metric_value(row, metric)
+
+    return {
+        "plans": [],
+        "rows": chart_rows,
+    }
+
+
+def _annual_build_plan_payload(
+    plans: list[str],
+    rows_by_plan: dict[str, list[dict[str, Any]]],
+    metric: str,
+    year_buckets: list[dict[str, str]],
+) -> dict[str, Any]:
+    chart_rows = _annual_empty_rows(year_buckets)
+    row_map = {str(row["label"]): row for row in chart_rows}
+
+    for plan in plans:
+        plan_rows = rows_by_plan.get(plan) or []
+        for row in plan_rows:
+            month_value = _extract_month_from_dimension_row(row)
+            label = _annual_find_bucket_label(month_value, year_buckets)
+            if not label:
+                continue
+            target = row_map.get(label)
+            if target is None:
+                continue
+            values = target.setdefault("values", {})
+            metric_value = _annual_extract_metric_value(row, metric)
+            values[plan] = float(values.get(plan, 0.0) or 0.0) + metric_value
+            target["total"] = float(target.get("total", 0.0) or 0.0) + metric_value
+
+    return {
+        "plans": plans,
+        "rows": chart_rows,
+    }
+
+
+def _annual_metric_payload_has_plan_signal(metric_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(metric_payload, dict):
+        return False
+
+    plans = [str(plan).strip() for plan in (metric_payload.get("plans") or []) if str(plan).strip()]
+    rows = metric_payload.get("rows") or []
+    if not plans or not isinstance(rows, list) or not rows:
+        return False
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        values = row.get("values") or {}
+        if not isinstance(values, dict):
+            continue
+        for raw_value in values.values():
+            try:
+                if abs(float(raw_value or 0)) > 0:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _annual_payload_has_signal(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    payload_by_metric = payload.get("payload_by_metric")
+    if not isinstance(payload_by_metric, dict) or not payload_by_metric:
+        return False
+
+    quantity_payload = payload_by_metric.get("quantity")
+    has_sales_totals = any(metric in payload_by_metric for metric in _ANNUAL_SALES_SUMMARY_METRICS)
+    if has_sales_totals:
+        return _annual_metric_payload_has_plan_signal(quantity_payload)
+
+    if _annual_metric_payload_has_plan_signal(quantity_payload):
+        return True
+
+    for metric_payload in payload_by_metric.values():
+        if _annual_metric_payload_has_plan_signal(metric_payload):
+            return True
+        if not isinstance(metric_payload, dict):
+            continue
+        rows = metric_payload.get("rows") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                if abs(float(row.get("total", 0) or 0)) > 0:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _rows_have_month_window_mismatch(
@@ -2879,6 +4065,20 @@ def _rows_have_month_window_mismatch(
     return False
 
 
+def _rows_have_future_months(rows: list[dict[str, Any]] | None) -> bool:
+    if not rows:
+        return False
+
+    current_month = _current_month_cap().to_period("M").to_timestamp()
+    for row in rows:
+        parsed = _extract_month_from_dimension_row(row)
+        if parsed is None:
+            continue
+        if pd.Timestamp(parsed).to_period("M").to_timestamp() > current_month:
+            return True
+    return False
+
+
 def _master_payload_has_godrej_sales_month_mismatch(
     payload: dict[str, Any] | None,
     *,
@@ -2891,6 +4091,8 @@ def _master_payload_has_godrej_sales_month_mismatch(
     if not isinstance(row_sets, dict):
         return False
     for key in ("godrej_gross", "godrej_earned", "godrej_zopper"):
+        if _rows_have_future_months(row_sets.get(key)):
+            return True
         if _rows_have_month_window_mismatch(
             row_sets.get(key),
             from_date=from_date,
@@ -2914,6 +4116,33 @@ def _bounds_from_master_rows(row_sets: list[list[dict[str, Any]]]) -> tuple[str 
                 max_dt = dt
     return (
         min_dt.date().isoformat() if min_dt is not None else None,
+        (max_dt + pd.offsets.MonthEnd(0)).date().isoformat() if max_dt is not None else None,
+    )
+
+
+def _finalize_master_date_bounds(
+    min_date: str | None,
+    max_date: str | None,
+) -> tuple[str | None, str | None]:
+    min_dt = pd.to_datetime(min_date, errors="coerce") if min_date else None
+    max_dt = pd.to_datetime(max_date, errors="coerce") if max_date else None
+
+    if min_dt is not None and pd.isna(min_dt):
+        min_dt = None
+    if max_dt is not None and pd.isna(max_dt):
+        max_dt = None
+
+    month_cap = _current_month_cap()
+    if min_dt is not None and (max_dt is None or (pd.notna(max_dt) and max_dt < month_cap)):
+        max_dt = month_cap
+    if max_dt is not None and pd.notna(max_dt) and max_dt > month_cap:
+        max_dt = month_cap
+
+    if min_dt is not None and max_dt is not None and min_dt > max_dt:
+        min_dt = max_dt.replace(day=1)
+
+    return (
+        min_dt.date().isoformat() if min_dt is not None else None,
         max_dt.date().isoformat() if max_dt is not None else None,
     )
 
@@ -2927,100 +4156,256 @@ def _date_bounds_for_source_dataset(
 ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     dataset_key = (dataset_type or "").strip().lower()
     src_key = (source or "").strip().lower()
-    df = get_dataframe(
-        db=db,
-        job_id=job_id,
-        source=source,
-        dataset_type=dataset_key,
-    )
+    df: pd.DataFrame | None = None
+
+    def _load_df() -> pd.DataFrame:
+        nonlocal df
+        if df is None:
+            df = get_dataframe(
+                db=db,
+                job_id=job_id,
+                source=source,
+                dataset_type=dataset_key,
+            )
+        return df
 
     if dataset_key == "sales" and src_key.startswith(("godrej", "goodrej", "goddrej")):
         # Godrej sales timeline should anchor on warranty purchase first.
-        purchase_min, purchase_max = _bounds_from_columns(df, ["Warranty Purchase Date"])
+        purchase_min, purchase_max = _bounds_from_jsonb_columns(
+            db=db,
+            source=source,
+            dataset_type=dataset_key,
+            job_id=job_id,
+            columns=["Warranty Purchase Date"],
+        )
+        if purchase_min is None and purchase_max is None:
+            purchase_min, purchase_max = _bounds_from_columns(_load_df(), ["Warranty Purchase Date"])
         if purchase_min is not None or purchase_max is not None:
             return purchase_min, purchase_max
-        product_purchase_min, product_purchase_max = _bounds_from_columns(df, ["Product Purchased Date"])
+        product_purchase_min, product_purchase_max = _bounds_from_jsonb_columns(
+            db=db,
+            source=source,
+            dataset_type=dataset_key,
+            job_id=job_id,
+            columns=["Product Purchased Date"],
+        )
+        if product_purchase_min is None and product_purchase_max is None:
+            product_purchase_min, product_purchase_max = _bounds_from_columns(_load_df(), ["Product Purchased Date"])
         if product_purchase_min is not None or product_purchase_max is not None:
             return product_purchase_min, product_purchase_max
 
     if dataset_key == "sales" and src_key == "hitachi":
         # Hitachi sales filters and quick ranges should track the sale/purchase date.
         # Warranty-start dates can extend into future coverage periods and break presets.
-        purchase_min, purchase_max = _bounds_from_columns(
-            df,
-            [
-                "Warranty Purchase Date",
-                "Plan Start Date",
-                "Date",
-                "Start_Date",
-                "Start Date",
-            ],
+        purchase_columns = [
+            "Warranty Purchase Date",
+            "Plan Start Date",
+            "Date",
+            "Start_Date",
+            "Start Date",
+        ]
+        purchase_min, purchase_max = _bounds_from_jsonb_columns(
+            db=db,
+            source=source,
+            dataset_type=dataset_key,
+            job_id=job_id,
+            columns=purchase_columns,
         )
+        if purchase_min is None and purchase_max is None:
+            purchase_min, purchase_max = _bounds_from_columns(_load_df(), purchase_columns)
         if purchase_min is not None or purchase_max is not None:
             return purchase_min, purchase_max
-        month_min, month_max = _bounds_from_columns(df, ["Month"])
+        month_min, month_max = _bounds_from_jsonb_columns(
+            db=db,
+            source=source,
+            dataset_type=dataset_key,
+            job_id=job_id,
+            columns=["Month"],
+        )
+        if month_min is None and month_max is None:
+            month_min, month_max = _bounds_from_columns(_load_df(), ["Month"])
         if month_min is not None or month_max is not None:
             return month_min, month_max
-        warranty_min, warranty_max = _bounds_from_columns(
-            df,
-            [
-                "Warranty Start Date",
-                "Warranty Start_Date",
-                "Product Purchased Date",
-            ],
+        warranty_columns = [
+            "Warranty Start Date",
+            "Warranty Start_Date",
+            "Product Purchased Date",
+        ]
+        warranty_min, warranty_max = _bounds_from_jsonb_columns(
+            db=db,
+            source=source,
+            dataset_type=dataset_key,
+            job_id=job_id,
+            columns=warranty_columns,
         )
+        if warranty_min is None and warranty_max is None:
+            warranty_min, warranty_max = _bounds_from_columns(_load_df(), warranty_columns)
         if warranty_min is not None or warranty_max is not None:
             return warranty_min, warranty_max
 
     if dataset_key == "sales":
-        if src_key == "reliance":
-            # Reliance trends align to warranty/plan start.
-            warranty_min, warranty_max = _bounds_from_columns(
-                df,
-                ["Warranty Start Date", "Warranty_Start_Date", "Plan Start Date", "Start Date", "Start_Date"],
+        if src_key.startswith("samsung"):
+            # Samsung sales timelines should prefer transaction/sale dates.
+            # Some partner files also carry future policy-start dates, which can
+            # incorrectly stretch picker bounds far beyond the sales month range.
+            sale_columns = [
+                "Date",
+                "Invoice Date",
+                "Invoice_Date_",
+                "Bill Created Date",
+                "Purchase Date",
+                "Transaction Date",
+                "Transaction_Date",
+            ]
+            sale_min, sale_max = _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=sale_columns,
             )
-            if warranty_min is not None or warranty_max is not None:
-                return warranty_min, warranty_max
-            month_min, month_max = _bounds_from_columns(
-                df,
-                ["Month", "Month Name", "Month_Name", "Month_Year", "Month-Year"],
-            )
-            if month_min is not None or month_max is not None:
-                return month_min, month_max
-        return _bounds_from_columns(
-            df,
-            [
+            if sale_min is None and sale_max is None:
+                sale_min, sale_max = _bounds_from_columns(_load_df(), sale_columns)
+            if sale_min is not None or sale_max is not None:
+                return sale_min, sale_max
+
+            # Legacy partner uploads can carry malformed Month labels; prefer
+            # canonical start dates before trusting those month strings.
+            start_columns = [
                 "Start_Date",
                 "Start Date",
                 "Plan Start Date",
                 "Warranty Start Date",
                 "Warranty Start_Date",
-                "Warranty Purchase Date",
-                "Invoice_Date_",
+            ]
+            start_min, start_max = _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=start_columns,
+            )
+            if start_min is None and start_max is None:
+                start_min, start_max = _bounds_from_columns(_load_df(), start_columns)
+            if start_min is not None or start_max is not None:
+                return start_min, start_max
+            month_columns = ["Month", "Month Name", "Month_Name", "Month_Year", "Month-Year"]
+            month_min, month_max = _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=month_columns,
+            )
+            if month_min is None and month_max is None:
+                month_min, month_max = _bounds_from_columns(_load_df(), month_columns)
+            if month_min is not None or month_max is not None:
+                return month_min, month_max
+
+        if src_key == "reliance":
+            # Reliance sales dashboards should default to the actual sale date
+            # window, not future warranty activation dates.
+            sale_columns = [
+                "Transaction Date",
+                "Transaction_Date",
+                "Purchase Date",
+                "PURCHASE_DATE",
+                "Purchase_Date",
                 "Invoice Date",
+                "Invoice_Date",
                 "Bill Created Date",
-                "Payment_date",
-                "Payment Date",
-                "Month",
-                "Month Name",
-                "Month_Name",
+                "Data Processing Date",
+                "Data_Processing_Date",
                 "Date",
-            ],
+            ]
+            sale_min, sale_max = _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=sale_columns,
+            )
+            if sale_min is None and sale_max is None:
+                sale_min, sale_max = _bounds_from_columns(_load_df(), sale_columns)
+            if sale_min is not None or sale_max is not None:
+                return sale_min, sale_max
+            month_columns = ["Month", "Month Name", "Month_Name", "Month_Year", "Month-Year"]
+            month_min, month_max = _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=month_columns,
+            )
+            if month_min is None and month_max is None:
+                month_min, month_max = _bounds_from_columns(_load_df(), month_columns)
+            if month_min is not None or month_max is not None:
+                return month_min, month_max
+            warranty_columns = ["Warranty Start Date", "Warranty_Start_Date", "Plan Start Date", "Start Date", "Start_Date"]
+            warranty_min, warranty_max = _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=warranty_columns,
+            )
+            if warranty_min is None and warranty_max is None:
+                warranty_min, warranty_max = _bounds_from_columns(_load_df(), warranty_columns)
+            if warranty_min is not None or warranty_max is not None:
+                return warranty_min, warranty_max
+        fallback_sales_columns = [
+            "Start_Date",
+            "Start Date",
+            "Plan Start Date",
+            "Warranty Start Date",
+            "Warranty Start_Date",
+            "Warranty Purchase Date",
+            "Invoice_Date_",
+            "Invoice Date",
+            "Bill Created Date",
+            "Payment_date",
+            "Payment Date",
+            "Month",
+            "Month Name",
+            "Month_Name",
+            "Date",
+        ]
+        fast_min, fast_max = _bounds_from_jsonb_columns(
+            db=db,
+            source=source,
+            dataset_type=dataset_key,
+            job_id=job_id,
+            columns=fallback_sales_columns,
         )
+        if fast_min is not None or fast_max is not None:
+            return fast_min, fast_max
+        return _bounds_from_columns(_load_df(), fallback_sales_columns)
 
     if dataset_key == "claims" and src_key.startswith("samsung"):
         # Samsung claims files can spread timeline fields across Fiscal/Month/Claim-Date
         # columns. Use a combined bound so newly uploaded claim dates are not hidden by
         # a stale fiscal-month range.
         bound_sets = [
-            _bounds_from_columns(df, ["Fiscal Month"]),
-            _bounds_from_columns(
-                df,
-                ["Month", "Month-Year", "Month Year", "Month_Year", "Month Name", "Month_Name"],
+            _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=["Fiscal Month"],
             ),
-            _bounds_from_columns(
-                df,
-                [
+            _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=["Month", "Month-Year", "Month Year", "Month_Year", "Month Name", "Month_Name"],
+            ),
+            _bounds_from_jsonb_columns(
+                db=db,
+                source=source,
+                dataset_type=dataset_key,
+                job_id=job_id,
+                columns=[
                     "Claim Date",
                     "Day of Call_Date",
                     "Call_Date",
@@ -3034,6 +4419,30 @@ def _date_bounds_for_source_dataset(
                 ],
             ),
         ]
+        if not any(local_min is not None or local_max is not None for local_min, local_max in bound_sets):
+            scoped_df = _load_df()
+            bound_sets = [
+                _bounds_from_columns(scoped_df, ["Fiscal Month"]),
+                _bounds_from_columns(
+                    scoped_df,
+                    ["Month", "Month-Year", "Month Year", "Month_Year", "Month Name", "Month_Name"],
+                ),
+                _bounds_from_columns(
+                    scoped_df,
+                    [
+                        "Claim Date",
+                        "Day of Call_Date",
+                        "Call_Date",
+                        "Call Date",
+                        "Date",
+                        "Payment_date",
+                        "Payment Date",
+                        "Posting Date",
+                        "Complete Date",
+                        "Bill Created Date",
+                    ],
+                ),
+            ]
         min_candidates = [mn for mn, _mx in bound_sets if mn is not None]
         max_candidates = [mx for _mn, mx in bound_sets if mx is not None]
         if min_candidates or max_candidates:
@@ -3042,33 +4451,40 @@ def _date_bounds_for_source_dataset(
                 max(max_candidates) if max_candidates else None,
             )
 
-    return _bounds_from_columns(
-        df,
-        [
-            "Day of Call_Date",
-            "Call_Date",
-            "Call Date",
-            "Call_Registered_Date",
-            "Call Registered Date",
-            "Call_Initiated_Date",
-            "Call Initiated Date",
-            "Month-Year",
-            "Month Year",
-            "Month_Year",
-            "Month Year",
-            "Fiscal Month",
-            "Invoice_Date_",
-            "Invoice Date",
-            "Payment_date",
-            "Payment Date",
-            "Posting Date",
-            "Complete Date",
-            "Bill Created Date",
-            "Warranty_start_date_",
-            "Warranty Start Date",
-            "Date",
-        ],
+    fallback_claims_columns = [
+        "Day of Call_Date",
+        "Call_Date",
+        "Call Date",
+        "Call_Registered_Date",
+        "Call Registered Date",
+        "Call_Initiated_Date",
+        "Call Initiated Date",
+        "Month-Year",
+        "Month Year",
+        "Month_Year",
+        "Month Year",
+        "Fiscal Month",
+        "Invoice_Date_",
+        "Invoice Date",
+        "Payment_date",
+        "Payment Date",
+        "Posting Date",
+        "Complete Date",
+        "Bill Created Date",
+        "Warranty_start_date_",
+        "Warranty Start Date",
+        "Date",
+    ]
+    fast_min, fast_max = _bounds_from_jsonb_columns(
+        db=db,
+        source=source,
+        dataset_type=dataset_key,
+        job_id=job_id,
+        columns=fallback_claims_columns,
     )
+    if fast_min is not None or fast_max is not None:
+        return fast_min, fast_max
+    return _bounds_from_columns(_load_df(), fallback_claims_columns)
 
 
 def _master_source_bounds(
@@ -3122,9 +4538,7 @@ def _load_master_summary(
     to_date: str | None,
 ) -> tuple[dict[str, Any], str | None]:
     source_key = (source or "").strip().lower()
-    force_live_summary = source_key in SAMSUNG_PARTNER_SOURCES and dataset_type in {"sales", "claims"}
-    if source_key == "hitachi" and dataset_type == "sales":
-        force_live_summary = True
+    force_live_summary = source_key.startswith("samsung") and dataset_type == "sales"
     selected_summary: dict[str, Any] = {}
     selected_job_id: str | None = candidate_job_ids[0] if candidate_job_ids else None
     for candidate_job_id in candidate_job_ids:
@@ -3138,6 +4552,33 @@ def _load_master_summary(
                 from_date=from_date,
                 to_date=to_date,
             )
+            if isinstance(summary, dict):
+                cache_updated_at = _get_summary_cache_updated_at(
+                    db=db,
+                    source=source_key,
+                    dataset_type=dataset_type,
+                    job_id=candidate_job_id,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+                if not _is_precomputed_cache_fresh(
+                    cache_updated_at=cache_updated_at,
+                    latest_marker_updated_at=_latest_cache_marker_updated_at(
+                        db=db,
+                        source=source_key,
+                        dataset_type=dataset_type,
+                        job_id=candidate_job_id,
+                        from_date=from_date,
+                        to_date=to_date,
+                    ),
+                ):
+                    logger.info(
+                        "Master summary cache stale from upload marker; recomputing live source=%s dataset=%s job_id=%s",
+                        source_key,
+                        dataset_type,
+                        candidate_job_id,
+                    )
+                    summary = None
         if summary is None:
             try:
                 summary = compute_summary_values(
@@ -3186,9 +4627,11 @@ def _load_master_metric_rows(
     to_date: str | None,
 ) -> list[dict[str, Any]]:
     source_key = (source or "").strip().lower()
-    force_live_rows = source_key in SAMSUNG_PARTNER_SOURCES and dataset_type in {"sales", "claims"}
-    if source_key == "hitachi" and dataset_type == "sales":
-        force_live_rows = True
+    force_live_rows = (
+        source_key.startswith("samsung")
+        and dataset_type == "sales"
+        and metric in {"earned_premium", "zopper_earned_premium"}
+    )
     ordered_candidates: list[str | None] = []
     if preferred_job_id in candidate_job_ids:
         ordered_candidates.append(preferred_job_id)
@@ -3212,14 +4655,60 @@ def _load_master_metric_rows(
                 from_date=from_date,
                 to_date=to_date,
             )
-            if (
-                rows is not None
-                and source_key == "godrej"
-                and dataset_type == "sales"
-                and _rows_have_month_window_mismatch(
-                    rows,
+            if rows is not None:
+                cache_updated_at = _get_graph_cache_updated_at(
+                    db=db,
+                    source=source_key,
+                    dataset_type=dataset_type,
+                    job_id=candidate_job_id,
+                    dimension="month",
+                    metric=metric,
+                    bucket="month",
                     from_date=from_date,
                     to_date=to_date,
+                )
+                if not _is_precomputed_cache_fresh(
+                    cache_updated_at=cache_updated_at,
+                    latest_marker_updated_at=_latest_cache_marker_updated_at(
+                        db=db,
+                        source=source_key,
+                        dataset_type=dataset_type,
+                        job_id=candidate_job_id,
+                        from_date=from_date,
+                        to_date=to_date,
+                        cache_kind="graph",
+                        dimension="month",
+                    ),
+                ):
+                    logger.info(
+                        "Master graph cache stale from upload marker; recomputing live source=%s dataset=%s metric=%s job_id=%s",
+                        source_key,
+                        dataset_type,
+                        metric,
+                        candidate_job_id,
+                    )
+                    should_recompute_live = True
+            if rows is not None and not _rows_have_values(rows, metric):
+                logger.warning(
+                    "Empty master metric graph cache detected; recomputing live source=%s dataset=%s metric=%s job_id=%s",
+                    source,
+                    dataset_type,
+                    metric,
+                    candidate_job_id,
+                )
+                should_recompute_live = True
+            if (
+                rows is not None
+                and not should_recompute_live
+                and source_key == "godrej"
+                and dataset_type == "sales"
+                and (
+                    _rows_have_future_months(rows)
+                    or _rows_have_month_window_mismatch(
+                        rows,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
                 )
             ):
                 logger.warning(
@@ -3304,7 +4793,6 @@ def _build_master_dashboard_payload(
     source_configs = [
         ("samsung_vs", "samsung_vs"),
         ("samsung_croma", "samsung_croma"),
-        ("samsung_croma_dsdsg", "samsung_croma_dsdsg"),
         ("samsung_reliance_digital", "samsung_reliance_digital"),
         ("reliance", "reliance"),
         ("godrej", "godrej"),
@@ -3375,22 +4863,7 @@ def _build_master_dashboard_payload(
         )
 
     min_date, max_date = _bounds_from_master_rows(list(rows.values()))
-    if not from_date and not to_date:
-        source_min, source_max = _master_source_bounds(db=db, job_id=job_id)
-        row_min_dt = pd.to_datetime(min_date, errors="coerce") if min_date else None
-        row_max_dt = pd.to_datetime(max_date, errors="coerce") if max_date else None
-        src_min_dt = pd.to_datetime(source_min, errors="coerce") if source_min else None
-        src_max_dt = pd.to_datetime(source_max, errors="coerce") if source_max else None
-
-        if src_min_dt is not None and pd.notna(src_min_dt):
-            if row_min_dt is None or pd.isna(row_min_dt) or src_min_dt < row_min_dt:
-                row_min_dt = src_min_dt
-        if src_max_dt is not None and pd.notna(src_max_dt):
-            if row_max_dt is None or pd.isna(row_max_dt) or src_max_dt > row_max_dt:
-                row_max_dt = src_max_dt
-
-        min_date = row_min_dt.date().isoformat() if row_min_dt is not None and pd.notna(row_min_dt) else min_date
-        max_date = row_max_dt.date().isoformat() if row_max_dt is not None and pd.notna(row_max_dt) else max_date
+    min_date, max_date = _finalize_master_date_bounds(min_date, max_date)
 
     return {
         "summaries": summaries,
@@ -3452,6 +4925,148 @@ def _schedule_master_dashboard_rebuild(
     ).start()
 
 
+def _schedule_summary_rebuild(
+    *,
+    job_id: str | None,
+    source: str,
+    dataset_type: str,
+    from_date: str | None,
+    to_date: str | None,
+) -> None:
+    key = "|".join(
+        [
+            (source or "").strip().lower(),
+            (dataset_type or "").strip().lower(),
+            (job_id or "").strip(),
+            from_date or "",
+            to_date or "",
+        ]
+    )
+    with _summary_rebuild_lock:
+        if key in _summary_rebuild_inflight:
+            return
+        _summary_rebuild_inflight.add(key)
+
+    def _worker() -> None:
+        worker_db = SessionLocal()
+        try:
+            payload = compute_summary_values(
+                db=worker_db,
+                job_id=job_id,
+                source=source,
+                dataset_type=dataset_type,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            upsert_precomputed_summary(
+                db=worker_db,
+                source=source,
+                dataset_type=dataset_type,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+                summary=payload if isinstance(payload, dict) else {},
+            )
+            worker_db.commit()
+        except Exception:
+            worker_db.rollback()
+            logger.exception(
+                "Failed background summary rebuild source=%s dataset=%s from=%s to=%s",
+                source,
+                dataset_type,
+                from_date,
+                to_date,
+            )
+        finally:
+            worker_db.close()
+            with _summary_rebuild_lock:
+                _summary_rebuild_inflight.discard(key)
+
+    threading.Thread(
+        target=_worker,
+        name=f"summary-rebuild-{(source or 'unknown').replace(' ', '-')}",
+        daemon=True,
+    ).start()
+
+
+def _schedule_graph_rebuild(
+    *,
+    job_id: str | None,
+    source: str,
+    dataset_type: str,
+    dimension: str,
+    metric: str,
+    bucket: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> None:
+    key = "|".join(
+        [
+            (source or "").strip().lower(),
+            (dataset_type or "").strip().lower(),
+            (job_id or "").strip(),
+            (dimension or "").strip().lower(),
+            (metric or "").strip().lower(),
+            (bucket or "").strip().lower(),
+            from_date or "",
+            to_date or "",
+        ]
+    )
+    with _graph_rebuild_lock:
+        if key in _graph_rebuild_inflight:
+            return
+        _graph_rebuild_inflight.add(key)
+
+    def _worker() -> None:
+        worker_db = SessionLocal()
+        try:
+            rows = compute_by_dimension_rows(
+                db=worker_db,
+                job_id=job_id,
+                dimension=dimension,
+                metric=metric,
+                source=source,
+                dataset_type=dataset_type,
+                bucket=bucket,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            upsert_precomputed_graph(
+                db=worker_db,
+                source=source,
+                dataset_type=dataset_type,
+                job_id=job_id,
+                dimension=dimension,
+                metric=metric,
+                bucket=bucket,
+                from_date=from_date,
+                to_date=to_date,
+                rows=rows if isinstance(rows, list) else [],
+            )
+            worker_db.commit()
+        except Exception:
+            worker_db.rollback()
+            logger.exception(
+                "Failed background graph rebuild source=%s dataset=%s dimension=%s metric=%s from=%s to=%s",
+                source,
+                dataset_type,
+                dimension,
+                metric,
+                from_date,
+                to_date,
+            )
+        finally:
+            worker_db.close()
+            with _graph_rebuild_lock:
+                _graph_rebuild_inflight.discard(key)
+
+    threading.Thread(
+        target=_worker,
+        name=f"graph-rebuild-{(source or 'unknown').replace(' ', '-')}",
+        daemon=True,
+    ).start()
+
+
 def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -3464,13 +5079,11 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "samsung_claims",
         "samsung_vs_sales",
         "samsung_croma_sales",
-        "samsung_croma_dsdsg_sales",
         "samsung_reliance_digital_sales",
         "reliance_sales",
         "godrej_sales",
         "samsung_vs_claims",
         "samsung_croma_claims",
-        "samsung_croma_dsdsg_claims",
         "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
@@ -3486,9 +5099,6 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "samsung_croma_gross",
         "samsung_croma_earned",
         "samsung_croma_zopper",
-        "samsung_croma_dsdsg_gross",
-        "samsung_croma_dsdsg_earned",
-        "samsung_croma_dsdsg_zopper",
         "samsung_reliance_digital_gross",
         "samsung_reliance_digital_earned",
         "samsung_reliance_digital_zopper",
@@ -3503,7 +5113,6 @@ def _is_valid_master_payload(payload: dict[str, Any] | None) -> bool:
         "hitachi_zopper",
         "samsung_vs_claims",
         "samsung_croma_claims",
-        "samsung_croma_dsdsg_claims",
         "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
@@ -3524,13 +5133,11 @@ def _empty_master_payload(
         "samsung_claims",
         "samsung_vs_sales",
         "samsung_croma_sales",
-        "samsung_croma_dsdsg_sales",
         "samsung_reliance_digital_sales",
         "reliance_sales",
         "godrej_sales",
         "samsung_vs_claims",
         "samsung_croma_claims",
-        "samsung_croma_dsdsg_claims",
         "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
@@ -3544,9 +5151,6 @@ def _empty_master_payload(
         "samsung_croma_gross",
         "samsung_croma_earned",
         "samsung_croma_zopper",
-        "samsung_croma_dsdsg_gross",
-        "samsung_croma_dsdsg_earned",
-        "samsung_croma_dsdsg_zopper",
         "samsung_reliance_digital_gross",
         "samsung_reliance_digital_earned",
         "samsung_reliance_digital_zopper",
@@ -3561,7 +5165,6 @@ def _empty_master_payload(
         "hitachi_zopper",
         "samsung_vs_claims",
         "samsung_croma_claims",
-        "samsung_croma_dsdsg_claims",
         "samsung_reliance_digital_claims",
         "reliance_claims",
         "godrej_claims",
@@ -3605,6 +5208,187 @@ def _get_master_cache_updated_at(
     return row.updated_at if row is not None else None
 
 
+def _get_summary_cache_updated_at(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> datetime | None:
+    row = (
+        db.query(PrecomputedSummary)
+        .filter(PrecomputedSummary.source == (source or "").strip().lower())
+        .filter(PrecomputedSummary.dataset_type == (dataset_type or "").strip().lower())
+        .filter(PrecomputedSummary.job_key == (job_id or "").strip())
+        .filter(PrecomputedSummary.from_date == (from_date or "").strip())
+        .filter(PrecomputedSummary.to_date == (to_date or "").strip())
+        .first()
+    )
+    return row.updated_at if row is not None else None
+
+
+def _get_graph_cache_updated_at(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    dimension: str,
+    metric: str,
+    bucket: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> datetime | None:
+    row = (
+        db.query(PrecomputedGraph)
+        .filter(PrecomputedGraph.source == (source or "").strip().lower())
+        .filter(PrecomputedGraph.dataset_type == (dataset_type or "").strip().lower())
+        .filter(PrecomputedGraph.job_key == (job_id or "").strip())
+        .filter(PrecomputedGraph.dimension == (dimension or "").strip().lower())
+        .filter(PrecomputedGraph.metric == (metric or "").strip().lower())
+        .filter(PrecomputedGraph.bucket == (bucket or "").strip())
+        .filter(PrecomputedGraph.from_date == (from_date or "").strip())
+        .filter(PrecomputedGraph.to_date == (to_date or "").strip())
+        .first()
+    )
+    return row.updated_at if row is not None else None
+
+
+def _latest_manual_update_marker_updated_at(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+) -> datetime | None:
+    source_key = (source or "").strip().lower()
+    source_variants = list(SAMSUNG_SOURCE_VARIANTS) if source_key == "samsung" else [source_key]
+    query = (
+        db.query(func.max(ManualUpdateMarker.updated_at))
+        .filter(ManualUpdateMarker.source.in_(source_variants))
+        .filter(ManualUpdateMarker.dataset_type == (dataset_type or "").strip().lower())
+    )
+    job_key = (job_id or "").strip()
+    if job_key:
+        query = query.filter(ManualUpdateMarker.job_key.in_([job_key, ""]))
+    return query.scalar()
+
+
+def _latest_cache_marker_updated_at(
+    *,
+    db: Session,
+    source: str,
+    dataset_type: str,
+    job_id: str | None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    cache_kind: str = "summary",
+    dimension: str | None = None,
+) -> datetime | None:
+    latest_marker = _latest_manual_update_marker_updated_at(
+        db=db,
+        source=source,
+        dataset_type=dataset_type,
+        job_id=job_id,
+    )
+
+    source_key = (source or "").strip().lower()
+    dataset_key = (dataset_type or "").strip().lower()
+    samsung_source = normalize_samsung_source(source_key)
+    canonical_source = samsung_source if samsung_source else source_key
+    if canonical_source in {"reliance resq", "reliance_resq", "reliance-resq", "resq"}:
+        canonical_source = "reliance"
+    if canonical_source in {"goodrej", "goddrej"}:
+        canonical_source = "godrej"
+
+    def _needs_scope_refresh() -> bool:
+        if dataset_key != "sales":
+            return False
+        if not from_date and not to_date:
+            return False
+        if not from_date or not to_date:
+            return True
+        start = pd.to_datetime(from_date, errors="coerce")
+        end = pd.to_datetime(to_date, errors="coerce")
+        if pd.isna(start) or pd.isna(end):
+            return True
+        return abs((end.normalize() - start.normalize()).days) <= 31
+
+    code_marker: datetime | None = None
+    if _needs_scope_refresh():
+        if cache_kind == "graph" and canonical_source in _GRAPH_SCOPE_REFRESH_SOURCES:
+            code_marker = _SALES_SCOPING_CACHE_UPDATED_AT
+        elif cache_kind != "graph" and canonical_source in _SUMMARY_SCOPE_REFRESH_SOURCES:
+            code_marker = _SALES_SCOPING_CACHE_UPDATED_AT
+
+    if (
+        cache_kind == "graph"
+        and dataset_key == "sales"
+        and canonical_source == "reliance"
+        and _to_safe_key(dimension or "") in {"brand", "article_brand"}
+    ):
+        if code_marker is None:
+            code_marker = _RELIANCE_BRAND_CACHE_UPDATED_AT
+        else:
+            code_marker = max(pd.Timestamp(code_marker), pd.Timestamp(_RELIANCE_BRAND_CACHE_UPDATED_AT)).to_pydatetime()
+
+    if (
+        cache_kind == "graph"
+        and canonical_source == "hitachi"
+        and _to_safe_key(dimension or "") == "plan_category"
+    ):
+        if code_marker is None:
+            code_marker = _HITACHI_PLAN_CACHE_UPDATED_AT
+        else:
+            code_marker = max(pd.Timestamp(code_marker), pd.Timestamp(_HITACHI_PLAN_CACHE_UPDATED_AT)).to_pydatetime()
+
+    if latest_marker is None:
+        return code_marker
+    if code_marker is None:
+        return latest_marker
+    latest_ts = pd.Timestamp(latest_marker)
+    code_ts = pd.Timestamp(code_marker)
+    if latest_ts.tzinfo is not None:
+        latest_ts = latest_ts.tz_convert(None)
+    if code_ts.tzinfo is not None:
+        code_ts = code_ts.tz_convert(None)
+    return max(latest_ts, code_ts).to_pydatetime()
+
+
+def _is_precomputed_cache_fresh(
+    *,
+    cache_updated_at: datetime | None,
+    latest_marker_updated_at: datetime | None,
+) -> bool:
+    if cache_updated_at is None:
+        return False
+    if latest_marker_updated_at is None:
+        return True
+    cache_ts = pd.Timestamp(cache_updated_at)
+    latest_ts = pd.Timestamp(latest_marker_updated_at)
+    if cache_ts.tzinfo is not None:
+        cache_ts = cache_ts.tz_convert(None)
+    if latest_ts.tzinfo is not None:
+        latest_ts = latest_ts.tz_convert(None)
+    return cache_ts >= latest_ts
+
+
+def _merge_cache_freshness_markers(
+    *markers: datetime | None,
+) -> datetime | None:
+    latest: pd.Timestamp | None = None
+    for marker in markers:
+        if marker is None:
+            continue
+        marker_ts = pd.Timestamp(marker)
+        if marker_ts.tzinfo is not None:
+            marker_ts = marker_ts.tz_convert(None)
+        latest = marker_ts if latest is None else max(latest, marker_ts)
+    return latest.to_pydatetime() if latest is not None else None
+
+
 def _latest_master_marker_updated_at(
     *,
     db: Session,
@@ -3614,7 +5398,6 @@ def _latest_master_marker_updated_at(
         "samsung",
         "samsung_vs",
         "samsung_croma",
-        "samsung_croma_dsdsg",
         "samsung_reliance_digital",
         "samsung_vijay_sales",
         "reliance",
@@ -3629,8 +5412,6 @@ def _latest_master_marker_updated_at(
     job_key = (job_id or "").strip()
     if job_key:
         query = query.filter(ManualUpdateMarker.job_key.in_([job_key, ""]))
-    else:
-        query = query.filter(ManualUpdateMarker.job_key == "")
     return query.scalar()
 
 
@@ -3643,7 +5424,7 @@ def analytics_master_dashboard(
 ):
     started = time.perf_counter()
     from_date, to_date = _sanitize_range(from_date, to_date)
-    cache_source = "master_dashboard_v11"
+    cache_source = "master_dashboard_v15"
 
     cached = get_precomputed_summary(
         db=db,
@@ -3660,44 +5441,58 @@ def analytics_master_dashboard(
         from_date=from_date,
         to_date=to_date,
     )
-    latest_marker_updated_at = _latest_master_marker_updated_at(db=db, job_id=job_id)
+    latest_marker_updated_at = _merge_cache_freshness_markers(
+        _latest_master_marker_updated_at(db=db, job_id=job_id),
+        _MASTER_DASHBOARD_CACHE_UPDATED_AT,
+    )
     cache_is_fresh = False
     if cache_updated_at is not None:
-        if latest_marker_updated_at is None:
-            cache_is_fresh = True
-        else:
-            cache_is_fresh = pd.Timestamp(cache_updated_at) >= pd.Timestamp(latest_marker_updated_at)
+        cache_is_fresh = _is_precomputed_cache_fresh(
+            cache_updated_at=cache_updated_at,
+            latest_marker_updated_at=latest_marker_updated_at,
+        )
+    cache_is_code_stale = False
+    if cache_updated_at is not None:
+        cache_is_code_stale = not _is_precomputed_cache_fresh(
+            cache_updated_at=cache_updated_at,
+            latest_marker_updated_at=_MASTER_DASHBOARD_CACHE_UPDATED_AT,
+        )
     cache_has_godrej_sales_month_mismatch = _master_payload_has_godrej_sales_month_mismatch(
         cached,
         from_date=from_date,
         to_date=to_date,
     )
 
-    if _is_valid_master_payload(cached):
-        if cache_is_fresh and not cache_has_godrej_sales_month_mismatch:
+    if _is_valid_master_payload(cached) and not cache_has_godrej_sales_month_mismatch:
+        if cache_is_fresh:
             logger.info(
                 "TIMING analytics.master_dashboard mode=precomputed duration_ms=%.2f",
                 (time.perf_counter() - started) * 1000,
             )
             return cached
-        if cache_has_godrej_sales_month_mismatch:
-            logger.warning(
-                "Stale master dashboard cache detected; serving stale and rebuilding source=%s from=%s to=%s",
-                cache_source,
-                from_date,
-                to_date,
+        if cache_is_code_stale:
+            logger.info(
+                "Master dashboard cache stale from code marker; rebuilding synchronously.",
             )
         else:
             logger.info(
                 "Master dashboard cache stale; serving cached payload and rebuilding in background.",
             )
-        _schedule_master_dashboard_rebuild(
-            job_id=job_id,
-            from_date=from_date,
-            to_date=to_date,
-            cache_source=cache_source,
+            _schedule_master_dashboard_rebuild(
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+                cache_source=cache_source,
+            )
+            return cached
+
+    if cache_has_godrej_sales_month_mismatch:
+        logger.warning(
+            "Invalid Godrej master cache detected; rebuilding synchronously source=%s from=%s to=%s",
+            cache_source,
+            from_date,
+            to_date,
         )
-        return cached
 
     payload_is_fallback = False
     try:
@@ -3741,6 +5536,315 @@ def analytics_master_dashboard(
     return payload
 
 
+@router.get("/forecast")
+def analytics_forecast(
+    source: str = Query(...),
+    dataset_type: str = Query(...),
+    metric: str = Query("gross_premium"),
+    job_id: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    horizon_months: int = Query(6, ge=1, le=24),
+    grain: str = Query("month"),
+    db: Session = Depends(get_db),
+):
+    safe_from, safe_to = _sanitize_range(from_date, to_date)
+    resolved_source, _ = _normalize_source(source)
+    dataset_key = (dataset_type or "").strip().lower()
+    resolved_job_id = _resolve_job_id_fallback(
+        db=db,
+        resolved_source=resolved_source,
+        dataset_key=dataset_key,
+        job_id=job_id,
+        context="forecast",
+    )
+    return build_forecast_response(
+        db=db,
+        source=resolved_source,
+        dataset_type=dataset_key,
+        metric=metric,
+        job_id=resolved_job_id,
+        from_date=safe_from,
+        to_date=safe_to,
+        horizon_months=horizon_months,
+        grain=grain,
+    )
+
+
+@router.get("/annual-comparison")
+def analytics_annual_comparison(
+    job_id: str | None = Query(None),
+    source: str = Query(...),
+    dataset_type: str = Query(...),
+    metric: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    started = time.perf_counter()
+    safe_from, safe_to = _sanitize_range(from_date, to_date)
+    resolved_source, engine_key = _normalize_source(source)
+    normalized_dataset = (dataset_type or "").strip().lower()
+    current_from, current_to = _annual_build_current_range(safe_from, safe_to)
+    year_buckets = _annual_build_year_buckets(current_from, current_to)
+    if normalized_dataset not in {"sales", "claims"} or not year_buckets:
+        return {
+            "year_buckets": year_buckets,
+            "payload_by_metric": {},
+        }
+
+    selected_metric = _to_safe_key(metric or "")
+    if normalized_dataset == "claims":
+        if selected_metric not in _ANNUAL_SUPPORTED_CLAIMS_METRICS:
+            selected_metric = "claims"
+        cache_metric = selected_metric
+    else:
+        selected_metric = "quantity"
+        cache_metric = "sales"
+
+    resolved_job_id = _resolve_job_id_fallback(
+        db=db,
+        resolved_source=resolved_source,
+        dataset_key=normalized_dataset,
+        job_id=job_id,
+        context="annual_comparison",
+    )
+    cache_bucket = _annual_comparison_cache_bucket(resolved_source)
+
+    cached_rows = get_precomputed_graph(
+        db=db,
+        source=resolved_source,
+        dataset_type=normalized_dataset,
+        job_id=resolved_job_id,
+        dimension=_ANNUAL_COMPARISON_DIMENSION,
+        metric=cache_metric,
+        bucket=cache_bucket,
+        from_date=current_from,
+        to_date=current_to,
+    )
+    if cached_rows:
+        cached_payload = next(
+            (
+                row
+                for row in cached_rows
+                if isinstance(row, dict) and isinstance(row.get("payload_by_metric"), dict)
+            ),
+            None,
+        )
+        if cached_payload is not None and _annual_payload_has_signal(cached_payload):
+            logger.info(
+                "TIMING analytics.annual_comparison source=%s dataset=%s metric=%s mode=precomputed duration_ms=%.2f",
+                source,
+                dataset_type,
+                cache_metric,
+                (time.perf_counter() - started) * 1000,
+            )
+            return cached_payload
+
+    fetch_from = year_buckets[0]["from"]
+    fetch_to = year_buckets[-1]["to"]
+    needs_sales = normalized_dataset == "sales" or selected_metric == "loss_ratio"
+    needs_claims = normalized_dataset == "claims"
+
+    engine = None
+    base_payload = None
+    engine_cls = ENGINE_REGISTRY.get(engine_key)
+    if engine_cls is not None:
+        engine = engine_cls(
+            db=db,
+            job_id=resolved_job_id,
+            source=resolved_source,
+            dataset_type=normalized_dataset,
+            from_date=fetch_from,
+            to_date=fetch_to,
+        )
+        if engine_key in {"samsung", "godrej", "hitachi"}:
+            base_payload = engine.load_data(include_sales=needs_sales, include_claims=needs_claims)
+        else:
+            base_payload = engine.load_data()
+
+    def _fetch_rows(
+        *,
+        dimension: str,
+        metric_name: str,
+        category_filters: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if resolved_source == "samsung" and normalized_dataset == "sales":
+            try:
+                rows = compute_by_dimension_rows(
+                    db=db,
+                    job_id=resolved_job_id,
+                    dimension=dimension,
+                    metric=metric_name,
+                    source=resolved_source,
+                    dataset_type=normalized_dataset,
+                    bucket="month" if _to_safe_key(dimension) == "month" else None,
+                    from_date=fetch_from,
+                    to_date=fetch_to,
+                    category_filters=category_filters,
+                )
+                return _annual_sum_samsung_partner_rows(
+                    rows,
+                    dimension=dimension,
+                    metric=metric_name,
+                )
+            except Exception:
+                logger.exception(
+                    "Annual comparison samsung partner-merge failed source=%s dataset=%s dimension=%s metric=%s filters=%s",
+                    resolved_source,
+                    normalized_dataset,
+                    dimension,
+                    metric_name,
+                    category_filters,
+                )
+                return []
+
+        if engine is None:
+            try:
+                return compute_by_dimension_rows(
+                    db=db,
+                    job_id=resolved_job_id,
+                    dimension=dimension,
+                    metric=metric_name,
+                    source=resolved_source,
+                    dataset_type=normalized_dataset,
+                    bucket="month" if _to_safe_key(dimension) == "month" else None,
+                    from_date=fetch_from,
+                    to_date=fetch_to,
+                    category_filters=category_filters,
+                )
+            except Exception:
+                logger.exception(
+                    "Annual comparison fallback compute failed source=%s dataset=%s dimension=%s metric=%s",
+                    resolved_source,
+                    normalized_dataset,
+                    dimension,
+                    metric_name,
+                )
+                return []
+
+        if not category_filters:
+            try:
+                rows = engine.compute_by_dimension(dimension=dimension, metric=metric_name)
+                return _normalize_dimension_rows(rows, dimension=dimension)
+            except Exception:
+                logger.exception(
+                    "Annual comparison engine compute failed source=%s dataset=%s dimension=%s metric=%s",
+                    resolved_source,
+                    normalized_dataset,
+                    dimension,
+                    metric_name,
+                )
+                return []
+
+        original_cache = getattr(engine, "_loaded_data_cache", None)
+        try:
+            filtered_payload = _apply_dimension_filters_to_payload(base_payload or {}, category_filters)
+            if engine_key in {"samsung", "godrej", "hitachi"}:
+                cache_map = dict(original_cache or {})
+                cache_map[(needs_sales, needs_claims)] = filtered_payload
+                engine._loaded_data_cache = cache_map
+            else:
+                engine._loaded_data_cache = filtered_payload
+            rows = engine.compute_by_dimension(dimension=dimension, metric=metric_name)
+            return _normalize_dimension_rows(rows, dimension=dimension)
+        except Exception:
+            logger.exception(
+                "Annual comparison filtered engine compute failed source=%s dataset=%s dimension=%s metric=%s filters=%s",
+                resolved_source,
+                normalized_dataset,
+                dimension,
+                metric_name,
+                category_filters,
+            )
+            return []
+        finally:
+            engine._loaded_data_cache = original_cache
+
+    plan_seed_metric = "quantity" if normalized_dataset == "sales" else "claims"
+    plan_rows = _fetch_rows(dimension="plan_category", metric_name=plan_seed_metric)
+    plans = _annual_extract_plans(resolved_source, plan_rows)
+    payload_by_metric: dict[str, Any] = {}
+
+    if normalized_dataset == "sales":
+        quantity_rows_by_plan = {
+            plan: _fetch_rows(
+                dimension="month",
+                metric_name="quantity",
+                category_filters=[{"dimension": "plan_category", "values": [plan]}],
+            )
+            for plan in plans
+        }
+        payload_by_metric["quantity"] = _annual_build_plan_payload(
+            plans,
+            quantity_rows_by_plan,
+            "quantity",
+            year_buckets,
+        )
+
+        for summary_metric in _ANNUAL_SALES_SUMMARY_METRICS:
+            summary_rows = _fetch_rows(dimension="month", metric_name=summary_metric)
+            payload_by_metric[summary_metric] = _annual_build_total_payload(
+                summary_rows,
+                summary_metric,
+                year_buckets,
+            )
+    else:
+        rows_by_plan = {
+            plan: _fetch_rows(
+                dimension="month",
+                metric_name=selected_metric,
+                category_filters=[{"dimension": "plan_category", "values": [plan]}],
+            )
+            for plan in plans
+        }
+        payload_by_metric[selected_metric] = _annual_build_plan_payload(
+            plans,
+            rows_by_plan,
+            selected_metric,
+            year_buckets,
+        )
+
+    response = {
+        "year_buckets": year_buckets,
+        "payload_by_metric": payload_by_metric,
+    }
+
+    if _annual_payload_has_signal(response):
+        try:
+            upsert_precomputed_graph(
+                db=db,
+                source=resolved_source,
+                dataset_type=normalized_dataset,
+                job_id=resolved_job_id,
+                dimension=_ANNUAL_COMPARISON_DIMENSION,
+                metric=cache_metric,
+                bucket=cache_bucket,
+                from_date=current_from,
+                to_date=current_to,
+                rows=[response],
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to upsert annual comparison cache source=%s dataset=%s metric=%s",
+                resolved_source,
+                normalized_dataset,
+                cache_metric,
+            )
+
+    logger.info(
+        "TIMING analytics.annual_comparison source=%s dataset=%s metric=%s plans=%s duration_ms=%.2f",
+        source,
+        dataset_type,
+        cache_metric,
+        len(plans),
+        (time.perf_counter() - started) * 1000,
+    )
+    return response
+
+
 @router.get("/summary")
 def analytics_summary(
     job_id: str | None = Query(None),
@@ -3761,10 +5865,7 @@ def analytics_summary(
         job_id=job_id,
         context="summary",
     )
-    force_live_summary = (
-        (resolved_source.startswith("samsung") and normalized_dataset == "sales")
-        or (resolved_source == "hitachi" and normalized_dataset == "sales")
-    )
+    force_live_summary = resolved_source == "samsung" and normalized_dataset == "sales"
 
     if resolved_source == "samsung" and not force_live_summary:
         partner_rows: list[dict[str, Any]] = []
@@ -3777,7 +5878,26 @@ def analytics_summary(
                 from_date=from_date,
                 to_date=to_date,
             )
-            if partner_summary is None:
+            partner_cache_updated_at = _get_summary_cache_updated_at(
+                db=db,
+                source=partner_source,
+                dataset_type=normalized_dataset,
+                job_id=job_id,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            partner_cache_is_fresh = _is_precomputed_cache_fresh(
+                cache_updated_at=partner_cache_updated_at,
+                latest_marker_updated_at=_latest_cache_marker_updated_at(
+                    db=db,
+                    source=partner_source,
+                    dataset_type=normalized_dataset,
+                    job_id=job_id,
+                    from_date=from_date,
+                    to_date=to_date,
+                ),
+            )
+            if not isinstance(partner_summary, dict) or not partner_cache_is_fresh:
                 partner_rows = []
                 break
             partner_rows.append(partner_summary)
@@ -3805,72 +5925,146 @@ def analytics_summary(
         from_date=from_date,
         to_date=to_date,
     )
+    cache_updated_at = _get_summary_cache_updated_at(
+        db=db,
+        source=resolved_source,
+        dataset_type=normalized_dataset,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    manual_summary_marker_updated_at = _latest_manual_update_marker_updated_at(
+        db=db,
+        source=resolved_source,
+        dataset_type=normalized_dataset,
+        job_id=job_id,
+    )
+    latest_summary_marker_updated_at = _latest_cache_marker_updated_at(
+        db=db,
+        source=resolved_source,
+        dataset_type=normalized_dataset,
+        job_id=job_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    cache_is_fresh = _is_precomputed_cache_fresh(
+        cache_updated_at=cache_updated_at,
+        latest_marker_updated_at=latest_summary_marker_updated_at,
+    )
     if cached is not None and not force_live_summary:
-        gross_cached = float(cached.get("gross_premium", 0) or 0)
-        earned_cached = float(cached.get("earned_premium", 0) or 0)
-        zopper_cached = float(cached.get("zopper_earned_premium", 0) or 0)
-        units_cached = int(cached.get("units_sold", 0) or 0)
-        all_financial_zero = (
-            gross_cached == 0
-            and earned_cached == 0
-            and zopper_cached == 0
-        )
+        if not cache_is_fresh:
+            manual_marker_only_stale = False
+            if (
+                cache_updated_at is not None
+                and manual_summary_marker_updated_at is not None
+                and latest_summary_marker_updated_at is not None
+            ):
+                cache_ts = pd.Timestamp(cache_updated_at)
+                manual_ts = pd.Timestamp(manual_summary_marker_updated_at)
+                latest_ts = pd.Timestamp(latest_summary_marker_updated_at)
+                if cache_ts.tzinfo is not None:
+                    cache_ts = cache_ts.tz_convert(None)
+                if manual_ts.tzinfo is not None:
+                    manual_ts = manual_ts.tz_convert(None)
+                if latest_ts.tzinfo is not None:
+                    latest_ts = latest_ts.tz_convert(None)
+                manual_marker_only_stale = cache_ts < manual_ts and latest_ts == manual_ts
 
-        source_variants = (
-            list(SAMSUNG_SOURCE_VARIANTS)
-            if resolved_source == "samsung"
-            else [resolved_source]
-        )
+            gross_cached = float(cached.get("gross_premium", 0) or 0)
+            earned_cached = float(cached.get("earned_premium", 0) or 0)
+            zopper_cached = float(cached.get("zopper_earned_premium", 0) or 0)
+            all_financial_zero = (
+                gross_cached == 0
+                and earned_cached == 0
+                and zopper_cached == 0
+            )
 
-        def _has_rows_in_scope() -> bool:
-            if from_date is None and to_date is None:
-                query = (
-                    db.query(func.count(DataRow.id))
-                    .filter(DataRow.source.in_(source_variants))
-                    .filter(DataRow.dataset_type == normalized_dataset)
-                )
-                if job_id is not None:
-                    query = query.filter(DataRow.job_id == job_id)
-                count = query.scalar()
-                return int(count or 0) > 0
-
-            for src in source_variants:
-                scoped_df = get_dataframe(
-                    db=db,
+            if manual_marker_only_stale and not all_financial_zero:
+                _schedule_summary_rebuild(
                     job_id=job_id,
-                    source=src,
+                    source=resolved_source,
                     dataset_type=normalized_dataset,
+                    from_date=from_date,
+                    to_date=to_date,
                 )
-                if scoped_df is None or scoped_df.empty:
-                    continue
-                scoped_df = filter_by_date_range(scoped_df, normalized_dataset, from_date, to_date)
-                if scoped_df is not None and not scoped_df.empty:
-                    return True
-            return False
+                logger.info(
+                    "TIMING analytics.summary source=%s dataset=%s mode=precomputed_stale_background duration_ms=%.2f",
+                    source,
+                    dataset_type,
+                    (time.perf_counter() - started) * 1000,
+                )
+                return cached
 
-        has_rows_in_scope = _has_rows_in_scope() if all_financial_zero else False
-        is_stale_zero_with_units = all_financial_zero and units_cached > 0
-        is_stale_zero_empty = all_financial_zero and units_cached == 0
-        is_stale_zero_with_rows = is_stale_zero_empty and (
-            has_rows_in_scope or resolved_source.startswith("samsung")
-        )
-
-        if is_stale_zero_with_units or is_stale_zero_with_rows:
-            reason = "zero_with_units" if is_stale_zero_with_units else "zero_with_rows"
-            logger.warning(
-                "Stale precomputed summary detected (%s); recomputing live source=%s dataset=%s",
-                reason,
+            logger.info(
+                "Stale precomputed summary detected; recomputing live source=%s dataset=%s",
                 resolved_source,
                 normalized_dataset,
             )
         else:
-            logger.info(
-                "TIMING analytics.summary source=%s dataset=%s mode=precomputed duration_ms=%.2f",
-                source,
-                dataset_type,
-                (time.perf_counter() - started) * 1000,
+            gross_cached = float(cached.get("gross_premium", 0) or 0)
+            earned_cached = float(cached.get("earned_premium", 0) or 0)
+            zopper_cached = float(cached.get("zopper_earned_premium", 0) or 0)
+            units_cached = int(cached.get("units_sold", 0) or 0)
+            all_financial_zero = (
+                gross_cached == 0
+                and earned_cached == 0
+                and zopper_cached == 0
             )
-            return cached
+
+            source_variants = (
+                list(SAMSUNG_SOURCE_VARIANTS)
+                if resolved_source == "samsung"
+                else [resolved_source]
+            )
+
+            def _has_rows_in_scope() -> bool:
+                if from_date is None and to_date is None:
+                    query = (
+                        db.query(func.count(DataRow.id))
+                        .filter(DataRow.source.in_(source_variants))
+                        .filter(DataRow.dataset_type == normalized_dataset)
+                    )
+                    if job_id is not None:
+                        query = query.filter(DataRow.job_id == job_id)
+                    count = query.scalar()
+                    return int(count or 0) > 0
+
+                for src in source_variants:
+                    scoped_df = get_dataframe(
+                        db=db,
+                        job_id=job_id,
+                        source=src,
+                        dataset_type=normalized_dataset,
+                    )
+                    if scoped_df is None or scoped_df.empty:
+                        continue
+                    scoped_df = filter_by_date_range(scoped_df, normalized_dataset, from_date, to_date)
+                    if scoped_df is not None and not scoped_df.empty:
+                        return True
+                return False
+
+            has_rows_in_scope = _has_rows_in_scope() if all_financial_zero and not cache_is_fresh else False
+            is_stale_zero_with_units = all_financial_zero and units_cached > 0
+            is_stale_zero_with_rows = False
+            if all_financial_zero and units_cached == 0 and not cache_is_fresh:
+                is_stale_zero_with_rows = has_rows_in_scope or resolved_source.startswith("samsung")
+
+            if is_stale_zero_with_units or is_stale_zero_with_rows:
+                reason = "zero_with_units" if is_stale_zero_with_units else "zero_with_rows"
+                logger.warning(
+                    "Stale precomputed summary detected (%s); recomputing live source=%s dataset=%s",
+                    reason,
+                    resolved_source,
+                    normalized_dataset,
+                )
+            else:
+                logger.info(
+                    "TIMING analytics.summary source=%s dataset=%s mode=precomputed duration_ms=%.2f",
+                    source,
+                    dataset_type,
+                    (time.perf_counter() - started) * 1000,
+                )
+                return cached
     elif cached is not None and force_live_summary:
         logger.info(
             "Bypassing precomputed summary; recomputing live source=%s dataset=%s from=%s to=%s",
@@ -3880,14 +6074,32 @@ def analytics_summary(
             to_date,
         )
 
-    out = compute_summary_values(
-        db=db,
-        job_id=job_id,
-        source=source,
-        dataset_type=normalized_dataset,
-        from_date=from_date,
-        to_date=to_date,
-    )
+    try:
+        out = compute_summary_values(
+            db=db,
+            job_id=job_id,
+            source=source,
+            dataset_type=normalized_dataset,
+            from_date=from_date,
+            to_date=to_date,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Live compute failed for analytics.summary source=%s dataset=%s from=%s to=%s",
+            source,
+            dataset_type,
+            from_date,
+            to_date,
+        )
+        if isinstance(cached, dict):
+            return cached
+        return {
+            "gross_premium": 0,
+            "earned_premium": 0,
+            "zopper_earned_premium": 0,
+            "units_sold": 0,
+        }
     logger.info(
         "TIMING analytics.summary source=%s dataset=%s mode=live duration_ms=%.2f",
         source,
@@ -4022,6 +6234,7 @@ def analytics_date_bounds(
     dataset_type: str = Query(...),
     db: Session = Depends(get_db),
 ):
+    started = time.perf_counter()
     resolved_source, _ = _normalize_source(source)
     dataset_key = (dataset_type or "").strip().lower()
     job_id = _resolve_job_id_fallback(
@@ -4031,36 +6244,83 @@ def analytics_date_bounds(
         job_id=job_id,
         context="date_bounds",
     )
+    cache_dataset_type = _date_bounds_cache_dataset_type(dataset_key)
+    cached = get_precomputed_summary(
+        db=db,
+        source=resolved_source,
+        dataset_type=cache_dataset_type,
+        job_id=job_id,
+        from_date=None,
+        to_date=None,
+    )
+    cache_updated_at = _get_date_bounds_cache_updated_at(
+        db=db,
+        source=resolved_source,
+        dataset_type=dataset_key,
+        job_id=job_id,
+    )
+    latest_marker_updated_at = _latest_date_bounds_marker_updated_at(
+        db=db,
+        source=resolved_source,
+        dataset_type=dataset_key,
+        job_id=job_id,
+    )
+    cache_is_fresh = False
+    if cache_updated_at is not None:
+        if latest_marker_updated_at is None:
+            cache_is_fresh = True
+        else:
+            cache_is_fresh = pd.Timestamp(cache_updated_at) >= pd.Timestamp(latest_marker_updated_at)
 
-    if resolved_source == "samsung":
-        bounds = [
-            _date_bounds_for_source_dataset(
-                db=db,
-                source=partner_source,
-                dataset_type=dataset_key,
-                job_id=job_id,
-            )
-            for partner_source in SAMSUNG_PARTNER_SOURCES
-        ]
-        min_candidates = [local_min for local_min, _local_max in bounds if local_min is not None]
-        max_candidates = [local_max for _local_min, local_max in bounds if local_max is not None]
-        min_date = min(min_candidates) if min_candidates else None
-        max_date = max(max_candidates) if max_candidates else None
-    else:
-        min_date, max_date = _date_bounds_for_source_dataset(
+    force_live_date_bounds = resolved_source == "samsung" and dataset_key == "sales"
+
+    if isinstance(cached, dict) and cache_is_fresh and not force_live_date_bounds:
+        min_date = str(cached.get("min_date") or "").strip() or None
+        max_date = str(cached.get("max_date") or "").strip() or None
+        logger.info(
+            "TIMING analytics.date_bounds source=%s dataset=%s mode=precomputed duration_ms=%.2f",
+            source,
+            dataset_type,
+            (time.perf_counter() - started) * 1000,
+        )
+        return {
+            "min_date": min_date,
+            "max_date": max_date,
+        }
+
+    payload = compute_date_bounds_payload(
+        db=db,
+        source=resolved_source,
+        dataset_type=dataset_key,
+        job_id=job_id,
+    )
+    try:
+        upsert_precomputed_summary(
             db=db,
             source=resolved_source,
-            dataset_type=dataset_key,
+            dataset_type=cache_dataset_type,
             job_id=job_id,
+            from_date=None,
+            to_date=None,
+            summary=payload,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to upsert date bounds cache source=%s dataset=%s job_id=%s",
+            resolved_source,
+            dataset_key,
+            job_id,
         )
 
-    if min_date is not None and max_date is not None and min_date > max_date:
-        min_date = max_date
-
-    return {
-        "min_date": min_date.date().isoformat() if min_date is not None else None,
-        "max_date": max_date.date().isoformat() if max_date is not None else None,
-    }
+    logger.info(
+        "TIMING analytics.date_bounds source=%s dataset=%s mode=live duration_ms=%.2f",
+        source,
+        dataset_type,
+        (time.perf_counter() - started) * 1000,
+    )
+    return payload
 
 
 @router.get("/distinct")

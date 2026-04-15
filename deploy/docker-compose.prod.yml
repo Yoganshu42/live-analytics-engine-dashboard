@@ -16,7 +16,7 @@ services:
       SARVAM_API_KEY: sk_nw2w0nwy_cnKdoteNsOPuFaA35ACGepc4
       SARVAM_MODEL: sarvam-m
       SARVAM_TIMEOUT_SECONDS: "110"
-      LLM_PREWARM: "1"
+      LLM_PREWARM: "0"
       CHATCARDS_MODEL: sarvam-m
       CHATCARDS_TEMPERATURE: "0.20"
       CHATCARDS_NUM_PREDICT: "900"
@@ -35,11 +35,14 @@ services:
       CHATBOT_LARGE_NUM_PREDICT: "1800"
       CHATBOT_RETRY_NUM_PREDICT: "640"
       CHATBOT_REPAIR_NUM_PREDICT: "640"
-      CHATBOT_NUM_CTX: "4096"
       CHATBOT_CACHE_TTL_SECONDS: "180"
       CHATBOT_CACHE_MAX_ITEMS: "256"
       ENABLE_GRAPH_INSIGHTS: "1"
       ENABLE_CHATBOT: "1"
+      AUTO_DAILY_REFRESH: "1"
+      AUTO_DAILY_REFRESH_STARTUP_DELAY_SECONDS: "120"
+      AUTO_DAILY_REFRESH_CHECK_INTERVAL_SECONDS: "3600"
+      AUTO_DAILY_REFRESH_INCLUDE_TAGGED_JOBS: "0"
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -48,9 +51,9 @@ services:
     build:
       context: ./frontend/my-app
       args:
-        NEXT_PUBLIC_API_BASE: http://13.235.56.166
+        NEXT_PUBLIC_API_BASE: http://13.202.80.63/api
     environment:
-      NEXT_PUBLIC_API_BASE: http://13.235.56.166
+      NEXT_PUBLIC_API_BASE: http://13.202.80.63/api
       NEXT_PUBLIC_CHATBOT_TIMEOUT_MS: "120000"
     ports:
       - "3000:3000"

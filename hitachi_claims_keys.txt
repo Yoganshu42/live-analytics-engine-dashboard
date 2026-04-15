@@ -1,0 +1,51 @@
+Approval Status
+ApprovedDate
+Branch Name
+Call Date
+Call No
+Call Status
+Call Type
+Capacity
+Care+ Plan Description
+Care+ Plan ID
+Care+ Plan Name
+Channel
+Channel Name
+City
+Claim Date
+Claim_Amount
+Coverage Type
+Customer Name
+Date
+Dealer ID
+Dealer Name
+Dealer Type
+End Date
+End_Date
+Major call Operation
+Mobile Primary
+Model Description
+Model No
+Month
+Month Name
+Month_Name
+Nature of Complaint
+Net Amount
+New Branch
+ODU SrNo
+Payout Amount
+Payout Type
+Plan End Date
+Plan Start Date
+Product Category
+Product SubCatergory
+Product_Category
+Purchase From
+SMS Closure Date
+Service Closed Date
+Start Date
+Start_Date
+State
+Warranty End Date
+Warranty Start Date
+Zone Name

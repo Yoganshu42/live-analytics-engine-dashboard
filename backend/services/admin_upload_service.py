@@ -95,10 +95,19 @@ def resolve_job_id(
     dataset_type: str,
     requested_job_id: str | None,
     uploaded_at: datetime | None = None,
+    prefer_existing_job_id: bool = False,
 ) -> tuple[str, bool]:
     requested = job_key(requested_job_id)
     if requested:
         return requested, False
+    if prefer_existing_job_id:
+        existing = get_latest_available_job_id(
+            db,
+            source=source,
+            dataset_type=dataset_type,
+        )
+        if existing:
+            return existing, False
     generated = generate_auto_job_id(
         db,
         source=source,
@@ -285,6 +294,102 @@ def get_latest_upload_batch_map(
             "notes": "Historical upload metadata predates uploader tracking.",
         }
     return out
+
+
+def get_latest_available_job_id(
+    db: Session,
+    *,
+    source: str,
+    dataset_type: str,
+) -> str | None:
+    source_key = str(source or "").strip().lower()
+    dataset_key = str(dataset_type or "").strip().lower()
+    if not source_key or not dataset_key:
+        return None
+
+    def _latest_row_backed_job() -> str | None:
+        try:
+            row = db.execute(
+                text(
+                    """
+                    SELECT job_id
+                    FROM public.data_rows
+                    WHERE source = :source
+                      AND dataset_type = :dataset_type
+                      AND job_id IS NOT NULL
+                      AND TRIM(job_id) <> ''
+                    GROUP BY job_id
+                    ORDER BY MAX(id) DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "source": source_key,
+                    "dataset_type": dataset_key,
+                },
+            ).first()
+        except Exception:
+            return None
+
+        if not row:
+            return None
+        job_value = str(row[0] or "").strip()
+        return job_value or None
+
+    preferred_row_backed_job = _latest_row_backed_job()
+    if preferred_row_backed_job:
+        return preferred_row_backed_job
+
+    try:
+        batch_rows = db.execute(
+            text(
+                """
+                SELECT job_key, action
+                FROM public.admin_upload_batches
+                WHERE source = :source
+                  AND dataset_type = :dataset_type
+                  AND job_key <> ''
+                ORDER BY uploaded_at DESC, id DESC
+                LIMIT 50
+                """
+            ),
+            {
+                "source": source_key,
+                "dataset_type": dataset_key,
+            },
+        ).mappings().all()
+    except Exception:
+        batch_rows = []
+
+    for row in batch_rows:
+        job_value = str((row or {}).get("job_key") or "").strip()
+        if not job_value:
+            continue
+        action = str((row or {}).get("action") or "").strip().lower()
+        if action == "delete_tag":
+            continue
+        row_count = (
+            db.query(func.count(DataRow.id))
+            .filter(
+                DataRow.source == source_key,
+                DataRow.dataset_type == dataset_key,
+                DataRow.job_id == job_value,
+            )
+            .scalar()
+        )
+        if int(row_count or 0) > 0:
+            return job_value
+
+    for row in batch_rows:
+        job_value = str((row or {}).get("job_key") or "").strip()
+        if not job_value:
+            continue
+        action = str((row or {}).get("action") or "").strip().lower()
+        if action in {"delete_tag", "job_id_backfill"}:
+            continue
+        return job_value
+
+    return None
 
 
 def backfill_missing_job_ids(db: Session) -> dict[str, Any]:

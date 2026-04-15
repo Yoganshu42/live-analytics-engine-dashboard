@@ -159,9 +159,6 @@ SOURCE_ALIASES = {
     "samsungvs": "samsung",
     "samsungvijaysales": "samsung",
     "samsungcroma": "samsung",
-    "samsungcromadsdsg": "samsung",
-    "dsdsg": "samsung",
-    "cromadsdsg": "samsung",
     "samsungreliancedigital": "samsung",
     "reliancedigital": "samsung",
 }
@@ -413,6 +410,20 @@ PROFILE_RULES: dict[tuple[str, str], list[FieldRule]] = {
             required=True,
         ),
         FieldRule(
+            field="plan_category",
+            aliases=(
+                "plan category",
+                "plan_category",
+                "display_plan_name",
+                "warranty type",
+                "plan type",
+                "pack type",
+            ),
+            keywords=("plan", "warranty", "pack"),
+            expected_type="text",
+            required=False,
+        ),
+        FieldRule(
             field="channel",
             aliases=("channel", "channel name", "channel_name"),
             keywords=("channel",),
@@ -462,6 +473,22 @@ PROFILE_RULES: dict[tuple[str, str], list[FieldRule]] = {
             keywords=("claim", "amount", "payment", "payout"),
             expected_type="numeric",
             required=True,
+        ),
+        FieldRule(
+            field="plan_category",
+            aliases=(
+                "care+ plan name",
+                "care + plan name",
+                "care plus plan name",
+                "care+ plan description",
+                "care plus plan description",
+                "plan category",
+                "plan_category",
+                "plan name",
+            ),
+            keywords=("care", "plan", "description"),
+            expected_type="text",
+            required=False,
         ),
         FieldRule(
             field="channel",

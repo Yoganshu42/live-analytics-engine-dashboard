@@ -86,44 +86,37 @@ The backend loads `.env` automatically and creates required tables (`users`, `da
 
 ---
 
-## Free AI Setup (Gemma + Ollama)
+## AI Setup (Sarvam)
 
-This project now defaults to self-hosted Gemma for both:
-- `POST /insights/graph` (chatcards insights)
+This project uses Sarvam for both:
+- `POST /insights/graph` (graph insights)
 - `POST /chatbot/message` (chatbot backend API)
 
-No paid API key is required.
+Required environment variables:
+- `SARVAM_API_KEY`
+- `SARVAM_MODEL` or `CHATBOT_MODEL`
+
+Optional graph-insights override:
+- `CHATCARDS_MODEL`
 
 ### Local (without Docker)
 
-1. Start Ollama:
-```powershell
-ollama serve
-```
-
-2. Pull Gemma once:
-```powershell
-ollama pull gemma2:2b
-```
-
-3. Run backend with Gemma:
 ```powershell
 cd backend
-$env:OLLAMA_API_URL="http://127.0.0.1:11434/api/generate"
-$env:CHATCARDS_MODEL="gemma2:2b"
-$env:CHATBOT_MODEL="gemma2:2b"
+$env:SARVAM_API_URL="https://api.sarvam.ai/v1/chat/completions"
+$env:SARVAM_API_KEY="your-key"
+$env:SARVAM_MODEL="sarvam-m"
+$env:CHATBOT_MODEL="sarvam-m"
+$env:CHATCARDS_MODEL="sarvam-m"
 uvicorn main:app --reload
 ```
 
 ### Docker Compose
 
-`docker-compose.yml` now includes an `ollama` service.
+Set the same Sarvam environment variables on the backend service before starting:
 
-After first startup, pull model into container:
 ```powershell
-docker compose up -d ollama
-docker compose exec ollama ollama pull gemma2:2b
-docker compose up -d
+docker compose up -d --build
 ```
 
 ### Chatbot API Example

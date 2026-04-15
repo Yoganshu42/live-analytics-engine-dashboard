@@ -1,5 +1,6 @@
 
 import json
+import os
 import threading
 import time
 
@@ -7,15 +8,30 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
+from services.dataframe_optimization import BoundedTTLCache, compact_dataframe_memory
+from services.reliance_branding import canonicalize_reliance_brand_columns, is_reliance_source
 from services.samsung_partner_config import (
     SAMSUNG_PARTNER_SOURCES,
     SAMSUNG_SOURCE_VARIANTS,
     normalize_samsung_source,
 )
 
-_CACHE_TTL_SECONDS = 300
+_CACHE_TTL_SECONDS = max(30, int(os.getenv("ANALYTICS_DATAFRAME_CACHE_TTL_SECONDS", "300")))
+_CACHE_MAX_ITEMS = max(1, int(os.getenv("ANALYTICS_DATAFRAME_CACHE_MAX_ITEMS", "2")))
 _df_cache_lock = threading.Lock()
-_df_cache: dict[tuple[str, str, str], tuple[float, pd.DataFrame]] = {}
+_df_cache: BoundedTTLCache[tuple[str, str, str], pd.DataFrame] = BoundedTTLCache(
+    max_items=_CACHE_MAX_ITEMS,
+)
+_MERGED_ALL_TAG_SOURCES = {
+    "reliance",
+    "reliance resq",
+    "reliance_resq",
+    "reliance-resq",
+    "resq",
+}
+_MERGED_ALL_TAG_SAMSUNG_SOURCES = {
+    "samsung_reliance_digital",
+}
 
 
 def _cache_key(source: str, dataset_type: str, job_id: str | None) -> tuple[str, str, str]:
@@ -146,25 +162,49 @@ def get_dataframe(
     job_id: str | None,
     source: str,
     dataset_type: str,
+    *,
+    cache_result: bool = True,
 ):
     """
     Fetch rows from data_rows using RAW SQL and flatten JSONB `data` into a DataFrame.
     """
     key = _cache_key(source, dataset_type, job_id)
     now = time.time()
-    with _df_cache_lock:
-        cached = _df_cache.get(key)
-        if cached is not None:
-            expires_at, cached_df = cached
-            if expires_at >= now:
+    if cache_result:
+        with _df_cache_lock:
+            cached_df = _df_cache.get(key, now=now)
+            if cached_df is not None:
                 return cached_df.copy(deep=False)
-            _df_cache.pop(key, None)
 
     # RAW SQL QUERY for performance (bypasses ORM overhead)
     # We select only the 'data' column.
     source_values = _source_variants(source)
     source_placeholders = ", ".join([f":source_{idx}" for idx in range(len(source_values))])
-    stmt = f"SELECT data FROM data_rows WHERE source IN ({source_placeholders}) AND dataset_type = :dataset_type"
+    source_key = (source or "").strip().lower()
+    samsung_source = normalize_samsung_source(source_key)
+    use_merged_all_tags = not job_id and (
+        source_key in _MERGED_ALL_TAG_SOURCES
+        or samsung_source in _MERGED_ALL_TAG_SAMSUNG_SOURCES
+    )
+
+    if use_merged_all_tags:
+        stmt = f"""
+            SELECT deduped.data
+            FROM (
+                SELECT
+                    data,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(record_key, CONCAT('__row__', id::text))
+                        ORDER BY id DESC
+                    ) AS rn
+                FROM data_rows
+                WHERE source IN ({source_placeholders})
+                  AND dataset_type = :dataset_type
+            ) AS deduped
+            WHERE deduped.rn = 1
+        """
+    else:
+        stmt = f"SELECT data FROM data_rows WHERE source IN ({source_placeholders}) AND dataset_type = :dataset_type"
     params = {"dataset_type": dataset_type}
     for idx, value in enumerate(source_values):
         params[f"source_{idx}"] = value
@@ -185,8 +225,9 @@ def get_dataframe(
 
     if not rows:
         df = pd.DataFrame()
-        with _df_cache_lock:
-            _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
+        if cache_result:
+            with _df_cache_lock:
+                _df_cache.set(key, df, expires_at=now + _CACHE_TTL_SECONDS, now=now)
         return df
 
     # Optimize payload extraction
@@ -206,13 +247,19 @@ def get_dataframe(
 
     if not payloads:
         df = pd.DataFrame()
-        with _df_cache_lock:
-            _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
+        if cache_result:
+            with _df_cache_lock:
+                _df_cache.set(key, df, expires_at=now + _CACHE_TTL_SECONDS, now=now)
         return df
 
     # Create DataFrame directly from list of dicts
     df = pd.DataFrame.from_records(payloads)
-    
-    with _df_cache_lock:
-        _df_cache[key] = (now + _CACHE_TTL_SECONDS, df)
+    if is_reliance_source(source):
+        canonicalize_reliance_brand_columns(df)
+
+    compact_dataframe_memory(df, allow_category=True)
+
+    if cache_result:
+        with _df_cache_lock:
+            _df_cache.set(key, df, expires_at=now + _CACHE_TTL_SECONDS, now=now)
     return df.copy(deep=False)

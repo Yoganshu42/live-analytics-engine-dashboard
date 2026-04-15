@@ -1,20 +1,23 @@
 import pandas as pd
 import numpy as np
+import os
 import time
 import logging
 import threading
 from sqlalchemy.orm import Session
 from models.data_rows import DataRow
 from services.analytics.base_engine import BaseAnalyticsEngine
+from services.dataframe_optimization import BoundedTTLCache, compact_dataframe_mapping, compact_dataframe_memory
 
 LOSS_RATIO_CAP_PERCENT = 300.0
 logger = logging.getLogger(__name__)
 GODREJ_LOAD_CACHE_TTL_SECONDS = 300
+GODREJ_LOAD_CACHE_MAX_ITEMS = max(1, int(os.getenv("GODREJ_LOAD_CACHE_MAX_ITEMS", "3")))
 _godrej_load_cache_lock = threading.Lock()
-_godrej_load_cache: dict[
+_godrej_load_cache: BoundedTTLCache[
     tuple[str, str, str, str, str, bool, bool],
-    tuple[float, dict[str, pd.DataFrame]],
-] = {}
+    dict[str, pd.DataFrame],
+] = BoundedTTLCache(max_items=GODREJ_LOAD_CACHE_MAX_ITEMS)
 
 REVENUE_SPLIT = {
     "D2D": {"Channel": 0.25, "Godrej": 0.35, "Zopper": 0.40},
@@ -152,20 +155,20 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         shared_key = self._shared_load_cache_key(include_sales, include_claims)
         now = time.time()
         with _godrej_load_cache_lock:
-            shared_cached = _godrej_load_cache.get(shared_key)
-            if shared_cached is not None:
-                expires_at, cached_value = shared_cached
-                if expires_at >= now:
-                    cloned = self._clone_loaded_data(cached_value)
-                    self._loaded_data_cache[cache_key] = cloned
-                    return cloned
-                _godrej_load_cache.pop(shared_key, None)
+            cached_value = _godrej_load_cache.get(shared_key, now=now)
+            if cached_value is not None:
+                cloned = self._clone_loaded_data(cached_value)
+                self._loaded_data_cache[cache_key] = cloned
+                return cloned
 
             result = self._load_data_uncached(include_sales=include_sales, include_claims=include_claims)
             cloned = self._clone_loaded_data(result)
-            _godrej_load_cache[shared_key] = (
-                time.time() + GODREJ_LOAD_CACHE_TTL_SECONDS,
+            cache_now = time.time()
+            _godrej_load_cache.set(
+                shared_key,
                 cloned,
+                expires_at=cache_now + GODREJ_LOAD_CACHE_TTL_SECONDS,
+                now=cache_now,
             )
             self._loaded_data_cache[cache_key] = self._clone_loaded_data(cloned)
             return self._loaded_data_cache[cache_key]
@@ -177,7 +180,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         started = time.perf_counter()
         sales = self._load_rows("sales") if include_sales else pd.DataFrame()
         claims = self._load_rows("claims") if include_claims else pd.DataFrame()
-        result = {"sales": sales, "claims": claims}
+        result = compact_dataframe_mapping({"sales": sales, "claims": claims})
         self._loaded_data_cache[cache_key] = result
         logger.info(
             "TIMING godrej.load_data source=%s dataset=%s include_sales=%s include_claims=%s sales_rows=%s claims_rows=%s duration_ms=%.2f",
@@ -265,7 +268,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             df = self.compute_premiums(df)
         else:
             df = self._normalize_claims(df)
-        return df
+        return compact_dataframe_memory(df, allow_category=True)
 
     @classmethod
     def _apply_source_filter(cls, query):
@@ -784,10 +787,14 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
         return self._clip_month_series_to_report_window(parsed)
 
     def _clip_month_series_to_report_window(self, series: pd.Series) -> pd.Series:
-        if series is None or series.empty or not self.apply_date_filter:
+        if series is None or series.empty:
             return series
 
         out = series.copy()
+        current_month_end = pd.Timestamp.now().normalize().to_period("M").to_timestamp(how="end")
+        out = out.where(out <= current_month_end, pd.NaT)
+        if not self.apply_date_filter:
+            return out
         if self.report_start is not None and self.report_start is not pd.NaT:
             lower = pd.Timestamp(self.report_start).to_period("M").to_timestamp()
             out = out.where(out >= lower, pd.NaT)
@@ -871,6 +878,9 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             "month": [
                 *(month_candidates_claims if dataset_type == "claims" else month_candidates_sales),
             ],
+            "date": [
+                *(month_candidates_claims if dataset_type == "claims" else month_candidates_sales),
+            ],
             "state": [
                 "State",
                 "Customer_State",
@@ -939,10 +949,10 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 dim_col = normalized[key]
                 break
 
-        if dim_key == "month":
+        if dim_key in {"month", "date"}:
             df = df.copy()
             tried_columns: set[str] = set()
-            best_month: pd.Series | None = None
+            best_series: pd.Series | None = None
             best_valid = -1
             best_years = -1
             for candidate in candidates:
@@ -951,17 +961,20 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 if matched_col is None or matched_col in tried_columns:
                     continue
                 tried_columns.add(matched_col)
-                month_series = self._parse_month_series(df[matched_col])
-                valid = int(month_series.notna().sum())
+                parsed_series = self._parse_month_series(df[matched_col])
+                valid = int(parsed_series.notna().sum())
                 if valid <= 0:
                     continue
-                years = int(month_series.dropna().dt.year.nunique())
+                years = int(parsed_series.dropna().dt.year.nunique())
                 if valid > best_valid or (valid == best_valid and years > best_years):
-                    best_month = month_series
+                    best_series = parsed_series
                     best_valid = valid
                     best_years = years
-            if best_month is not None:
-                df["_month_key"] = best_month.dt.to_period("M").dt.to_timestamp()
+            if best_series is not None:
+                if dim_key == "date":
+                    df["_date_key"] = best_series.dt.normalize()
+                    return df, "_date_key"
+                df["_month_key"] = best_series.dt.to_period("M").dt.to_timestamp()
                 return df, "_month_key"
             return df, None
 
@@ -1386,6 +1399,12 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             out["_month_sort"] = month_series[month_series.notna()]
             out["month"] = out["_month_sort"].dt.strftime("%b-%y")
             out = out.sort_values("_month_sort").drop(columns=["_month_sort"])
+        elif dimension == "date" and "date" in out.columns:
+            date_series = pd.to_datetime(out["date"], errors="coerce")
+            out = out[date_series.notna()].copy()
+            out["_date_sort"] = date_series[date_series.notna()]
+            out["date"] = out["_date_sort"].dt.strftime("%Y-%m-%d")
+            out = out.sort_values("_date_sort").drop(columns=["_date_sort"])
         else:
             out = self._drop_noise_buckets(out, dimension)
 
@@ -1440,12 +1459,16 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
                 "units_sold": 0,
             }
 
-        # Gross premium and units sold should reflect total uploaded sales rows,
-        # not the currently selected date slice.
-        df_all = df
         df_period = self._apply_date_filter(df, "sales")
+        if self.apply_date_filter and df_period.empty:
+            return {
+                "gross_premium": 0,
+                "earned_premium": 0,
+                "zopper_earned_premium": 0,
+                "units_sold": 0,
+            }
 
-        gross = self._numeric_series_from_frame(df_all, "Customer Premium").sum()
+        gross = self._numeric_series_from_frame(df_period, "Customer Premium").sum()
         earned = self._numeric_series_from_frame(df_period, "Earned_Premium").sum()
         zopper_earned = self._numeric_series_from_frame(df_period, "Zopper_Share_EP").sum()
 
@@ -1453,7 +1476,7 @@ class GodrejAnalyticsEngine(BaseAnalyticsEngine):
             "gross_premium": float(gross),
             "earned_premium": float(earned),
             "zopper_earned_premium": float(zopper_earned),
-            "units_sold": int(len(df_all)),
+            "units_sold": int(len(df_period)),
         }
 
     def compute(self) -> dict:

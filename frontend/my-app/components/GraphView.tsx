@@ -2,7 +2,6 @@
 
 import { Fragment, type MouseEvent, type TouchEvent, useEffect, useId, useMemo, useRef, useState } from "react"
 import { useReducedMotion } from "framer-motion"
-import indiaSvgMap from "@svg-maps/india"
 import {
   Area,
   AreaChart,
@@ -31,6 +30,9 @@ import {
   sumSamsungPartnerValues,
   type SamsungPartnerKey,
 } from "@/lib/samsungPartners"
+import { SALES_METRIC_ORDER } from "@/lib/salesMetricOrder"
+import { fetchByDimensionBatch, type FetchByDimensionBatchItem } from "@/app/lib/api"
+import IndiaSvgMap from "@svg-maps/india"
 
 /* ---------- TYPES ---------- */
 export type GraphChartType = "bar" | "line" | "pie" | "radar" | "india_map"
@@ -55,6 +57,8 @@ type Props = {
   tooltipMetricOverride?: string
   heightClassName?: string
   categoryFilters?: GraphCategoryFilter[]
+  eagerMapHoverPrefetch?: boolean
+  enableCrossDatasetHoverCompare?: boolean
   onDataReady?: (snapshot: GraphDataSnapshot) => void
 }
 
@@ -101,7 +105,7 @@ const formatValue = (value: number, measure: string) => {
   return `Rs ${value.toLocaleString()}`
 }
 
-const formatMonth = (value: string) => {
+const formatMonth = (value: string, dimKey = "month") => {
   if (!value) return value
   if (typeof value === "string") {
     const shortMatch = value.match(/^[A-Za-z]{3}[-/]\d{2}$/)
@@ -111,17 +115,74 @@ const formatMonth = (value: string) => {
   }
   const d = new Date(value)
   if (isNaN(d.getTime())) return value
+  if (toSafeKey(dimKey).includes("date")) {
+    return d.toLocaleDateString("en-US", {
+      day: "2-digit",
+      month: "short",
+      year: "2-digit",
+    })
+  }
   return d.toLocaleString("en-US", {
     month: "short",
     year: "2-digit",
   })
 }
 
-const normalizeDimValue = (value: unknown, dimKey: string) => {
+const canonicalizePlanCategoryLabel = (value: string, source: string) => {
+  const raw = String(value || "").trim()
+  const text = raw.toLowerCase().replace(/\s+/g, " ").trim()
+  if (!text) return "Unknown"
+  if (text.includes("combo")) return "Combo"
+  if (text.includes("adld") || text.includes("accidental") || text.includes("liquid")) return "ADLD"
+  if (source === "reliance" && (text.includes("crack") || text.includes("screen") || /\bsp\b|\bspp\b/.test(text))) {
+    return "Crack Screen"
+  }
+  if (text.includes("screen") || text.includes("crack") || text.includes("protect max") || /\bsp\b|\bspp\b/.test(text)) {
+    return "Screen Protection"
+  }
+  if (text.includes("extended") || text.includes("warranty") || /\bew\b/.test(text)) {
+    return "Extended Warranty"
+  }
+  return raw.replace(/[^a-zA-Z0-9\s/-]/g, " ").replace(/\s+/g, " ").trim() || "Unknown"
+}
+
+const normalizeDimValue = (value: unknown, dimKey: string, source = "") => {
   if (value == null) return "Unknown"
   const raw = String(value).trim()
   if (!raw) return "Unknown"
-  if (dimKey.includes("month") || dimKey.includes("date")) {
+  const safeDimKey = toSafeKey(dimKey)
+  if (safeDimKey.includes("date")) {
+    const shortMatch = raw.match(/^([A-Za-z]{3})[-/](\d{2})$/)
+    if (shortMatch) {
+      const monthMap: Record<string, number> = {
+        jan: 1,
+        feb: 2,
+        mar: 3,
+        apr: 4,
+        may: 5,
+        jun: 6,
+        jul: 7,
+        aug: 8,
+        sep: 9,
+        oct: 10,
+        nov: 11,
+        dec: 12,
+      }
+      const monthKey = shortMatch[1].toLowerCase()
+      const month = monthMap[monthKey]
+      if (month) {
+        const year = 2000 + Number(shortMatch[2])
+        return `${year}-${String(month).padStart(2, "0")}-01`
+      }
+    }
+    const d = new Date(raw)
+    if (!isNaN(d.getTime())) {
+      const year = d.getFullYear()
+      const month = String(d.getMonth() + 1).padStart(2, "0")
+      const day = String(d.getDate()).padStart(2, "0")
+      return `${year}-${month}-${day}`
+    }
+  } else if (safeDimKey.includes("month")) {
     const shortMatch = raw.match(/^([A-Za-z]{3})[-/](\d{2})$/)
     if (shortMatch) {
       const monthMap: Record<string, number> = {
@@ -151,6 +212,9 @@ const normalizeDimValue = (value: unknown, dimKey: string) => {
       const month = String(d.getMonth() + 1).padStart(2, "0")
       return `${year}-${month}-01`
     }
+  }
+  if (safeDimKey === "plan_category") {
+    return canonicalizePlanCategoryLabel(raw, source)
   }
   if (dimKey.includes("product_category")) {
     const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, "")
@@ -309,7 +373,7 @@ const toLogSafeValue = (value: unknown) => {
   return numeric > 0 ? numeric : 1
 }
 
-const toTimeValue = (value: unknown) => {
+const toTimeValue = (value: unknown, dimKey = "month") => {
   const raw = String(value ?? "").trim()
   if (!raw) return Number.NaN
 
@@ -337,7 +401,7 @@ const toTimeValue = (value: unknown) => {
     }
   }
 
-  const normalized = normalizeDimValue(raw, "month")
+  const normalized = normalizeDimValue(raw, dimKey)
   const normalizedTs = new Date(normalized).getTime()
   if (!Number.isNaN(normalizedTs)) return normalizedTs
 
@@ -347,8 +411,8 @@ const toTimeValue = (value: unknown) => {
 
 const sortTemporalRows = (rows: Row[], dimKey: string) =>
   [...rows].sort((a, b) => {
-    const at = toTimeValue(a[dimKey])
-    const bt = toTimeValue(b[dimKey])
+    const at = toTimeValue(a[dimKey], dimKey)
+    const bt = toTimeValue(b[dimKey], dimKey)
     const aValid = Number.isFinite(at)
     const bValid = Number.isFinite(bt)
     if (aValid && bValid) return at - bt
@@ -363,8 +427,19 @@ const monthBucketValue = (date: Date) => {
   return `${year}-${month}-01`
 }
 
+const dayBucketValue = (date: Date) => {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  return `${year}-${month}-${day}`
+}
+
+const temporalBucketValue = (date: Date, dimKey: string) => (
+  toSafeKey(dimKey).includes("date") ? dayBucketValue(date) : monthBucketValue(date)
+)
+
 const buildZeroTemporalRow = (template: Row, dimKey: string, date: Date): Row => {
-  const bucket = monthBucketValue(date)
+  const bucket = temporalBucketValue(date, dimKey)
   const next: Row = {}
   Object.entries(template).forEach(([key, value]) => {
     if (key === dimKey || key === "period_start" || key === "period_end") {
@@ -379,19 +454,31 @@ const buildZeroTemporalRow = (template: Row, dimKey: string, date: Date): Row =>
 
 const padSingleTemporalRows = (rows: Row[], dimKey: string) => {
   if (rows.length !== 1) return rows
-  const centerTs = toTimeValue(rows[0][dimKey])
+  const centerTs = toTimeValue(rows[0][dimKey], dimKey)
   if (!Number.isFinite(centerTs)) return rows
   const center = new Date(centerTs)
-  center.setDate(1)
-  const prev = new Date(center)
-  prev.setMonth(center.getMonth() - 1)
-  const next = new Date(center)
-  next.setMonth(center.getMonth() + 1)
-  return [
-    buildZeroTemporalRow(rows[0], dimKey, prev),
-    rows[0],
-    buildZeroTemporalRow(rows[0], dimKey, next),
-  ]
+  if (toSafeKey(dimKey).includes("date")) {
+    const prev = new Date(center)
+    const next = new Date(center)
+    prev.setDate(center.getDate() - 1)
+    next.setDate(center.getDate() + 1)
+    return [
+      buildZeroTemporalRow(rows[0], dimKey, prev),
+      rows[0],
+      buildZeroTemporalRow(rows[0], dimKey, next),
+    ]
+  } else {
+    center.setDate(1)
+    const prev = new Date(center)
+    const next = new Date(center)
+    prev.setMonth(center.getMonth() - 1)
+    next.setMonth(center.getMonth() + 1)
+    return [
+      buildZeroTemporalRow(rows[0], dimKey, prev),
+      rows[0],
+      buildZeroTemporalRow(rows[0], dimKey, next),
+    ]
+  }
 }
 
 /* ---------- DATA FETCH ---------- */
@@ -405,6 +492,10 @@ export type GraphFetchParams = {
   from_date?: string
   to_date?: string
   categoryFilters?: GraphCategoryFilter[]
+}
+
+type GraphFetchOptions = {
+  signal?: AbortSignal
 }
 
 type FetchRowsResult = {
@@ -423,6 +514,40 @@ export const clearGraphDataCache = () => {
   graphInFlight.clear()
 }
 
+const normalizeFetchedRows = (
+  rawRows: Array<Record<string, unknown>>,
+  params: Pick<GraphFetchParams, "dimension" | "metric" | "source">
+): FetchRowsResult => {
+  const dimKey = toSafeKey(params.dimension)
+  const metricKey = toSafeKey(params.metric)
+
+  if (!Array.isArray(rawRows) || rawRows.length === 0) {
+    return { ts: Date.now(), data: [], measure: metricKey, usedRangeFallback: false }
+  }
+
+  let processed: Row[] = rawRows.map((row) => {
+    const out: Row = {}
+    Object.entries(row || {}).forEach(([key, value]) => {
+      out[toSafeKey(key)] = value
+    })
+    out[dimKey] = normalizeDimValue(pickDimensionValue(out, dimKey), dimKey, params.source)
+    return out
+  })
+
+  if (dimKey.includes("product_category") || dimKey.includes("plan_category")) {
+    processed = mergeRowsByDimension(processed, dimKey)
+  }
+
+  processed = filterRelatableRows(processed, dimKey)
+
+  return {
+    ts: Date.now(),
+    data: processed,
+    measure: metricKey,
+    usedRangeFallback: false,
+  }
+}
+
 const DEFAULT_API_BASE =
   typeof window !== "undefined"
     ? (window.location.origin || "")
@@ -436,7 +561,8 @@ const normalizeApiBase = (value: string) => {
   return normalized.replace(/\/+$/, "")
 }
 
-const API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE || DEFAULT_API_BASE)
+const ENV_API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_BASE || "")
+const API_BASE = ENV_API_BASE || DEFAULT_API_BASE
 const runtimeOverride =
   typeof window !== "undefined"
     ? normalizeApiBase(new URLSearchParams(window.location.search).get("api") || "")
@@ -445,8 +571,8 @@ const runtimeOverride =
 const browserOriginApiBases =
   typeof window !== "undefined"
     ? [
-        window.location.origin,
         `${window.location.origin}/api`,
+        window.location.origin,
       ]
     : []
 
@@ -462,8 +588,9 @@ const API_FALLBACKS = Array.from(
   new Set(
     [
       runtimeOverride,
-      ...browserOriginApiBases,
+      ENV_API_BASE,
       ...browserHostApiBases,
+      ...browserOriginApiBases,
       API_BASE,
       "http://127.0.0.1:8000",
       "http://localhost:8000",
@@ -548,13 +675,93 @@ const buildQuery = ({
   return query.toString()
 }
 
+const buildGraphCacheKey = (params: GraphFetchParams) => (
+  `${params.source}|${params.datasetType}|${buildQuery(params)}`
+)
+
+const toBatchRequest = (
+  params: GraphFetchParams,
+  requestKey: string
+): FetchByDimensionBatchItem => {
+  let safeFrom = params.from_date
+  let safeTo = params.to_date
+  if (safeFrom && safeTo && safeFrom > safeTo) {
+    const swappedFrom = safeTo
+    const swappedTo = safeFrom
+    safeFrom = swappedFrom
+    safeTo = swappedTo
+  }
+
+  const request: FetchByDimensionBatchItem = {
+    request_key: requestKey,
+    source: params.source,
+    dataset_type: params.datasetType,
+    dimension: params.dimension,
+    metric: params.metric,
+  }
+  if (params.jobId) request.job_id = params.jobId
+  if (params.bucket) request.bucket = params.bucket
+  if (safeFrom) request.from_date = safeFrom
+  if (safeTo) request.to_date = safeTo
+
+  const activeFilters = (params.categoryFilters || [])
+    .map((filter) => ({
+      dimension: toSafeKey(String(filter.dimension || "")),
+      values: Array.isArray(filter.values)
+        ? filter.values
+            .map((value) => String(value || "").trim())
+            .filter(Boolean)
+        : [],
+    }))
+    .filter((filter) => Boolean(filter.dimension) && filter.values.length > 0)
+    .slice(0, 2)
+
+  activeFilters.forEach((filter, index) => {
+    const slot = index + 1
+    request[`filter_${slot}_dimension` as "filter_1_dimension" | "filter_2_dimension"] = filter.dimension
+    request[`filter_${slot}_values` as "filter_1_values" | "filter_2_values"] = filter.values.join(",")
+  })
+
+  return request
+}
+
 const buildUrl = (base: string, query: string) => `${base}/analytics/by-dimension?${query}`
+
+const writeGraphCache = (cacheKey: string, result: FetchRowsResult) => {
+  if (result.data.length > 0) {
+    graphResultCache.set(cacheKey, {
+      expiresAt: Date.now() + GRAPH_RESULT_TTL_MS,
+      value: result,
+    })
+    return
+  }
+
+  graphResultCache.delete(cacheKey)
+}
+
+const mergeAbortSignals = (signals: Array<AbortSignal | null | undefined>) => {
+  const activeSignals = signals.filter(Boolean) as AbortSignal[]
+  if (!activeSignals.length) return undefined
+  if (activeSignals.length === 1) return activeSignals[0]
+
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  activeSignals.forEach((signal) => {
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener("abort", abort, { once: true })
+  })
+  return controller.signal
+}
 
 const fetchWithTimeout = async (url: string, init: RequestInit) => {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    const signal = mergeAbortSignals([init.signal, controller.signal])
+    return await fetch(url, { ...init, signal })
   } finally {
     clearTimeout(timer)
   }
@@ -564,21 +771,24 @@ class NoFallbackError extends Error {
   noFallback = true
 }
 
-const fetchRows = async (params: GraphFetchParams): Promise<FetchRowsResult> => {
+const fetchRows = async (
+  params: GraphFetchParams,
+  options: GraphFetchOptions = {}
+): Promise<FetchRowsResult> => {
   const query = buildQuery(params)
-  const cacheKey = `${params.source}|${params.datasetType}|${query}`
+  const cacheKey = buildGraphCacheKey(params)
   const now = Date.now()
   const cached = graphResultCache.get(cacheKey)
   if (cached && cached.expiresAt > now) {
     return cached.value
   }
-  const inFlight = graphInFlight.get(cacheKey)
-  if (inFlight) {
-    return inFlight
+  if (!options.signal) {
+    const inFlight = graphInFlight.get(cacheKey)
+    if (inFlight) {
+      return inFlight
+    }
   }
 
-  const dimKey = toSafeKey(params.dimension)
-  const metricKey = toSafeKey(params.metric)
   const headers = new Headers()
   const token = getAuthToken()
   if (token) headers.set("Authorization", `Bearer ${token}`)
@@ -587,9 +797,9 @@ const fetchRows = async (params: GraphFetchParams): Promise<FetchRowsResult> => 
     const errors: string[] = []
     let sawUnauthorized = false
     for (const base of orderedApiBases()) {
-      const url = buildUrl(base, query)
-      try {
-        const res = await fetchWithTimeout(url, { headers, mode: "cors" })
+        const url = buildUrl(base, query)
+        try {
+        const res = await fetchWithTimeout(url, { headers, mode: "cors", signal: options.signal })
         if (!res.ok) {
           let detail = ""
           try {
@@ -612,29 +822,10 @@ const fetchRows = async (params: GraphFetchParams): Promise<FetchRowsResult> => 
 
         const raw = await res.json()
         preferredApiBase = base
-        if (!Array.isArray(raw) || raw.length === 0) {
-          return { ts: Date.now(), data: [], measure: metricKey, usedRangeFallback: false }
-        }
-
-        let processed: Row[] = raw.map(row => {
-          const out: Row = {}
-          Object.entries(row).forEach(([k, v]) => {
-            out[toSafeKey(k)] = v
-          })
-          out[dimKey] = normalizeDimValue(pickDimensionValue(out, dimKey), dimKey)
-          return out
-        })
-        if (dimKey.includes("product_category")) {
-          processed = mergeRowsByDimension(processed, dimKey)
-        }
-        processed = filterRelatableRows(processed, dimKey)
-
-        return {
-          ts: Date.now(),
-          data: processed,
-          measure: metricKey,
-          usedRangeFallback: false,
-        }
+        return normalizeFetchedRows(
+          Array.isArray(raw) ? raw : [],
+          { source: params.source, dimension: params.dimension, metric: params.metric }
+        )
       } catch (error) {
         if (error instanceof NoFallbackError) {
           throw error
@@ -649,29 +840,53 @@ const fetchRows = async (params: GraphFetchParams): Promise<FetchRowsResult> => 
     throw new Error(`Failed to fetch analytics. Tried: ${errors.join(" | ")}`)
   })()
 
-  graphInFlight.set(cacheKey, requestPromise)
+  if (!options.signal) {
+    graphInFlight.set(cacheKey, requestPromise)
+  }
   try {
     const result = await requestPromise
-    if (result.data.length > 0) {
-      graphResultCache.set(cacheKey, {
-        expiresAt: Date.now() + GRAPH_RESULT_TTL_MS,
-        value: result,
-      })
-    } else {
-      graphResultCache.delete(cacheKey)
-    }
+    writeGraphCache(cacheKey, result)
     return result
   } finally {
-    graphInFlight.delete(cacheKey)
+    if (!options.signal) {
+      graphInFlight.delete(cacheKey)
+    }
   }
 }
 
-const fetchRowsWithRangeFallback = async (params: GraphFetchParams): Promise<FetchRowsResult> => {
-  return fetchRows(params)
+const fetchRowsWithRangeFallback = async (
+  params: GraphFetchParams,
+  options: GraphFetchOptions = {}
+): Promise<FetchRowsResult> => {
+  return fetchRows(params, options)
 }
 
-export const fetchGraphRows = async (params: GraphFetchParams) => {
-  return fetchRowsWithRangeFallback(params)
+export const fetchGraphRows = async (
+  params: GraphFetchParams,
+  options: GraphFetchOptions = {}
+) => {
+  return fetchRowsWithRangeFallback(params, options)
+}
+
+export const readGraphDataCache = (params: GraphFetchParams) => {
+  const cached = graphResultCache.get(buildGraphCacheKey(params))
+  if (!cached || cached.expiresAt <= Date.now()) return null
+  return cached.value
+}
+
+export const seedGraphDataCache = (
+  params: GraphFetchParams,
+  rawRows: Array<Record<string, unknown>>
+) => {
+  if (!params.source || !params.dimension || !params.metric) return null
+  const cacheKey = buildGraphCacheKey(params)
+  const result = normalizeFetchedRows(rawRows, {
+    source: params.source,
+    dimension: params.dimension,
+    metric: params.metric,
+  })
+  writeGraphCache(cacheKey, result)
+  return result
 }
 
 export const prefetchGraphData = async (params: GraphFetchParams) => {
@@ -683,6 +898,44 @@ export const hasGraphData = async (params: GraphFetchParams): Promise<boolean> =
   if (!params.source || !params.dimension || !params.metric) return false
   const result = await fetchRowsWithRangeFallback(params)
   return result.data.length > 0
+}
+
+const fetchRowsBatch = async (
+  requests: Array<{ requestKey: string; params: GraphFetchParams }>,
+  options: GraphFetchOptions = {}
+): Promise<Record<string, FetchRowsResult>> => {
+  const now = Date.now()
+  const resolved: Record<string, FetchRowsResult> = {}
+  const pending = requests.filter(({ requestKey, params }) => {
+    const cached = graphResultCache.get(buildGraphCacheKey(params))
+    if (cached && cached.expiresAt > now) {
+      resolved[requestKey] = cached.value
+      return false
+    }
+    return true
+  })
+
+  if (!pending.length) return resolved
+
+  const batchResponse = await fetchByDimensionBatch(
+    pending.map(({ requestKey, params }) => toBatchRequest(params, requestKey)),
+    { signal: options.signal }
+  )
+  const resultByKey = new Map(
+    (batchResponse.results || []).map((entry) => [entry.request_key, Array.isArray(entry.rows) ? entry.rows : []])
+  )
+
+  pending.forEach(({ requestKey, params }) => {
+    const normalized = normalizeFetchedRows(resultByKey.get(requestKey) || [], {
+      source: params.source,
+      dimension: params.dimension,
+      metric: params.metric,
+    })
+    writeGraphCache(buildGraphCacheKey(params), normalized)
+    resolved[requestKey] = normalized
+  })
+
+  return resolved
 }
 
 /* ---------- COLOR HELPERS ---------- */
@@ -701,6 +954,79 @@ const hashString = (value: string) => {
 const pickColor = (key: string, palette: string[]) => {
   if (!palette.length) return "#6366f1"
   return palette[hashString(key) % palette.length]
+}
+
+const hslToHex = (hue: number, saturation: number, lightness: number) => {
+  const h = ((hue % 360) + 360) % 360
+  const s = Math.max(0, Math.min(100, saturation)) / 100
+  const l = Math.max(0, Math.min(100, lightness)) / 100
+  const chroma = (1 - Math.abs((2 * l) - 1)) * s
+  const segment = h / 60
+  const second = chroma * (1 - Math.abs((segment % 2) - 1))
+  const match = l - (chroma / 2)
+
+  let red = 0
+  let green = 0
+  let blue = 0
+
+  if (segment >= 0 && segment < 1) {
+    red = chroma
+    green = second
+  } else if (segment < 2) {
+    red = second
+    green = chroma
+  } else if (segment < 3) {
+    green = chroma
+    blue = second
+  } else if (segment < 4) {
+    green = second
+    blue = chroma
+  } else if (segment < 5) {
+    red = second
+    blue = chroma
+  } else {
+    red = chroma
+    blue = second
+  }
+
+  const toHex = (value: number) =>
+    Math.round((value + match) * 255)
+      .toString(16)
+      .padStart(2, "0")
+
+  return `#${toHex(red)}${toHex(green)}${toHex(blue)}`
+}
+
+const buildDistinctChartColors = (count: number, palette: string[], seedKey: string) => {
+  if (count <= 0) return [] as string[]
+
+  const colors: string[] = []
+  const used = new Set<string>()
+  const paletteSize = palette.length
+  const seed = hashString(seedKey)
+  const paletteOffset = paletteSize ? seed % paletteSize : 0
+  let generatedIndex = 0
+
+  for (let index = 0; index < count; index += 1) {
+    let candidate = ""
+
+    if (index < paletteSize) {
+      candidate = palette[(paletteOffset + index) % paletteSize]
+    }
+
+    while (!candidate || used.has(candidate)) {
+      const hue = (seed + (generatedIndex * 137.508)) % 360
+      const saturation = 68 + ((generatedIndex % 3) * 6)
+      const lightness = 46 + ((generatedIndex % 4) * 5)
+      candidate = hslToHex(hue, saturation, lightness)
+      generatedIndex += 1
+    }
+
+    used.add(candidate)
+    colors.push(candidate)
+  }
+
+  return colors
 }
 
 const hexToRgb = (hex: string) => {
@@ -735,29 +1061,54 @@ type IndiaMapLocation = {
   path: string
 }
 
-const INDIA_MAP_LOCATIONS: IndiaMapLocation[] = (
-  indiaSvgMap.locations as Array<{ id: string; name: string; path: string }>
-).map((location) => ({
-  id: location.id,
-  name: location.name,
-  path: location.path,
-}))
+type IndiaMapDefinition = {
+  viewBox: string
+  locations: IndiaMapLocation[]
+}
 
 const normalizeStateLookupKey = (value: string) =>
   String(value || "")
     .toLowerCase()
     .replace(/[^a-z]/g, "")
 
-const INDIA_STATE_KEY_TO_ID: Record<string, string> = INDIA_MAP_LOCATIONS.reduce(
-  (acc, location) => {
+const toIndiaMapDefinition = (value: unknown): IndiaMapDefinition | null => {
+  if (!value || typeof value !== "object") return null
+  const mapValue = value as {
+    viewBox?: string
+    locations?: Array<{ id?: string; name?: string; path?: string }>
+  }
+  const locations = Array.isArray(mapValue.locations)
+    ? mapValue.locations
+        .map((location) => ({
+          id: String(location?.id || "").trim(),
+          name: String(location?.name || "").trim(),
+          path: String(location?.path || "").trim(),
+        }))
+        .filter((location) => Boolean(location.id) && Boolean(location.name) && Boolean(location.path))
+    : []
+  const viewBox = String(mapValue.viewBox || "").trim()
+  if (!viewBox || !locations.length) return null
+  return { viewBox, locations }
+}
+
+const STATIC_INDIA_MAP_DEFINITION = toIndiaMapDefinition(IndiaSvgMap)
+
+const buildIndiaStateKeyToId = (locations: IndiaMapLocation[]): Record<string, string> => {
+  const keyMap = locations.reduce((acc, location) => {
     const nameKey = normalizeStateLookupKey(location.name)
     if (nameKey) acc[nameKey] = location.id
     const idKey = normalizeStateLookupKey(location.id)
     if (idKey) acc[idKey] = location.id
     return acc
-  },
-  {} as Record<string, string>
-)
+  }, {} as Record<string, string>)
+
+  Object.entries(STATE_NAME_ALIASES).forEach(([aliasKey, canonicalKey]) => {
+    const canonicalId = keyMap[canonicalKey]
+    if (canonicalId) keyMap[aliasKey] = canonicalId
+  })
+
+  return keyMap
+}
 
 const STATE_NAME_ALIASES: Record<string, string> = {
   orissa: "odisha",
@@ -809,11 +1160,6 @@ const STATE_NAME_ALIASES: Record<string, string> = {
   chandigarh: "chandigarh",
 }
 
-Object.entries(STATE_NAME_ALIASES).forEach(([aliasKey, canonicalKey]) => {
-  const canonicalId = INDIA_STATE_KEY_TO_ID[canonicalKey]
-  if (canonicalId) INDIA_STATE_KEY_TO_ID[aliasKey] = canonicalId
-})
-
 const COMBINED_UT_KEY = normalizeStateLookupKey("Dadra and Nagar Haveli and Daman and Diu")
 const COMBINED_UT_ALIASES = new Set<string>([
   COMBINED_UT_KEY,
@@ -826,16 +1172,16 @@ const COMBINED_UT_COMPONENT_KEYS = [
   normalizeStateLookupKey("Daman and Diu"),
 ]
 
-const mapStateToIndiaStateIds = (stateValue: string): string[] => {
+const mapStateToIndiaStateIds = (stateValue: string, stateKeyToId: Record<string, string>): string[] => {
   const key = normalizeStateLookupKey(stateValue)
   if (!key) return []
   if (COMBINED_UT_ALIASES.has(key)) {
     const ids = COMBINED_UT_COMPONENT_KEYS
-      .map(componentKey => INDIA_STATE_KEY_TO_ID[componentKey])
+      .map(componentKey => stateKeyToId[componentKey])
       .filter((id): id is string => Boolean(id))
     return Array.from(new Set(ids))
   }
-  const resolved = INDIA_STATE_KEY_TO_ID[key]
+  const resolved = stateKeyToId[key]
   return resolved ? [resolved] : []
 }
 
@@ -861,12 +1207,7 @@ type HoverDetailMetricKey =
   | "loss_ratio"
   | "quantity"
 
-const SALES_HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
-  "gross_premium",
-  "earned_premium",
-  "zopper_earned_premium",
-  "quantity",
-]
+const SALES_HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [...SALES_METRIC_ORDER]
 
 const CLAIMS_HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
   "claims",
@@ -874,6 +1215,25 @@ const CLAIMS_HOVER_DETAIL_METRICS: HoverDetailMetricKey[] = [
   "loss_ratio",
   "quantity",
 ]
+
+const getHoverMetricsForDataset = (datasetType: "sales" | "claims"): HoverDetailMetricKey[] => (
+  datasetType === "claims" ? CLAIMS_HOVER_DETAIL_METRICS : SALES_HOVER_DETAIL_METRICS
+)
+
+const hasSamsungCompareColumns = (row: Row) => (
+  SAMSUNG_PARTNERS.some((partner) => row[partner.key] != null)
+)
+
+const resolveHoverMetricValue = (
+  row: Row,
+  measureKey: string,
+  fallbackMetric: HoverDetailMetricKey
+) => {
+  if (hasSamsungCompareColumns(row)) {
+    return sumSamsungPartnerValues(row as Record<string, unknown>)
+  }
+  return asNumber(row[measureKey] ?? row[fallbackMetric])
+}
 
 const HOVER_DETAIL_LABELS: Record<HoverDetailMetricKey, string> = {
   gross_premium: "Gross Premium",
@@ -908,6 +1268,7 @@ type CustomTooltipProps = {
   payload?: TooltipEntry[]
   label?: string
   measure: string
+  dimensionKey: string
   compareTooltipQuantity?: boolean
   showPeriodRange?: boolean
   periodStartLabel?: string
@@ -918,20 +1279,21 @@ const CustomTooltip = ({
   payload,
   label,
   measure,
+  dimensionKey,
   compareTooltipQuantity = false,
   showPeriodRange = false,
   periodStartLabel = "",
 }: CustomTooltipProps) => {
   if (!active || !payload?.length) return null
-  const formattedLabel = formatMonth(label || "")
+  const formattedLabel = formatMonth(label || "", dimensionKey)
   const tooltipRow = payload[0]?.payload
   const tooltipObject = (tooltipRow || {}) as Record<string, unknown>
   const compareTooltipPartners = SAMSUNG_PARTNERS.filter((partner) => (
     `tooltip_${partner.key}` in tooltipObject
   ))
   const metricIsLossRatio = measure.toLowerCase().includes("loss_ratio")
-  const rowPeriodStart = formatMonth(String(tooltipRow?.period_start ?? ""))
-  const rowPeriodEnd = formatMonth(String((tooltipRow?.period_end ?? label) || ""))
+  const rowPeriodStart = formatMonth(String(tooltipRow?.period_start ?? ""), dimensionKey)
+  const rowPeriodEnd = formatMonth(String((tooltipRow?.period_end ?? label) || ""), dimensionKey)
   const effectivePeriodStart = rowPeriodStart || periodStartLabel
   const effectivePeriodEnd = rowPeriodEnd || formattedLabel
   const showPeriod = Boolean(
@@ -1033,6 +1395,8 @@ export default function GraphView({
   tooltipMetricOverride,
   heightClassName = "h-72",
   categoryFilters,
+  eagerMapHoverPrefetch = false,
+  enableCrossDatasetHoverCompare = false,
   onDataReady,
 }: Props) {
   const prefersReducedMotion = useReducedMotion()
@@ -1047,12 +1411,24 @@ export default function GraphView({
     if (typeof window === "undefined") return false
     return window.innerWidth < 640
   })
+  const [indiaMapDefinition, setIndiaMapDefinition] = useState<IndiaMapDefinition | null>(STATIC_INDIA_MAP_DEFINITION)
+  const [indiaMapAssetState, setIndiaMapAssetState] = useState<"idle" | "loading" | "ready" | "error">(
+    STATIC_INDIA_MAP_DEFINITION ? "ready" : "error"
+  )
+  const [indiaMapAssetError, setIndiaMapAssetError] = useState<string | null>(
+    STATIC_INDIA_MAP_DEFINITION ? null : "Map asset unavailable"
+  )
   const [activeMapKey, setActiveMapKey] = useState<string | null>(null)
   const [hoverDetailByStateId, setHoverDetailByStateId] = useState<
     Record<string, Partial<Record<HoverDetailMetricKey, number>>>
   >({})
+  const [crossDatasetHoverExpanded, setCrossDatasetHoverExpanded] = useState(false)
+  const [crossDatasetHoverDetailByStateId, setCrossDatasetHoverDetailByStateId] = useState<
+    Record<string, Partial<Record<HoverDetailMetricKey, number>>>
+  >({})
   const [hoverDetailLoadingKey, setHoverDetailLoadingKey] = useState<string | null>(null)
   const [hoverDetailLoadingAll, setHoverDetailLoadingAll] = useState(false)
+  const [crossDatasetHoverLoadingKey, setCrossDatasetHoverLoadingKey] = useState<string | null>(null)
   const [hoverCard, setHoverCard] = useState<{
     key: string
     label: string
@@ -1067,8 +1443,13 @@ export default function GraphView({
   const gradientIdAlt = useId()
   const compareGradientBase = (gradientId || "compare").replace(/[^a-zA-Z0-9_-]/g, "")
   const hoverDetailMetrics = useMemo<HoverDetailMetricKey[]>(() => (
-    datasetType === "claims" ? CLAIMS_HOVER_DETAIL_METRICS : SALES_HOVER_DETAIL_METRICS
+    getHoverMetricsForDataset(datasetType)
   ), [datasetType])
+  const crossDatasetType = datasetType === "sales" ? "claims" : "sales"
+  const crossDatasetHoverMetrics = useMemo<HoverDetailMetricKey[]>(() => (
+    getHoverMetricsForDataset(crossDatasetType)
+  ), [crossDatasetType])
+  const showCrossDatasetHover = enableCrossDatasetHoverCompare && crossDatasetHoverExpanded
   const normalizedCategoryFilters = useMemo<GraphCategoryFilter[]>(() => (
     (categoryFilters || [])
       .map((filter) => ({
@@ -1091,9 +1472,17 @@ export default function GraphView({
     setActiveMapKey(null)
     setHoverCard(null)
     setHoverDetailByStateId({})
+    setCrossDatasetHoverExpanded(false)
+    setCrossDatasetHoverDetailByStateId({})
     setHoverDetailLoadingKey(null)
     setHoverDetailLoadingAll(false)
+    setCrossDatasetHoverLoadingKey(null)
   }, [source, dimension, metric, datasetType, bucket, chartType, fromDate, toDate, jobId, categoryFiltersKey])
+
+  useEffect(() => {
+    if (chartType !== "india_map") return
+    setHoverCard(null)
+  }, [chartType, showCrossDatasetHover])
 
   useEffect(() => {
     if (typeof window === "undefined") return
@@ -1129,33 +1518,78 @@ export default function GraphView({
   }, [deferUntilVisible, isVisible, source, dimension, metric, datasetType, fromDate, toDate])
 
   useEffect(() => {
+    if (chartType !== "india_map") return
+    if (deferUntilVisible && !isVisible) return
+    if (!STATIC_INDIA_MAP_DEFINITION) {
+      setIndiaMapAssetState("error")
+      setIndiaMapAssetError("Map asset unavailable")
+      return
+    }
+    if (indiaMapDefinition !== STATIC_INDIA_MAP_DEFINITION) {
+      setIndiaMapDefinition(STATIC_INDIA_MAP_DEFINITION)
+    }
+    if (indiaMapAssetState !== "ready") {
+      setIndiaMapAssetState("ready")
+    }
+    if (indiaMapAssetError) {
+      setIndiaMapAssetError(null)
+    }
+  }, [chartType, deferUntilVisible, indiaMapAssetError, indiaMapAssetState, indiaMapDefinition, isVisible])
+
+  const indiaMapLocations = useMemo(
+    () => indiaMapDefinition?.locations ?? [],
+    [indiaMapDefinition]
+  )
+  const indiaStateKeyToId = useMemo(
+    () => buildIndiaStateKeyToId(indiaMapLocations),
+    [indiaMapLocations]
+  )
+
+  useEffect(() => {
     if (!dimension || !source || !metric) return
     if (deferUntilVisible && !isVisible) return
     const requestId = ++requestIdRef.current
+    const controller = new AbortController()
+    const metricKey = toSafeKey(metric)
+    const tooltipMetricKey = toSafeKey(tooltipMetricOverride || "")
+    const baseFetchParams: GraphFetchParams = {
+      source,
+      dimension,
+      metric,
+      datasetType,
+      bucket,
+      jobId,
+      from_date: fromDate,
+      to_date: toDate,
+      categoryFilters: normalizedCategoryFilters,
+    }
+    const tooltipFetchParams =
+      tooltipMetricOverride && tooltipMetricKey && tooltipMetricKey !== metricKey
+        ? {
+            ...baseFetchParams,
+            metric: tooltipMetricOverride,
+          }
+        : null
+    const hasWarmCache =
+      Boolean(readGraphDataCache(baseFetchParams))
+      && (!tooltipFetchParams || Boolean(readGraphDataCache(tooltipFetchParams)))
 
     const fetchData = async () => {
-      setLoading(true)
+      const dimKey = toSafeKey(dimension)
+      if (!hasWarmCache) {
+        setLoading(true)
+      }
       setError(null)
 
       try {
-        const dimKey = toSafeKey(dimension)
-        const metricKey = toSafeKey(metric)
-        const tooltipMetricKey = toSafeKey(tooltipMetricOverride || "")
 
         if (source === "samsung") {
           setCompareMode(true)
           // Backend returns all Samsung partners in one response to avoid extra compare requests.
           const combined = await fetchRowsWithRangeFallback({
+            ...baseFetchParams,
             source: "samsung",
-            dimension,
-            metric,
-            datasetType,
-            bucket,
-            jobId,
-            from_date: fromDate,
-            to_date: toDate,
-            categoryFilters: normalizedCategoryFilters,
-          })
+          }, { signal: controller.signal })
 
           let merged: Row[] = (combined.data || []).map((row) => {
             const next: Row = { ...row }
@@ -1165,18 +1599,11 @@ export default function GraphView({
             return next
           })
 
-          if (tooltipMetricOverride && tooltipMetricKey && tooltipMetricKey !== metricKey) {
+          if (tooltipFetchParams) {
             const tooltipRows = await fetchRowsWithRangeFallback({
+              ...tooltipFetchParams,
               source: "samsung",
-              dimension,
-              metric: tooltipMetricOverride,
-              datasetType,
-              bucket,
-              jobId,
-              from_date: fromDate,
-              to_date: toDate,
-              categoryFilters: normalizedCategoryFilters,
-            })
+            }, { signal: controller.signal })
 
             const tooltipMap = new Map<string, Record<SamsungPartnerKey, number>>()
             for (const row of tooltipRows.data || []) {
@@ -1216,17 +1643,7 @@ export default function GraphView({
         }
 
         setCompareMode(false)
-        const single = await fetchRowsWithRangeFallback({
-          source,
-          dimension,
-          metric,
-          datasetType,
-          bucket,
-          jobId,
-          from_date: fromDate,
-          to_date: toDate,
-          categoryFilters: normalizedCategoryFilters,
-        })
+        const single = await fetchRowsWithRangeFallback(baseFetchParams, { signal: controller.signal })
 
         if (!single.data.length) {
           onDataReady?.({
@@ -1281,6 +1698,9 @@ export default function GraphView({
         })
       } catch (e: unknown) {
         if (requestId !== requestIdRef.current) return
+        if (controller.signal.aborted || (e instanceof Error && e.name === "AbortError")) {
+          return
+        }
         const msg = e instanceof Error ? e.message : "Failed"
         console.error("GraphView fetch error:", msg, { source, dimension, metric })
         setError(msg)
@@ -1298,13 +1718,14 @@ export default function GraphView({
     }
 
     let timer: ReturnType<typeof setTimeout> | null = null
-    if (fetchDelayMs && fetchDelayMs > 0) {
+    if (!hasWarmCache && fetchDelayMs && fetchDelayMs > 0) {
       timer = setTimeout(fetchData, fetchDelayMs)
     } else {
       fetchData()
     }
 
     return () => {
+      controller.abort()
       if (timer) clearTimeout(timer)
     }
   }, [
@@ -1326,19 +1747,19 @@ export default function GraphView({
   ])
 
   const indiaMapStateKeys = useMemo(() => {
-    if (chartType !== "india_map") return [] as string[]
+    if (chartType !== "india_map" || !indiaMapLocations.length) return [] as string[]
     const stateDimensionKey = toSafeKey(dimension || "state")
     const keys = new Set<string>()
     for (const row of data) {
       const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
       if (!stateName) continue
-      mapStateToIndiaStateIds(stateName).forEach((stateId) => keys.add(stateId))
+      mapStateToIndiaStateIds(stateName, indiaStateKeyToId).forEach((stateId) => keys.add(stateId))
     }
     return Array.from(keys)
-  }, [chartType, data, dimension])
+  }, [chartType, data, dimension, indiaMapLocations.length, indiaStateKeyToId])
 
   useEffect(() => {
-    if (chartType !== "india_map" || !source || !indiaMapStateKeys.length) return
+    if (!eagerMapHoverPrefetch || chartType !== "india_map" || !source || !indiaMapStateKeys.length) return
 
     const hasAllMetrics = indiaMapStateKeys.every((stateId) => (
       hoverDetailMetrics.every((detailMetric) => hoverDetailByStateId[stateId]?.[detailMetric] != null)
@@ -1346,6 +1767,7 @@ export default function GraphView({
     if (hasAllMetrics) return
 
     let active = true
+    const controller = new AbortController()
     const baseFilters = normalizedCategoryFilters.filter((filter) => filter.dimension !== "state").slice(0, 2)
 
     const timer = setTimeout(async () => {
@@ -1354,9 +1776,10 @@ export default function GraphView({
 
       try {
         const stateDimensionKey = toSafeKey(dimension || "state")
-        const detailRows = await Promise.all(
-          hoverDetailMetrics.map(async (detailMetric) => {
-            const result = await fetchRowsWithRangeFallback({
+        const detailRowsByMetric = await fetchRowsBatch(
+          hoverDetailMetrics.map((detailMetric) => ({
+            requestKey: detailMetric,
+            params: {
               source,
               dimension: "state",
               metric: detailMetric,
@@ -1366,13 +1789,9 @@ export default function GraphView({
               from_date: fromDate,
               to_date: toDate,
               categoryFilters: baseFilters,
-            })
-            return {
-              detailMetric,
-              measureKey: toSafeKey(result.measure || detailMetric),
-              rows: result.data || [],
-            }
-          })
+            },
+          })),
+          { signal: controller.signal }
         )
 
         if (!active) return
@@ -1382,13 +1801,16 @@ export default function GraphView({
           nextByStateId[stateId] = {}
         })
 
-        detailRows.forEach(({ detailMetric, measureKey, rows }) => {
+        hoverDetailMetrics.forEach((detailMetric) => {
+          const result = detailRowsByMetric[detailMetric]
+          const measureKey = toSafeKey(result?.measure || detailMetric)
+          const rows = result?.data || []
           rows.forEach((row) => {
             const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
             if (!stateName) return
-            const stateIds = mapStateToIndiaStateIds(stateName)
+            const stateIds = mapStateToIndiaStateIds(stateName, indiaStateKeyToId)
             if (!stateIds.length) return
-            const value = asNumber(row[measureKey] ?? row[detailMetric])
+            const value = resolveHoverMetricValue(row, measureKey, detailMetric)
             const apportionedValue = stateIds.length > 1 ? value / stateIds.length : value
             stateIds.forEach((stateId) => {
               const target = nextByStateId[stateId] || {}
@@ -1412,16 +1834,17 @@ export default function GraphView({
       } catch {
         // Keep the map interactive even if the eager KPI preload misses.
       } finally {
-        if (!active) return
         setHoverDetailLoadingAll(false)
       }
     }, 0)
 
     return () => {
       active = false
+      controller.abort()
       clearTimeout(timer)
     }
   }, [
+    eagerMapHoverPrefetch,
     chartType,
     source,
     dimension,
@@ -1431,6 +1854,7 @@ export default function GraphView({
     toDate,
     datasetType,
     indiaMapStateKeys,
+    indiaStateKeyToId,
     hoverDetailByStateId,
     hoverDetailMetrics,
     normalizedCategoryFilters,
@@ -1442,11 +1866,11 @@ export default function GraphView({
     for (const row of data) {
       const stateName = String(row[stateDimensionKey] ?? row.state ?? "").trim()
       if (!stateName) continue
-      const stateIds = mapStateToIndiaStateIds(stateName)
+      const stateIds = mapStateToIndiaStateIds(stateName, indiaStateKeyToId)
       if (stateIds.includes(hoverCard.key)) return stateName
     }
     return hoverCard.label || ""
-  }, [chartType, data, dimension, hoverCard])
+  }, [chartType, data, dimension, hoverCard, indiaStateKeyToId])
 
   useEffect(() => {
     if (chartType !== "india_map" || !source || !hoverCard?.key || !hoverDetailQueryLabel || hoverDetailLoadingAll) return
@@ -1456,6 +1880,8 @@ export default function GraphView({
     if (!pendingMetrics.length) return
 
     let active = true
+    const controller = new AbortController()
+    const hoverKey = hoverCard.key
     const hoverFilters: GraphCategoryFilter[] = [
       ...normalizedCategoryFilters.filter((filter) => filter.dimension !== "state").slice(0, 1),
       { dimension: "state", values: [hoverDetailQueryLabel] },
@@ -1463,13 +1889,14 @@ export default function GraphView({
 
     const timer = setTimeout(async () => {
       if (!active) return
-      setHoverDetailLoadingKey(hoverCard.key)
+      setHoverDetailLoadingKey(hoverKey)
 
       const nextMetrics: Partial<Record<HoverDetailMetricKey, number>> = { ...cachedMetrics }
-      await Promise.all(
-        pendingMetrics.map(async (detailMetric) => {
-          try {
-            const result = await fetchGraphRows({
+      try {
+        const detailRowsByMetric = await fetchRowsBatch(
+          pendingMetrics.map((detailMetric) => ({
+            requestKey: detailMetric,
+            params: {
               source,
               dimension: "state",
               metric: detailMetric,
@@ -1479,28 +1906,40 @@ export default function GraphView({
               from_date: fromDate,
               to_date: toDate,
               categoryFilters: hoverFilters,
-            })
-            const measureKey = toSafeKey(result.measure || detailMetric)
-            nextMetrics[detailMetric] = (result.data || []).reduce((sum, row) => (
-              sum + asNumber(row[measureKey] ?? row[detailMetric])
-            ), 0)
-          } catch {
-            // ignore hover detail misses per metric and keep map interactive
+            },
+          })),
+          { signal: controller.signal }
+        )
+
+        pendingMetrics.forEach((detailMetric) => {
+          const result = detailRowsByMetric[detailMetric]
+          const measureKey = toSafeKey(result?.measure || detailMetric)
+          nextMetrics[detailMetric] = (result?.data || []).reduce((sum, row) => (
+            sum + resolveHoverMetricValue(row, measureKey, detailMetric)
+          ), 0)
+        })
+      } catch {
+        pendingMetrics.forEach((detailMetric) => {
+          if (nextMetrics[detailMetric] == null) {
+            nextMetrics[detailMetric] = 0
           }
         })
-      )
+      }
 
-      if (!active) return
-      setHoverDetailByStateId((prev) => ({
-        ...prev,
-        [hoverCard.key]: nextMetrics,
-      }))
-      setHoverDetailLoadingKey((prev) => (prev === hoverCard.key ? null : prev))
+      if (active) {
+        setHoverDetailByStateId((prev) => ({
+          ...prev,
+          [hoverKey]: nextMetrics,
+        }))
+      }
+      setHoverDetailLoadingKey((prev) => (prev === hoverKey ? null : prev))
     }, 120)
 
     return () => {
       active = false
+      controller.abort()
       clearTimeout(timer)
+      setHoverDetailLoadingKey((prev) => (prev === hoverKey ? null : prev))
     }
   }, [
     chartType,
@@ -1518,6 +1957,99 @@ export default function GraphView({
     normalizedCategoryFilters,
   ])
 
+  useEffect(() => {
+    if (
+      chartType !== "india_map"
+      || !showCrossDatasetHover
+      || !source
+      || !hoverCard?.key
+      || !hoverDetailQueryLabel
+    ) {
+      return
+    }
+
+    const cachedMetrics = crossDatasetHoverDetailByStateId[hoverCard.key] || {}
+    const pendingMetrics = crossDatasetHoverMetrics.filter((detailMetric) => cachedMetrics[detailMetric] == null)
+    if (!pendingMetrics.length) return
+
+    let active = true
+    const controller = new AbortController()
+    const hoverKey = hoverCard.key
+    const hoverFilters: GraphCategoryFilter[] = [
+      ...normalizedCategoryFilters.filter((filter) => filter.dimension !== "state").slice(0, 1),
+      { dimension: "state", values: [hoverDetailQueryLabel] },
+    ]
+
+    const timer = setTimeout(async () => {
+      if (!active) return
+      setCrossDatasetHoverLoadingKey(hoverKey)
+
+      const nextMetrics: Partial<Record<HoverDetailMetricKey, number>> = { ...cachedMetrics }
+      try {
+        const detailRowsByMetric = await fetchRowsBatch(
+          pendingMetrics.map((detailMetric) => ({
+            requestKey: detailMetric,
+            params: {
+              source,
+              dimension: "state",
+              metric: detailMetric,
+              datasetType: crossDatasetType,
+              bucket,
+              jobId,
+              from_date: fromDate,
+              to_date: toDate,
+              categoryFilters: hoverFilters,
+            },
+          })),
+          { signal: controller.signal }
+        )
+
+        pendingMetrics.forEach((detailMetric) => {
+          const result = detailRowsByMetric[detailMetric]
+          const measureKey = toSafeKey(result?.measure || detailMetric)
+          nextMetrics[detailMetric] = (result?.data || []).reduce((sum, row) => (
+              sum + resolveHoverMetricValue(row, measureKey, detailMetric)
+            ), 0)
+        })
+      } catch {
+        pendingMetrics.forEach((detailMetric) => {
+          if (nextMetrics[detailMetric] == null) {
+            nextMetrics[detailMetric] = 0
+          }
+        })
+      }
+
+      if (active) {
+        setCrossDatasetHoverDetailByStateId((prev) => ({
+          ...prev,
+          [hoverKey]: nextMetrics,
+        }))
+      }
+      setCrossDatasetHoverLoadingKey((prev) => (prev === hoverKey ? null : prev))
+    }, 120)
+
+    return () => {
+      active = false
+      controller.abort()
+      clearTimeout(timer)
+      setCrossDatasetHoverLoadingKey((prev) => (prev === hoverKey ? null : prev))
+    }
+  }, [
+    bucket,
+    chartType,
+    crossDatasetHoverDetailByStateId,
+    crossDatasetHoverMetrics,
+    crossDatasetType,
+    fromDate,
+    hoverCard?.key,
+    hoverDetailQueryLabel,
+    jobId,
+    normalizedCategoryFilters,
+    showCrossDatasetHover,
+    source,
+    toDate,
+  ])
+
   if (deferUntilVisible && !isVisible) {
     return (
       <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-400`}>
@@ -1530,6 +2062,22 @@ export default function GraphView({
     return (
       <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-500`}>
         Loading...
+      </div>
+    )
+  }
+
+  if (chartType === "india_map" && (indiaMapAssetState === "idle" || indiaMapAssetState === "loading")) {
+    return (
+      <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-500`}>
+        Loading map...
+      </div>
+    )
+  }
+
+  if (chartType === "india_map" && indiaMapAssetState === "error") {
+    return (
+      <div ref={containerRef} className={`${heightClassName} flex items-center justify-center text-sm text-gray-400`}>
+        {indiaMapAssetError || "Map unavailable"}
       </div>
     )
   }
@@ -1606,8 +2154,8 @@ export default function GraphView({
     if (!isTemporalDimension || !chartData.length) return ""
     const firstRow = chartData[0]
     const explicitStart = String(firstRow?.period_start ?? "").trim()
-    if (explicitStart) return formatMonth(explicitStart)
-    return formatMonth(String(firstRow?.[dimKey] ?? ""))
+    if (explicitStart) return formatMonth(explicitStart, dimKey)
+    return formatMonth(String(firstRow?.[dimKey] ?? ""), dimKey)
   })()
   const barAnimationDuration = shouldAnimateBars ? 500 : 0
   const pieData = chartData
@@ -1630,10 +2178,13 @@ export default function GraphView({
     ? pieData
     : [{ name: "No Data", value: 1, baseValue: 1, ewValue: 0 }]
   const pieGradientBase = (gradientId || "pie").replace(/[^a-zA-Z0-9_-]/g, "")
+  const pieBaseColors = buildDistinctChartColors(
+    pieRows.length,
+    palette,
+    `${baseKey}-${pieRows.map((entry) => entry.name).join("|")}`
+  )
   const pieSlices = pieRows.map((entry, idx) => {
-    const baseColor = pieData.length
-      ? pickColor(`${baseKey}-${entry.name}`, palette)
-      : "#dbeafe"
+    const baseColor = pieData.length ? pieBaseColors[idx] : "#dbeafe"
     return {
       ...entry,
       baseColor,
@@ -1674,12 +2225,12 @@ export default function GraphView({
     })
     .slice(0, 12)
   const indiaMapValuesByStateId = new Map<string, number>()
-  INDIA_MAP_LOCATIONS.forEach((location) => {
+  indiaMapLocations.forEach((location) => {
     indiaMapValuesByStateId.set(location.id, 0)
   })
   chartData.forEach((row) => {
     const stateName = String(row[dimKey] ?? "").trim()
-    const stateIds = mapStateToIndiaStateIds(stateName)
+    const stateIds = mapStateToIndiaStateIds(stateName, indiaStateKeyToId)
     if (!stateIds.length) return
     const value = compareMode
       ? Math.max(0, sumSamsungPartnerValues(row as Record<string, unknown>))
@@ -1689,7 +2240,7 @@ export default function GraphView({
       indiaMapValuesByStateId.set(stateId, (indiaMapValuesByStateId.get(stateId) || 0) + perStateValue)
     })
   })
-  const indiaMapEntries = INDIA_MAP_LOCATIONS.map((location) => {
+  const indiaMapEntries = indiaMapLocations.map((location) => {
     const value = indiaMapValuesByStateId.get(location.id) || 0
     return {
       key: location.id,
@@ -1704,6 +2255,9 @@ export default function GraphView({
   const maxIndiaMapValue = indiaMapEntries.reduce((max, entry) => Math.max(max, entry.value), 0)
   const indiaMapLegendRows = indiaMapLegendEntries.length ? indiaMapLegendEntries : indiaMapEntries
   const hoverMetricValues = hoverCard ? hoverDetailByStateId[hoverCard.key] || {} : {}
+  const crossDatasetHoverMetricValues = hoverCard ? crossDatasetHoverDetailByStateId[hoverCard.key] || {} : {}
+  const hoverSectionLabel = datasetType === "sales" ? "Sales" : "Claims"
+  const crossDatasetHoverSectionLabel = crossDatasetType === "sales" ? "Sales" : "Claims"
 
   const placeHoverCard = (
     clientX: number,
@@ -1716,10 +2270,14 @@ export default function GraphView({
     const rect = host.getBoundingClientRect()
     const viewportWidth = typeof window !== "undefined" ? window.innerWidth : rect.width
     const compact = viewportWidth < 640 || rect.width < 380
-    const desiredWidth = compact ? 210 : 254
+    const desiredWidth = showCrossDatasetHover
+      ? (compact ? 228 : 292)
+      : (compact ? 210 : 254)
     const maxAllowedWidth = Math.max(120, rect.width - 16)
     const cardWidth = Math.min(desiredWidth, maxAllowedWidth)
-    const cardHeight = compact ? 142 : 168
+    const cardHeight = showCrossDatasetHover
+      ? (compact ? 248 : 300)
+      : (compact ? 142 : 168)
     let x = clientX - rect.left + 12
     let y = clientY - rect.top + 12
     if (x + cardWidth > rect.width - 8) x = rect.width - cardWidth - 8
@@ -1735,6 +2293,35 @@ export default function GraphView({
       compact,
     })
   }
+
+  const renderHoverMetricRows = (
+    stateKey: string,
+    metrics: HoverDetailMetricKey[],
+    values: Partial<Record<HoverDetailMetricKey, number>>,
+    loading: boolean,
+    compact: boolean
+  ) => (
+    metrics.map((detailMetric) => {
+      const value = values[detailMetric]
+      const hasValue = value != null
+      const formatted = hasValue
+        ? formatValue(asNumber(value), detailMetric)
+        : loading
+          ? "Loading..."
+          : "N/A"
+      return (
+        <div
+          key={`${stateKey}-${detailMetric}`}
+          className={`grid grid-cols-[minmax(0,1fr)_auto] items-center ${
+            compact ? "gap-1.5 text-[10px]" : "gap-2 text-[11px]"
+          }`}
+        >
+          <span className="truncate text-slate-600">{HOVER_DETAIL_LABELS[detailMetric]}</span>
+          <span className="font-semibold text-slate-800">{formatted}</span>
+        </div>
+      )
+    })
+  )
 
   const updateHoverCardPosition = (
     event: MouseEvent<SVGPathElement>,
@@ -1775,8 +2362,20 @@ export default function GraphView({
             ref={mapPanelRef}
             className="relative min-h-0 basis-[64%] rounded-xl border border-slate-200/80 bg-slate-50/60 px-2 py-2"
           >
+            {enableCrossDatasetHoverCompare && (
+              <div className="pointer-events-none absolute left-2 top-2 z-10">
+                <button
+                  type="button"
+                  onClick={() => setCrossDatasetHoverExpanded((prev) => !prev)}
+                  className="pointer-events-auto rounded-full border border-slate-200 bg-white/95 px-3 py-1.5 text-[10px] font-black uppercase tracking-[0.12em] text-slate-600 shadow-sm transition-colors hover:border-slate-300 hover:text-slate-900"
+                  aria-pressed={showCrossDatasetHover}
+                >
+                  {showCrossDatasetHover ? "Hide Sales + Claims" : "Show Sales + Claims"}
+                </button>
+              </div>
+            )}
             <svg
-              viewBox={indiaSvgMap.viewBox}
+              viewBox={indiaMapDefinition?.viewBox || "0 0 1 1"}
               className="h-full w-full"
               aria-label="India state heatmap"
               role="img"
@@ -1834,27 +2433,41 @@ export default function GraphView({
                 <div className={`mb-1 font-bold text-slate-800 ${hoverCard.compact ? "text-[11px]" : "text-xs"}`}>
                   {hoverCard.label}
                 </div>
-                <div className={hoverCard.compact ? "space-y-0.5" : "space-y-1"}>
-                  {hoverDetailMetrics.map((detailMetric) => {
-                    const value = hoverMetricValues[detailMetric]
-                    const hasValue = value != null
-                    const formatted = hasValue
-                      ? formatValue(asNumber(value), detailMetric)
-                      : hoverDetailLoadingAll || hoverDetailLoadingKey === hoverCard.key
-                        ? "Loading..."
-                        : "N/A"
-                    return (
-                      <div
-                        key={`${hoverCard.key}-${detailMetric}`}
-                        className={`grid grid-cols-[minmax(0,1fr)_auto] items-center ${
-                          hoverCard.compact ? "gap-1.5 text-[10px]" : "gap-2 text-[11px]"
-                        }`}
-                      >
-                        <span className="truncate text-slate-600">{HOVER_DETAIL_LABELS[detailMetric]}</span>
-                        <span className="font-semibold text-slate-800">{formatted}</span>
+                <div className={hoverCard.compact ? "space-y-1.5" : "space-y-2"}>
+                  <div>
+                    <div className={`mb-1 font-black uppercase tracking-[0.14em] text-slate-400 ${
+                      hoverCard.compact ? "text-[9px]" : "text-[10px]"
+                    }`}>
+                      {hoverSectionLabel}
+                    </div>
+                    <div className={hoverCard.compact ? "space-y-0.5" : "space-y-1"}>
+                      {renderHoverMetricRows(
+                        hoverCard.key,
+                        hoverDetailMetrics,
+                        hoverMetricValues,
+                        hoverDetailLoadingAll || hoverDetailLoadingKey === hoverCard.key,
+                        hoverCard.compact
+                      )}
+                    </div>
+                  </div>
+                  {showCrossDatasetHover && (
+                    <div className={`border-t border-slate-200/80 pt-1.5 ${hoverCard.compact ? "mt-1" : "mt-1.5"}`}>
+                      <div className={`mb-1 font-black uppercase tracking-[0.14em] text-slate-400 ${
+                        hoverCard.compact ? "text-[9px]" : "text-[10px]"
+                      }`}>
+                        {crossDatasetHoverSectionLabel}
                       </div>
-                    )
-                  })}
+                      <div className={hoverCard.compact ? "space-y-0.5" : "space-y-1"}>
+                        {renderHoverMetricRows(
+                          `${hoverCard.key}-${crossDatasetType}`,
+                          crossDatasetHoverMetrics,
+                          crossDatasetHoverMetricValues,
+                          crossDatasetHoverLoadingKey === hoverCard.key,
+                          hoverCard.compact
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -2021,7 +2634,7 @@ export default function GraphView({
               interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
               minTickGap={isTemporalDimension ? (isMobileViewport ? 8 : 16) : 8}
               tick={{ fontSize: isMobileViewport ? 10 : 11 }}
-              tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : String(v))}
+              tickFormatter={(v) => (isTemporalDimension ? formatMonth(v, dimKey) : String(v))}
             />
             <YAxis
               scale={useLogScale ? "log" : "auto"}
@@ -2040,6 +2653,7 @@ export default function GraphView({
               content={
                 <CustomTooltip
                   measure={measure}
+                  dimensionKey={dimKey}
                   compareTooltipQuantity={showCompareQuantityTooltip}
                   showPeriodRange={isTemporalDimension}
                   periodStartLabel={periodStartLabel}
@@ -2213,7 +2827,7 @@ export default function GraphView({
               interval={isTemporalDimension ? "preserveStartEnd" : "preserveEnd"}
               minTickGap={isTemporalDimension ? 16 : 8}
               tick={{ fontSize: 11 }}
-              tickFormatter={(v) => (isTemporalDimension ? formatMonth(v) : String(v))}
+              tickFormatter={(v) => (isTemporalDimension ? formatMonth(v, dimKey) : String(v))}
             />
             <YAxis
               domain={clampToZero ? [0, "auto"] : ["auto", "auto"]}
@@ -2226,6 +2840,7 @@ export default function GraphView({
               content={
                 <CustomTooltip
                   measure={measure}
+                  dimensionKey={dimKey}
                   compareTooltipQuantity={showCompareQuantityTooltip}
                   showPeriodRange={isTemporalDimension}
                   periodStartLabel={periodStartLabel}

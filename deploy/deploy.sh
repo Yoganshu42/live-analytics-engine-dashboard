@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-SERVER_IP="13.235.56.166"
+SERVER_IP="13.202.80.63"
 REMOTE_USER="ubuntu"
 REMOTE_PATH="/home/ubuntu/app"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,12 +42,13 @@ EOF
 echo ""
 echo "[5/5] Verifying deployment..."
 sleep 5
-curl -f http://${SERVER_IP}:8000/health && echo "✓ Backend health check passed" || (echo "✗ Backend health check failed" && ssh -i deploy/ssh_key.pem -o StrictHostKeyChecking=no ${REMOTE_USER}@${SERVER_IP} "tail -30 /tmp/backend.log" && exit 1)
+curl -f http://${SERVER_IP}/api/health && echo "✓ Backend health check passed" || (echo "✗ Backend health check failed" && ssh -i deploy/ssh_key.pem -o StrictHostKeyChecking=no ${REMOTE_USER}@${SERVER_IP} "tail -30 /tmp/backend.log" && exit 1)
 
 echo ""
 echo "========================================"
 echo "Deployment Complete!"
 echo "========================================"
 echo ""
-echo "Backend API: http://${SERVER_IP}:8000"
-echo "API Docs: http://${SERVER_IP}:8000/docs"
+echo "Frontend: http://${SERVER_IP}/"
+echo "Backend API: http://${SERVER_IP}/api"
+echo "API Docs: http://${SERVER_IP}/docs"

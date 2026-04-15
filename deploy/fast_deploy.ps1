@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$serverIP = "13.235.56.166"
+$serverIP = "13.202.80.63"
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
 $remoteUser = "ubuntu"
 $remotePath = "/home/ubuntu/live-dashboard"
@@ -36,7 +36,8 @@ Write-Host "  Done!" -ForegroundColor Green
 # Step 2: Create optimized docker-compose with build caching
 Write-Host "`n[2/7] Creating optimized docker-compose..." -ForegroundColor Yellow
 
-'version: "3.9"
+@"
+version: "3.9"
 services:
   backend:
     build:
@@ -51,7 +52,12 @@ services:
       ADMIN_PASSWORD: admin123
       EMPLOYEE_USERNAME: employee.user@zopper.com
       EMPLOYEE_PASSWORD: employee123
-      UVICORN_WORKERS: "2"
+      UVICORN_WORKERS: "1"
+      LLM_PREWARM: "0"
+      AUTO_DAILY_REFRESH: "1"
+      AUTO_DAILY_REFRESH_STARTUP_DELAY_SECONDS: "120"
+      AUTO_DAILY_REFRESH_CHECK_INTERVAL_SECONDS: "3600"
+      AUTO_DAILY_REFRESH_INCLUDE_TAGGED_JOBS: "0"
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -60,15 +66,16 @@ services:
     build:
       context: ./frontend/my-app
       args:
-        NEXT_PUBLIC_API_BASE: http://13.235.56.166:8000
+        NEXT_PUBLIC_API_BASE: http://$serverIP/api
     image: live-dashboard-frontend:latest
     environment:
-      NEXT_PUBLIC_API_BASE: http://13.235.56.166:8000
+      NEXT_PUBLIC_API_BASE: http://$serverIP/api
     ports:
       - "3000:3000"
     depends_on:
       - backend
-    restart: unless-stopped' | Out-File -FilePath "deploy/docker-compose.fast.yml" -Encoding utf8
+    restart: unless-stopped
+"@ | Out-File -FilePath "deploy/docker-compose.fast.yml" -Encoding utf8
 
 Write-Host "  Done!" -ForegroundColor Green
 
@@ -109,11 +116,11 @@ Write-Host "`n[7/7] Verifying deployment..." -ForegroundColor Yellow
 Start-Sleep -Seconds 5
 
 try {
-    $response = Invoke-RestMethod -Uri "http://${serverIP}:8000/health" -Method GET -TimeoutSec 10
+    $response = Invoke-RestMethod -Uri "http://${serverIP}/api/health" -Method GET -TimeoutSec 10
     Write-Host "  Backend health check passed!" -ForegroundColor Green
     
     try {
-        $frontendCheck = Invoke-WebRequest -Uri "http://${serverIP}:3000" -Method GET -TimeoutSec 10 -UseBasicParsing
+        $frontendCheck = Invoke-WebRequest -Uri "http://${serverIP}/" -Method GET -TimeoutSec 10 -UseBasicParsing
         Write-Host "  Frontend is accessible!" -ForegroundColor Green
     }
     catch {
@@ -130,9 +137,9 @@ catch {
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "DEPLOYMENT COMPLETE!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host "`nFrontend: http://${serverIP}:3000" -ForegroundColor Cyan
-Write-Host "Backend API: http://${serverIP}:8000" -ForegroundColor Cyan
-Write-Host "API Docs: http://${serverIP}:8000/docs" -ForegroundColor Cyan
+Write-Host "`nFrontend: http://${serverIP}/" -ForegroundColor Cyan
+Write-Host "Backend API: http://${serverIP}/api" -ForegroundColor Cyan
+Write-Host "API Docs: http://${serverIP}/docs" -ForegroundColor Cyan
 Write-Host "`nLogin credentials:" -ForegroundColor Cyan
 Write-Host "  Admin: admin.user@zopper.com / admin123" -ForegroundColor White
 Write-Host "  Employee: employee.user@zopper.com / employee123" -ForegroundColor White

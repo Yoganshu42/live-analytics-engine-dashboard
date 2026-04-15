@@ -1,7 +1,6 @@
 export type SamsungPartnerKey =
   | "samsung_vs"
   | "samsung_croma"
-  | "samsung_croma_dsdsg"
   | "samsung_reliance_digital"
 
 export type SamsungPartnerConfig = {
@@ -31,14 +30,6 @@ export const SAMSUNG_PARTNERS: readonly SamsungPartnerConfig[] = [
     color: "#0ea5a4",
   },
   {
-    key: "samsung_croma_dsdsg",
-    label: "Samsung Croma DSDSG",
-    shortLabel: "Croma DSDSG",
-    cardLabel: "Croma DSDSG",
-    logo: "/croma_logo.jpg",
-    color: "#14b8a6",
-  },
-  {
     key: "samsung_reliance_digital",
     label: "Samsung Reliance Digital",
     shortLabel: "Reliance Digital",
@@ -48,14 +39,11 @@ export const SAMSUNG_PARTNERS: readonly SamsungPartnerConfig[] = [
   },
 ] as const
 
-export const VISIBLE_SAMSUNG_PARTNERS = SAMSUNG_PARTNERS.filter(
-  (partner) => partner.key !== "samsung_croma_dsdsg"
-)
+export const VISIBLE_SAMSUNG_PARTNERS = SAMSUNG_PARTNERS
 
 export const SAMSUNG_PARTNER_KEYS: readonly SamsungPartnerKey[] = [
   "samsung_vs",
   "samsung_croma",
-  "samsung_croma_dsdsg",
   "samsung_reliance_digital",
 ]
 
@@ -74,16 +62,6 @@ export const normalizeSamsungSource = (value: string) => {
     || key === "protect max"
     || key === "protect max croma"
     || key === "croma protect max"
-    || key === "samsung_croma_dsdsg"
-    || key === "samsung croma dsdsg"
-    || key === "samsung croma ds dsg"
-    || key === "samsung_croma_ds_dsg"
-    || key === "croma ds dsg"
-    || key === "croma ds/dsg"
-    || key === "dsdsg"
-    || key === "ds dsg"
-    || key === "ds/dsg"
-    || key === "ds-dsg"
   ) {
     return "samsung_croma"
   }

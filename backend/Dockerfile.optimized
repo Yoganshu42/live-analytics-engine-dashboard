@@ -19,6 +19,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 
-# Use multiple workers to handle the dashboard's parallel graph requests.
-# Tunable via UVICORN_WORKERS; default keeps memory reasonable on small instances.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}"]
+# Tunable via UVICORN_WORKERS; default to a single worker to keep
+# burstable EC2 instances responsive without doubling memory use.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1}"]

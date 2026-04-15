@@ -33,8 +33,9 @@ from services.analytics.hitachi_engine import invalidate_hitachi_load_cache
 from services.analytics.reliance_engine import invalidate_reliance_load_cache
 from services.analytics.samsung_engine import invalidate_samsung_load_cache
 from services.deck_cache_service import invalidate_deck_cache_for_source_dataset
+from services.maintenance_service import refresh_master_overview_cache, run_daily_refresh
 from services.manual_update_service import mark_manual_update
-from services.precompute_service import rebuild_precomputed_analytics, rebuild_precomputed_for_all_tags
+from services.precompute_service import rebuild_precomputed_analytics
 from services.precomputed_repository import clear_precomputed_for_source_dataset
 from services.partner_filter_service import (
     dataframe_to_payload_rows,
@@ -560,6 +561,7 @@ async def _parse_upload_dataframe(
 
     filename = (file.filename or "").lower()
     buffer = BytesIO(contents)
+    xls: pd.ExcelFile | None = None
     try:
         if filename.endswith(".csv"):
             return pd.read_csv(buffer)
@@ -579,6 +581,11 @@ async def _parse_upload_dataframe(
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
+    finally:
+        if xls is not None:
+            xls.close()
+        buffer.close()
+        del contents
 
 
 def _snapshot_rows(rows: list[DataRow]) -> list[dict[str, Any]]:
@@ -1080,14 +1087,9 @@ def _post_file_update(
     job_norm: str | None,
     action: str,
 ):
-    # Master dashboard payloads are cached separately from source-specific caches.
-    # Clear both active and legacy versions so top-level KPI strips always refresh.
-    for master_cache_source in ("master_dashboard_v6", "master_dashboard_v7", "master_dashboard_v8", "master_dashboard_v9"):
-        clear_precomputed_for_source_dataset(
-            db,
-            source=master_cache_source,
-            dataset_type="overview",
-        )
+    # Keep the last successful master overview payload warm while new source data
+    # is rebuilding. Manual-update markers will mark it stale, and the background
+    # refresh below replaces it once the new overview is ready.
 
     invalidate_deck_cache_for_source_dataset(
         db=db,
@@ -1193,6 +1195,16 @@ def _post_file_update(
                             dataset_type=dataset_norm,
                             job_id=refresh_job,
                         )
+            try:
+                refresh_master_overview_cache(db=worker_db)
+            except Exception:
+                worker_db.rollback()
+                logger.exception(
+                    "Failed to refresh master overview after %s source=%s dataset=%s",
+                    action,
+                    source_norm,
+                    dataset_norm,
+                )
         finally:
             worker_db.close()
 
@@ -1607,6 +1619,7 @@ async def update_file_group(
         dataset_type=dataset_norm,
         requested_job_id=job_norm,
         uploaded_at=uploaded_at,
+        prefer_existing_job_id=True,
     )
 
     payloads, normalize_meta = await _parse_upload_payloads(
@@ -1699,6 +1712,7 @@ async def reverse_map_file(
         normalize_meta=normalize_meta,
     )
     effective_suggestion["file_name"] = file.filename or ""
+    del df
     return effective_suggestion
 
 
@@ -1977,12 +1991,21 @@ async def analyze_filter_file(
         "unexpected server fallback" in str(item).lower()
         for item in diagnostics.get("issues", [])
     )
+    rows_in = int(len(raw_df))
+    if "normalized_df" in locals():
+        del normalized_df
+    if "payloads" in locals():
+        del payloads
+    if "storage_rows" in locals():
+        del storage_rows
+    del analysis_df
+    del raw_df
     return _compose_filter_analyze_response(
         file_name=file.filename or "",
         source=source_norm,
         dataset_type=dataset_norm,
         job_id=job_norm,
-        rows_in=int(len(raw_df)),
+        rows_in=rows_in,
         key_meta=key_meta,
         effective_suggestion=effective_suggestion,
         diagnostics=diagnostics,
@@ -2130,6 +2153,7 @@ async def filter_and_apply_file(
         dataset_type=dataset_norm,
         requested_job_id=job_norm,
         uploaded_at=uploaded_at,
+        prefer_existing_job_id=True,
     )
 
     df = await _parse_upload_dataframe(
@@ -2160,6 +2184,12 @@ async def filter_and_apply_file(
     filtered_payloads = [item.get("data") for item in storage_rows if isinstance(item.get("data"), dict)]
     if not filtered_payloads:
         raise HTTPException(status_code=400, detail="No rows found after applying filters")
+    filtered_rows_count = int(len(filtered_payloads))
+
+    del payloads
+    del storage_rows
+    del normalized_df
+    del df
 
     _validate_payload_schema(
         source_norm=source_norm,
@@ -2200,7 +2230,7 @@ async def filter_and_apply_file(
         uploaded_by=_actor_email(current_user),
         uploaded_at=uploaded_at,
         file_name=file.filename or "",
-        rows_in=int(len(filtered_payloads)),
+        rows_in=filtered_rows_count,
         rows_inserted=int(inserted_rows),
         rows_updated=int(quality_meta.get("updated_rows") or 0),
         deleted_rows=int(replaced_rows),
@@ -2286,9 +2316,15 @@ async def filter_and_download_file(
     filtered_payloads = [item.get("data") for item in storage_rows if isinstance(item.get("data"), dict)]
     if not filtered_payloads:
         raise HTTPException(status_code=400, detail="No rows found after applying filters")
+    filtered_rows_count = int(len(filtered_payloads))
+
+    del payloads
+    del storage_rows
+    del normalized_df
+    del df
 
     replaced_rows = 0
-    inserted_rows = int(len(filtered_payloads))
+    inserted_rows = filtered_rows_count
     updated_rows = 0
     revision_id: int | None = None
     effective_job_id = job_norm
@@ -2303,6 +2339,7 @@ async def filter_and_download_file(
             dataset_type=dataset_norm,
             requested_job_id=job_norm,
             uploaded_at=uploaded_at,
+            prefer_existing_job_id=True,
         )
         _validate_payload_schema(
             source_norm=source_norm,
@@ -2410,17 +2447,19 @@ def recompute_precomputed_data(
     source: str | None = Query(None),
     dataset_type: str | None = Query(None),
     job_id: str | None = Query(None),
+    repair_reliance_brands: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     source_norm = _normalize_source_key(source)
     dataset_norm = _normalize(dataset_type)
     job_norm = _normalize(job_id)
     try:
-        result = rebuild_precomputed_for_all_tags(
+        result = run_daily_refresh(
             db=db,
             source=source_norm,
             dataset_type=dataset_norm,
             job_id=job_norm,
+            repair_reliance_brands=repair_reliance_brands,
         )
     except Exception:
         db.rollback()

@@ -14,7 +14,7 @@ type FetchLastUpdatedParams = {
   to_date?: string
 }
 
-type FetchByDimensionParams = {
+export type FetchByDimensionParams = {
   job_id?: string
   source: string
   dataset_type: "sales" | "claims"
@@ -27,6 +27,18 @@ type FetchByDimensionParams = {
   filter_1_values?: string
   filter_2_dimension?: string
   filter_2_values?: string
+}
+
+export type FetchByDimensionBatchItem = FetchByDimensionParams & {
+  request_key: string
+}
+
+export type FetchByDimensionBatchResponse = {
+  results: Array<{
+    request_key: string
+    rows: Array<Record<string, unknown>>
+  }>
+  truncated?: boolean
 }
 
 type FetchDateBoundsParams = {
@@ -55,6 +67,35 @@ export type MasterDashboardResponse = {
     min_date?: string | null
     max_date?: string | null
   }
+}
+
+type FetchAnnualComparisonParams = {
+  job_id?: string
+  source: string
+  dataset_type: "sales" | "claims"
+  metric?: string
+  from_date?: string
+  to_date?: string
+}
+
+export type AnnualComparisonMetricRow = {
+  label: string
+  total: number
+  values?: Record<string, number>
+}
+
+export type AnnualComparisonMetricPayload = {
+  plans: string[]
+  rows: AnnualComparisonMetricRow[]
+}
+
+export type AnnualComparisonResponse = {
+  year_buckets?: Array<{
+    label: string
+    from: string
+    to: string
+  }>
+  payload_by_metric?: Record<string, AnnualComparisonMetricPayload>
 }
 
 type LoginPayload = {
@@ -303,6 +344,13 @@ export type ChatbotFileTransformResult = {
   skipped: number
 }
 
+export type AnalyticsDimensionFilterQueryParams = {
+  filter_1_dimension?: string
+  filter_1_values?: string
+  filter_2_dimension?: string
+  filter_2_values?: string
+}
+
 export type CityBreakdownParams = {
   state: string
   metric: string
@@ -312,7 +360,7 @@ export type CityBreakdownParams = {
   from_date?: string
   to_date?: string
   limit?: number
-}
+} & AnalyticsDimensionFilterQueryParams
 
 export type CityBreakdownRow = {
   city: string
@@ -343,7 +391,7 @@ export type CategoryPercentageParams = {
   from_date?: string
   to_date?: string
   limit?: number
-}
+} & AnalyticsDimensionFilterQueryParams
 
 export type CategoryPercentageRow = {
   label: string
@@ -442,9 +490,9 @@ const browserHostApiBases =
 const API_FALLBACKS = Array.from(
   new Set([
     runtimeOverride,
-    ...browserOriginApiBases,
     ENV_API_BASE,
     ...browserHostApiBases,
+    ...browserOriginApiBases,
     API_BASE,
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -469,10 +517,17 @@ const orderedApiBases = () => {
 }
 
 const MASTER_CACHE = new Map<string, { data: MasterDashboardResponse; timestamp: number }>()
+const MASTER_INFLIGHT = new Map<string, Promise<MasterDashboardResponse>>()
 const MASTER_CACHE_TTL_MS = 30000 // 30 seconds
+const ANALYTICS_RESPONSE_CACHE = new Map<string, { data: unknown; timestamp: number }>()
+const ANALYTICS_INFLIGHT = new Map<string, Promise<unknown>>()
+const ANALYTICS_CACHE_TTL_MS = 15000
 
 export const clearMasterDashboardCache = () => {
   MASTER_CACHE.clear()
+  MASTER_INFLIGHT.clear()
+  ANALYTICS_RESPONSE_CACHE.clear()
+  ANALYTICS_INFLIGHT.clear()
 }
 
 export const prefetchMasterDashboard = async (params: FetchMasterDashboardParams) => {
@@ -486,12 +541,31 @@ export const prefetchMasterDashboard = async (params: FetchMasterDashboardParams
   const now = Date.now()
   const cached = MASTER_CACHE.get(key)
   if (cached && (now - cached.timestamp) < MASTER_CACHE_TTL_MS) return
-  
-  try {
-    const data = await fetchJsonWithFallback("/analytics/master-dashboard", query, {
-      timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+
+  const inflight = MASTER_INFLIGHT.get(key)
+  if (inflight) {
+    try {
+      await inflight
+    } catch {
+      // The active screen will retry through its own fetch path if needed.
+    }
+    return
+  }
+
+  const requestPromise = fetchJsonWithFallback("/analytics/master-dashboard", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+  })
+    .then((data) => {
+      MASTER_CACHE.set(key, { data, timestamp: Date.now() })
+      return data as MasterDashboardResponse
     })
-    MASTER_CACHE.set(key, { data, timestamp: now })
+    .finally(() => {
+      MASTER_INFLIGHT.delete(key)
+    })
+
+  MASTER_INFLIGHT.set(key, requestPromise)
+  try {
+    await requestPromise
   } catch (err) {
     console.error("Master prefetch failed:", err)
   }
@@ -527,6 +601,36 @@ type ApiRequestInit = RequestInit & {
   timeoutMs?: number
 }
 
+type CachedApiRequestInit = ApiRequestInit & {
+  cacheKey?: string
+  cacheTtlMs?: number
+}
+
+type AnalyticsRequestOptions = {
+  signal?: AbortSignal
+}
+
+type MasterDashboardRequestOptions = AnalyticsRequestOptions & {
+  forceFresh?: boolean
+}
+
+const mergeAbortSignals = (signals: Array<AbortSignal | null | undefined>) => {
+  const activeSignals = signals.filter(Boolean) as AbortSignal[]
+  if (!activeSignals.length) return undefined
+  if (activeSignals.length === 1) return activeSignals[0]
+
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  activeSignals.forEach((signal) => {
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener("abort", abort, { once: true })
+  })
+  return controller.signal
+}
+
 const fetchWithTimeout = async (
   url: string,
   init: RequestInit = {},
@@ -535,7 +639,8 @@ const fetchWithTimeout = async (
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    const signal = mergeAbortSignals([init.signal, controller.signal])
+    return await fetch(url, { ...init, signal })
   } finally {
     clearTimeout(timer)
   }
@@ -544,6 +649,42 @@ const fetchWithTimeout = async (
 async function fetchJsonWithFallback(path: string, query: string, init: ApiRequestInit = {}) {
   const response = await fetchResponseWithFallback(path, query, init)
   return response.json()
+}
+
+async function fetchCachedJsonWithFallback(path: string, query: string, init: CachedApiRequestInit = {}) {
+  const method = (init.method || "GET").toUpperCase()
+  const bodyKey = typeof init.body === "string" ? init.body : ""
+  const cacheKey = init.cacheKey || `${method}:${path}?${query}:${bodyKey}`
+  const cacheTtlMs = init.cacheTtlMs ?? ANALYTICS_CACHE_TTL_MS
+  const now = Date.now()
+  const cached = ANALYTICS_RESPONSE_CACHE.get(cacheKey)
+  if (cached && (now - cached.timestamp) < cacheTtlMs) {
+    return cached.data
+  }
+
+  if (!init.signal) {
+    const inflight = ANALYTICS_INFLIGHT.get(cacheKey)
+    if (inflight) {
+      return inflight
+    }
+  }
+
+  const requestPromise = fetchJsonWithFallback(path, query, init)
+    .then((data) => {
+      ANALYTICS_RESPONSE_CACHE.set(cacheKey, {
+        data,
+        timestamp: Date.now(),
+      })
+      return data
+    })
+    .finally(() => {
+      ANALYTICS_INFLIGHT.delete(cacheKey)
+    })
+
+  if (!init.signal) {
+    ANALYTICS_INFLIGHT.set(cacheKey, requestPromise)
+  }
+  return requestPromise
 }
 
 async function fetchResponseWithFallback(path: string, query: string, init: ApiRequestInit = {}) {
@@ -644,7 +785,7 @@ function withSafeDateRange<T extends { from_date?: string; to_date?: string }>(p
   }
 }
 
-export async function fetchSummary(params: FetchSummaryParams) {
+export async function fetchSummary(params: FetchSummaryParams, options: AnalyticsRequestOptions = {}) {
   const safeParams = withSafeDateRange(params)
   const query = new URLSearchParams(
     Object.entries(safeParams).reduce((acc, [k, v]) => {
@@ -653,12 +794,16 @@ export async function fetchSummary(params: FetchSummaryParams) {
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/summary", query, {
+  return fetchCachedJsonWithFallback("/analytics/summary", query, {
     timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
   })
 }
 
-export async function fetchLastUpdated(params: FetchLastUpdatedParams) {
+export async function fetchLastUpdated(
+  params: FetchLastUpdatedParams,
+  options: AnalyticsRequestOptions = {}
+) {
   const safeParams = withSafeDateRange(params)
   const query = new URLSearchParams(
     Object.entries(safeParams).reduce((acc, [k, v]) => {
@@ -669,10 +814,14 @@ export async function fetchLastUpdated(params: FetchLastUpdatedParams) {
 
   return fetchJsonWithFallback("/analytics/last-updated", query, {
     timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
   })
 }
 
-export async function fetchByDimensionRows(params: FetchByDimensionParams): Promise<Array<Record<string, unknown>>> {
+export async function fetchByDimensionRows(
+  params: FetchByDimensionParams,
+  options: AnalyticsRequestOptions = {}
+): Promise<Array<Record<string, unknown>>> {
   const safeParams = withSafeDateRange(params)
   const query = new URLSearchParams(
     Object.entries(safeParams).reduce((acc, [k, v]) => {
@@ -681,10 +830,44 @@ export async function fetchByDimensionRows(params: FetchByDimensionParams): Prom
     }, {} as Record<string, string>)
   ).toString()
 
-  const response = await fetchJsonWithFallback("/analytics/by-dimension", query, {
+  const response = await fetchCachedJsonWithFallback("/analytics/by-dimension", query, {
     timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
   })
   return Array.isArray(response) ? (response as Array<Record<string, unknown>>) : []
+}
+
+export async function fetchByDimensionBatch(
+  requests: FetchByDimensionBatchItem[],
+  options: AnalyticsRequestOptions = {}
+): Promise<FetchByDimensionBatchResponse> {
+  const safeRequests = (requests || []).map((request) => withSafeDateRange(request))
+  return fetchCachedJsonWithFallback("/analytics/by-dimension-batch", "", {
+    method: "POST",
+    body: JSON.stringify({ requests: safeRequests }),
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
+    cacheKey: `POST:/analytics/by-dimension-batch:${JSON.stringify(safeRequests)}`,
+  })
+}
+
+export async function fetchAnnualComparison(
+  params: FetchAnnualComparisonParams,
+  options: AnalyticsRequestOptions = {}
+): Promise<AnnualComparisonResponse> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [key, value]) => {
+      if (value !== undefined && value !== null && value !== "") acc[key] = String(value)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  return fetchCachedJsonWithFallback("/analytics/annual-comparison", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
+    cacheTtlMs: 30000,
+  })
 }
 
 export async function fetchDateBounds(params: FetchDateBoundsParams) {
@@ -695,13 +878,15 @@ export async function fetchDateBounds(params: FetchDateBoundsParams) {
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/date-bounds", query, {
+  return fetchCachedJsonWithFallback("/analytics/date-bounds", query, {
     timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    cacheTtlMs: 300000,
   })
 }
 
 export async function fetchMasterDashboard(
-  params: FetchMasterDashboardParams
+  params: FetchMasterDashboardParams,
+  options: MasterDashboardRequestOptions = {}
 ): Promise<MasterDashboardResponse> {
   const safeParams = withSafeDateRange(params)
   const query = new URLSearchParams(
@@ -713,16 +898,41 @@ export async function fetchMasterDashboard(
 
   const key = `master-${query}`
   const now = Date.now()
+  if (options.forceFresh) {
+    MASTER_CACHE.delete(key)
+  }
+
   const cached = MASTER_CACHE.get(key)
-  if (cached && (now - cached.timestamp) < MASTER_CACHE_TTL_MS) {
+  if (!options.forceFresh && cached && (now - cached.timestamp) < MASTER_CACHE_TTL_MS) {
     return cached.data
   }
 
-  const data = await fetchJsonWithFallback("/analytics/master-dashboard", query, {
+  if (!options.forceFresh && !options.signal) {
+    const inflight = MASTER_INFLIGHT.get(key)
+    if (inflight) {
+      return inflight
+    }
+  }
+
+  const requestPromise = fetchJsonWithFallback("/analytics/master-dashboard", query, {
     timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
   })
-  MASTER_CACHE.set(key, { data, timestamp: now })
-  return data
+    .then((data) => {
+      MASTER_CACHE.set(key, { data, timestamp: Date.now() })
+      return data as MasterDashboardResponse
+    })
+    .finally(() => {
+      if (!options.signal) {
+        MASTER_INFLIGHT.delete(key)
+      }
+    })
+
+  if (!options.signal) {
+    MASTER_INFLIGHT.set(key, requestPromise)
+  }
+
+  return requestPromise
 }
 
 export async function login(payload: LoginPayload): Promise<LoginResponse> {
@@ -1113,7 +1323,10 @@ export async function transformChatbotFile(payload: {
   }
 }
 
-export async function fetchCityBreakdownByState(params: CityBreakdownParams): Promise<CityBreakdownResponse> {
+export async function fetchCityBreakdownByState(
+  params: CityBreakdownParams,
+  options: AnalyticsRequestOptions = {}
+): Promise<CityBreakdownResponse> {
   const safeParams = withSafeDateRange(params)
   const query = new URLSearchParams(
     Object.entries(safeParams).reduce((acc, [k, v]) => {
@@ -1122,11 +1335,15 @@ export async function fetchCityBreakdownByState(params: CityBreakdownParams): Pr
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/city-breakdown", query)
+  return fetchCachedJsonWithFallback("/analytics/city-breakdown", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
+  })
 }
 
 export async function fetchCategoryPercentage(
-  params: CategoryPercentageParams
+  params: CategoryPercentageParams,
+  options: AnalyticsRequestOptions = {}
 ): Promise<CategoryPercentageResponse> {
   const safeParams = withSafeDateRange(params)
   const query = new URLSearchParams(
@@ -1136,5 +1353,8 @@ export async function fetchCategoryPercentage(
     }, {} as Record<string, string>)
   ).toString()
 
-  return fetchJsonWithFallback("/analytics/category-percentage", query)
+  return fetchCachedJsonWithFallback("/analytics/category-percentage", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
+  })
 }

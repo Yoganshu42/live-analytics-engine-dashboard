@@ -116,9 +116,9 @@ The new script shows:
 4. **Check Docker cache**: Run `docker system df` on EC2
 
 ### If build fails:
-1. Check logs: `ssh -i deploy/ssh_key.pem ubuntu@13.235.56.166 "cd /home/ubuntu/live-dashboard && docker-compose logs"`
-2. Check disk space: `ssh -i deploy/ssh_key.pem ubuntu@13.235.56.166 "df -h"`
-3. Clean Docker cache: `ssh -i deploy/ssh_key.pem ubuntu@13.235.56.166 "docker system prune -af"`
+1. Check logs: `ssh -i deploy/ssh_key.pem ubuntu@13.202.80.63 "cd /home/ubuntu/live-dashboard && docker-compose logs"`
+2. Check disk space: `ssh -i deploy/ssh_key.pem ubuntu@13.202.80.63 "df -h"`
+3. Clean Docker cache: `ssh -i deploy/ssh_key.pem ubuntu@13.202.80.63 "docker system prune -af"`
 
 ## Performance Comparison
 

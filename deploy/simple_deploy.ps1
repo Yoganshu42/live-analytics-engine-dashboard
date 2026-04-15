@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$serverIP = "13.235.56.166"
+$serverIP = "13.202.80.63"
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"
 $remoteUser = "ubuntu"
 $remotePath = "/home/ubuntu/app"
@@ -42,7 +42,7 @@ ssh -i $sshKey -o StrictHostKeyChecking=no "${remoteUser}@${serverIP}" $deploySc
 Write-Host "`n[5/5] Verifying deployment..." -ForegroundColor Yellow
 Start-Sleep -Seconds 5
 try {
-    $response = Invoke-RestMethod -Uri "http://${serverIP}:8000/health" -Method GET -TimeoutSec 10
+    $response = Invoke-RestMethod -Uri "http://${serverIP}/api/health" -Method GET -TimeoutSec 10
     Write-Host "✓ Backend health check passed: $($response | ConvertTo-Json -Compress)" -ForegroundColor Green
 }
 catch {
@@ -55,8 +55,9 @@ catch {
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "Deployment Complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host "`nBackend API: http://${serverIP}:8000" -ForegroundColor Cyan
-Write-Host "API Docs: http://${serverIP}:8000/docs" -ForegroundColor Cyan
+Write-Host "`nFrontend: http://${serverIP}/" -ForegroundColor Cyan
+Write-Host "Backend API: http://${serverIP}/api" -ForegroundColor Cyan
+Write-Host "API Docs: http://${serverIP}/docs" -ForegroundColor Cyan
 Write-Host "`nLogin with:" -ForegroundColor Cyan
 Write-Host "  Username: admin.user@zopper.com" -ForegroundColor White
 Write-Host "  Password: admin123" -ForegroundColor White
