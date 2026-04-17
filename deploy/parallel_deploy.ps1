@@ -11,7 +11,7 @@ if ([string]::IsNullOrWhiteSpace($ServerIP)) {
     $ServerIP = $env:LIVE_DASHBOARD_SERVER_IP
 }
 if ([string]::IsNullOrWhiteSpace($ServerIP)) {
-    $ServerIP = "13.202.80.63"
+    $ServerIP = "13.235.66.217"
 }
 
 $sshKey = Join-Path $PSScriptRoot "ssh_key.pem"

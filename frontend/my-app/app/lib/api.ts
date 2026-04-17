@@ -98,6 +98,90 @@ export type AnnualComparisonResponse = {
   payload_by_metric?: Record<string, AnnualComparisonMetricPayload>
 }
 
+export type FetchPnlBoardParams = {
+  job_id?: string
+  source: string
+  from_date?: string
+  to_date?: string
+  state?: string
+  city?: string
+  limit?: number
+}
+
+export type FetchPnlStoreDetailParams = {
+  job_id?: string
+  source: string
+  store_key: string
+  from_date?: string
+  to_date?: string
+  state?: string
+  city?: string
+}
+
+export type PnlFilterOption = {
+  label: string
+  count: number
+}
+
+export type PnlStoreRow = {
+  store_key: string
+  store_name: string
+  store_id?: string
+  state?: string
+  city?: string
+  product_name?: string
+  plan_label?: string
+  channel_label?: string
+  top_claim_reason?: string
+  profit: number
+  loss_ratio: number
+}
+
+export type PnlBoardSummary = {
+  total_profit: number
+  total_claims_cost: number
+  overall_loss_ratio: number
+  total_stores: number
+  total_units_sold: number
+  total_claim_count: number
+  profitable_stores: number
+  loss_making_stores: number
+  breakeven_stores: number
+  best_store_name?: string
+  worst_store_name?: string
+}
+
+export type PnlBoardResponse = {
+  source: string
+  summary: PnlBoardSummary
+  state_options: PnlFilterOption[]
+  city_options: PnlFilterOption[]
+  rows: PnlStoreRow[]
+  default_store_key?: string
+  message?: string
+}
+
+export type PnlPerformanceRow = {
+  month: string
+  zopper_earned_premium: number
+  claims_cost: number
+  profit: number
+}
+
+export type PnlBreakdownRow = {
+  label: string
+  profit?: number
+  claims_cost?: number
+}
+
+export type PnlStoreDetailResponse = {
+  selected_store?: PnlStoreRow | null
+  performance_rows: PnlPerformanceRow[]
+  plan_rows: PnlBreakdownRow[]
+  cause_rows: PnlBreakdownRow[]
+  message?: string
+}
+
 type LoginPayload = {
   email: string
   password: string
@@ -882,6 +966,44 @@ export async function fetchDateBounds(params: FetchDateBoundsParams) {
     timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
     cacheTtlMs: 300000,
   })
+}
+
+export async function fetchPnlBoard(
+  params: FetchPnlBoardParams,
+  options: AnalyticsRequestOptions = {}
+): Promise<PnlBoardResponse> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [key, value]) => {
+      if (value !== undefined && value !== null && value !== "") acc[key] = String(value)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  return fetchCachedJsonWithFallback("/analytics/pnl-board", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
+    cacheTtlMs: 30000,
+  }) as Promise<PnlBoardResponse>
+}
+
+export async function fetchPnlStoreDetail(
+  params: FetchPnlStoreDetailParams,
+  options: AnalyticsRequestOptions = {}
+): Promise<PnlStoreDetailResponse> {
+  const safeParams = withSafeDateRange(params)
+  const query = new URLSearchParams(
+    Object.entries(safeParams).reduce((acc, [key, value]) => {
+      if (value !== undefined && value !== null && value !== "") acc[key] = String(value)
+      return acc
+    }, {} as Record<string, string>)
+  ).toString()
+
+  return fetchCachedJsonWithFallback("/analytics/pnl-store-detail", query, {
+    timeoutMs: ANALYTICS_REQUEST_TIMEOUT_MS,
+    signal: options.signal,
+    cacheTtlMs: 30000,
+  }) as Promise<PnlStoreDetailResponse>
 }
 
 export async function fetchMasterDashboard(

@@ -52,10 +52,10 @@ services:
     build:
       context: ./frontend/my-app
       args:
-        NEXT_PUBLIC_API_BASE: http://13.202.80.63/api
+        NEXT_PUBLIC_API_BASE: http://13.235.66.217/api
     image: live-dashboard-frontend:latest
     environment:
-      NEXT_PUBLIC_API_BASE: http://13.202.80.63/api
+      NEXT_PUBLIC_API_BASE: http://13.235.66.217/api
       NEXT_PUBLIC_CHATBOT_TIMEOUT_MS: "120000"
     ports:
       - "3000:3000"

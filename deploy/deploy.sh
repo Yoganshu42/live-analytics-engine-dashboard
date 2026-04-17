@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-SERVER_IP="13.202.80.63"
+SERVER_IP="13.235.66.217"
 REMOTE_USER="ubuntu"
 REMOTE_PATH="/home/ubuntu/app"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

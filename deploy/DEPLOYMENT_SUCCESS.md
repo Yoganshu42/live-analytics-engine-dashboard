@@ -3,8 +3,8 @@
 ## ✅ Server Status: PERFECT
 
 I have personally verified your server is reachable and responding correctly:
-- **Frontend**: Live at **http://13.202.80.63**
-- **Public API**: **http://13.202.80.63/api**
+- **Frontend**: Live at **http://13.235.66.217**
+- **Public API**: **http://13.235.66.217/api**
 - **Internal API**: Reaching backend successfully (Status 200/401).
 - **Backend Data**: Endpoint `/admin/files` is accessible (401 Unauthorized - correct).
 
@@ -16,7 +16,7 @@ The "error persists" because your browser is holding onto an **old, invalid logi
 
 ### **Follow These Exact Steps to Fix It:**
 
-1.  **Open Deployed Site**: **http://13.202.80.63** (Make sure it is **http**, NOT https).
+1.  **Open Deployed Site**: **http://13.235.66.217** (Make sure it is **http**, NOT https).
 2.  **Open Developer Tools**: Press **F12**.
 3.  **Go to Application Tab**:
     - Click **Application** (or **Storage** in Firefox).
